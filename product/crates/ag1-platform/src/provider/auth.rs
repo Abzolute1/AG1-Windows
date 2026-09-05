@@ -19,6 +19,9 @@ pub struct CredentialRecord {
     pub revision: u64,
     pub raw: SecretBytes,
 }
+/// Native vault tombstones retain revision history so logout cannot be erased by
+/// an older in-flight login/refresh. They contain no credential material.
+pub const REVOKED_CREDENTIAL_TYPE: &str = "ag1:revoked";
 pub trait CredentialLease: Send {}
 impl<T: Send> CredentialLease for T {}
 pub trait CredentialBackend: Send + Sync {
@@ -32,6 +35,15 @@ pub trait CredentialBackend: Send + Sync {
         source: CredentialSource,
     ) -> PortFuture<'a, Option<SecretBytes>>;
     fn load<'a>(&'a self, provider: &'a str) -> PortFuture<'a, Option<CredentialRecord>>;
+    /// Create only an absent record while holding the shared vault lease. A
+    /// concurrent creator must conflict rather than replace an existing secret.
+    fn create<'a>(&'a self, _provider: &'a str, _raw: SecretBytes) -> PortFuture<'a, ()> {
+        Box::pin(async {
+            Err(DomainError::Unavailable(
+                "credential creation is unavailable".into(),
+            ))
+        })
+    }
     fn compare_exchange<'a>(
         &'a self,
         provider: &'a str,
@@ -233,6 +245,7 @@ impl<B: CredentialBackend, R: OAuthRefresh> AuthCoordinator<B, R> {
                         oauth: Some(service),
                     }));
                 }
+                Some(REVOKED_CREDENTIAL_TYPE) => {}
                 _ => return Err(DomainError::InvalidInput("unknown credential type".into())),
             }
         }

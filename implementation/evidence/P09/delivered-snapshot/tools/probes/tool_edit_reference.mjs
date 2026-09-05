@@ -1,0 +1,10 @@
+import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..'),base=path.join(root,'reference/ag1-executable/packages/coding-agent/dist/core/tools');
+const edit=await import(pathToFileURL(path.join(base,'edit-diff.js'))),trunc=await import(pathToFileURL(path.join(base,'truncate.js')));
+const input=JSON.parse(fs.readFileSync(path.join(root,'fixtures/tools/edit-inputs.json'),'utf8'));
+const edits=input.edits.map(input=>{let output;try{const result=edit.applyEditsToNormalizedContent(input.content,input.edits,'file.txt',{allowFuzzyMatch:input.fuzzy??false});output={result,diff:edit.generateDiffString(result.baseContent,result.newContent)};}catch(e){output={error:e.message};}return {input,output};});
+const diffs=input.diffs.map(input=>({input,output:edit.generateDiffString(input.old,input.new,input.context??4)}));
+const truncation=input.truncation.map(input=>({input,head:trunc.truncateHead(input.content,input.limits),tail:trunc.truncateTail(input.content,input.limits)}));
+const text=input.text.map(content=>({content,lf:edit.normalizeToLF(content),ending:edit.detectLineEnding(content),bom:edit.stripBom(content),fuzzy:edit.normalizeForFuzzyMatch(content)}));
+const out=JSON.parse(JSON.stringify({version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',model_actions:0,network_actions:0,edits,diffs,truncation,text}));const target=path.join(root,'fixtures/tools/edit-oracle.json');if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(out,null,2)+'\n');}else assert.deepEqual(out,JSON.parse(fs.readFileSync(target,'utf8')));
+console.log(JSON.stringify({status:'passed',edits:edits.length,diffs:diffs.length,truncation:truncation.length,text:text.length,model_actions:0,network_actions:0}));

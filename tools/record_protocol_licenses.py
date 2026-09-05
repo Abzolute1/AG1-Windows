@@ -17,7 +17,7 @@ def main():
         if not package['source']:
             continue
         directory = Path(package['manifest_path']).parent
-        files = [f for f in directory.iterdir() if f.is_file() and f.name.lower().startswith(('license', 'licence', 'copying', 'notice', 'copyright'))]
+        files = [f for f in directory.iterdir() if f.is_file() and (f.name.lower().startswith(('license', 'licence', 'copying', 'notice', 'copyright')) or f.name.lower().endswith(('-license', '-licence')) or f.name.lower() == 'unlicense')]
         for folder in directory.iterdir():
             if folder.is_dir() and folder.name.lower() in ['licenses', 'license']:
                 files.extend(f for f in folder.rglob('*') if f.is_file())

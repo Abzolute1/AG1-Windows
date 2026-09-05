@@ -27,7 +27,7 @@ impl CancelToken {
     pub fn cancelled(&self) -> bool {
         *self.receiver.borrow() || self.receiver.has_changed().is_err()
     }
-    async fn wait(&mut self) {
+    pub(crate) async fn wait(&mut self) {
         if self.cancelled() {
             return;
         }
@@ -118,6 +118,9 @@ impl ProviderHttp {
             .collect::<Result<BTreeSet<_>, _>>()?;
         let client = Client::builder()
             .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(connect_timeout)
             .pool_max_idle_per_host(3)

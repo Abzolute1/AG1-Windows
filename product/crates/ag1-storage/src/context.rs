@@ -250,3 +250,85 @@ impl ContextArtifactPort for ContextStore<'_> {
             .collect())
     }
 }
+
+impl ag1_core::tools::result::ResultArtifacts for ContextStore<'_> {
+    fn producer_record(
+        &self,
+        id: &str,
+        tool: &str,
+        call: &str,
+    ) -> Result<ContextArtifact, DomainError> {
+        let origin = self.origin_for(id)?;
+        if origin != self.origin {
+            return Err(DomainError::PermissionDenied);
+        }
+        let bytes = self
+            .store
+            .artifact_record(self.session.as_str(), &origin, id)
+            .map_err(domain_error)?;
+        let record: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| DomainError::InvalidInput("producer artifact record".into()))?;
+        if record["producer"] != json!({"type":"tool","name":tool,"callId":call})
+            || record["encoding"] != "utf8"
+        {
+            return Err(DomainError::PermissionDenied);
+        }
+        self.get(id)
+    }
+    fn text_page(
+        &self,
+        record: &ContextArtifact,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<(u64, String), DomainError> {
+        if self.get(&record.id)? != *record {
+            return Err(DomainError::Conflict);
+        }
+        let origin = self.origin_for(&record.id)?;
+        let page = self
+            .store
+            .page(
+                self.session.as_str(),
+                &origin,
+                &record.id,
+                offset,
+                max_bytes,
+            )
+            .map_err(domain_error)?;
+        let text = String::from_utf8(page.bytes)
+            .map_err(|_| DomainError::InvalidInput("producer artifact UTF-8".into()))?;
+        Ok((page.offset, text))
+    }
+    fn read_call(&self, id: &str, offset: u64, max_bytes: u32) -> Result<Value, DomainError> {
+        let origin = self.origin_for(id)?;
+        let cursor = self
+            .store
+            .cursor(self.session.as_str(), &origin, id, offset, max_bytes)
+            .map_err(domain_error)?;
+        Ok(json!({"action":"read","cursor":cursor}))
+    }
+}
+
+impl ag1_core::tools::executor::ExecutionArtifacts for ContextStore<'_> {
+    fn read_json(&self, artifact: &ContextArtifact) -> Result<Value, DomainError> {
+        let current = self.get(&artifact.id)?;
+        if current != *artifact {
+            return Err(DomainError::Conflict);
+        }
+        let origin = self.origin_for(&artifact.id)?;
+        let bytes = self
+            .store
+            .execution_artifact_bytes(
+                self.session.as_str(),
+                &origin,
+                &artifact.id,
+                128 * 1024 * 1024,
+            )
+            .map_err(domain_error)?;
+        if digest(&bytes) != artifact.sha256 {
+            return Err(DomainError::Conflict);
+        }
+        serde_json::from_slice(&bytes)
+            .map_err(|_| DomainError::InvalidInput("execution artifact JSON".into()))
+    }
+}

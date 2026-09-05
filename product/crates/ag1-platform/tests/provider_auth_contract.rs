@@ -203,6 +203,49 @@ async fn credential_precedence_matches_runtime_file_environment_store_and_fallba
     );
 }
 #[tokio::test]
+async fn revoked_records_skip_refresh_preserve_revision_and_respect_independent_sources() {
+    let backend = Backend::default();
+    backend.set("anthropic", json!({"type":REVOKED_CREDENTIAL_TYPE}));
+    backend.source("anthropic", CredentialSource::Fallback, "fixture-fallback");
+    let refresh = Refresh::default();
+    let coordinator =
+        AuthCoordinator::new(backend.clone(), refresh.clone(), Arc::new(FixtureClock));
+    assert!(
+        coordinator
+            .resolve("anthropic", Some(OAuthService::Anthropic), false)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let fallback = coordinator
+        .resolve("anthropic", Some(OAuthService::Anthropic), true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fallback.source, CredentialSource::Fallback);
+    assert_eq!(fallback.value.expose(), b"fixture-fallback");
+    assert!(fallback.oauth.is_none());
+    backend.source(
+        "anthropic",
+        CredentialSource::Environment,
+        "fixture-environment",
+    );
+    let environment = coordinator
+        .resolve("anthropic", Some(OAuthService::Anthropic), false)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(environment.source, CredentialSource::Environment);
+    assert_eq!(environment.value.expose(), b"fixture-environment");
+    assert_eq!(refresh.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.records.lock().unwrap()["anthropic"].0, 0);
+    assert_eq!(
+        backend.value("anthropic"),
+        json!({"type":REVOKED_CREDENTIAL_TYPE})
+    );
+}
+#[tokio::test]
 async fn concurrent_coordinators_share_one_locked_refresh_and_preserve_unknown_fields() {
     let backend = Backend::default();
     backend.set("anthropic", oauth());

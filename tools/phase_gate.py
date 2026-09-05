@@ -176,6 +176,9 @@ def main():
     elif args.phase=='P08':
         from context_gate import execute_p08
         execute_p08()
+    elif args.phase=='P09':
+        from tool_gate import execute_p09
+        execute_p09()
     else:raise GateError(f'{args.phase} has no implemented gate yet; refusing a placeholder pass')
 
 

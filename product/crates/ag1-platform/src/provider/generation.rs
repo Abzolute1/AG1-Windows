@@ -6,7 +6,10 @@ use super::{
     http::{CancelToken, ErrorRedactor, HttpRequest, ProviderHttp},
 };
 use ag1_core::{DomainError, inference::GenerationPermit, provider::*};
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::time::Instant;
 
 pub struct GenerationLimits {
@@ -49,6 +52,84 @@ pub async fn request_generation(
     http: &ProviderHttp,
     generation: GenerationRequest,
     permit: GenerationPermit,
+    cancel: &mut CancelToken,
+    observer: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
+) -> Result<ProviderSnapshot, GenerationFailure> {
+    generation_with_admission(
+        http,
+        generation,
+        Admission::Owned(Some(permit)),
+        cancel,
+        observer,
+    )
+    .await
+}
+
+/// A sequential transport inside an admitted custom provider borrows the actual
+/// permit. It cannot release its caller's slot. Incomplete transport settlement
+/// latches a fault even if the provider catches the error and returns success.
+pub(crate) async fn request_borrowed_generation(
+    http: &ProviderHttp,
+    generation: GenerationRequest,
+    permit: &mut GenerationPermit,
+    fault: &AtomicBool,
+    cancel: &mut CancelToken,
+    observer: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
+) -> Result<ProviderSnapshot, GenerationFailure> {
+    if fault.load(Ordering::Acquire) {
+        return Err(failure(
+            DomainError::Unavailable("parent generation requires settlement".into()),
+            None,
+        ));
+    }
+    generation_with_admission(
+        http,
+        generation,
+        Admission::Borrowed {
+            _permit: permit,
+            fault,
+            settled: false,
+        },
+        cancel,
+        observer,
+    )
+    .await
+}
+enum Admission<'a> {
+    Owned(Option<GenerationPermit>),
+    Borrowed {
+        _permit: &'a mut GenerationPermit,
+        fault: &'a AtomicBool,
+        settled: bool,
+    },
+}
+impl Admission<'_> {
+    fn terminal(mut self) -> Result<(), DomainError> {
+        match &mut self {
+            Self::Owned(permit) => permit.take().ok_or(DomainError::Conflict)?.terminal(),
+            Self::Borrowed { settled, .. } => {
+                *settled = true;
+                Ok(())
+            }
+        }
+    }
+}
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if let Self::Borrowed {
+            fault,
+            settled: false,
+            ..
+        } = self
+        {
+            fault.store(true, Ordering::Release);
+        }
+    }
+}
+async fn generation_with_admission(
+    http: &ProviderHttp,
+    generation: GenerationRequest,
+    permit: Admission<'_>,
     cancel: &mut CancelToken,
     mut observer: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
 ) -> Result<ProviderSnapshot, GenerationFailure> {

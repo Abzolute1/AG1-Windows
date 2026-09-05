@@ -83,21 +83,21 @@ impl<S: StoragePort + 'static> StorageCredentialBackend<S> {
     /// are read-only inputs and are never overwritten by this adapter.
     pub async fn import(&self, provider: &str, raw: SecretBytes) -> Result<(), DomainError> {
         let _guard = self.inner.lock.lock().await;
-        let store = self.inner.storage.clone();
-        let provider = provider.to_owned();
-        self.inner
-            .pool
-            .submit(move || {
-                let record = parse(raw.expose())?;
-                let body = serde_json::to_vec(&json!({"revision":0,"credential":record}))
-                    .map_err(|_| DomainError::InvalidInput("credential import".into()))?;
-                store.commit_metadata("provider-credential", &provider, None, &body)?;
-                Ok(())
-            })
-            .await
+        self.create(provider, raw).await
     }
 }
 impl<S: StoragePort + 'static> CredentialBackend for StorageCredentialBackend<S> {
+    fn create<'a>(&'a self, provider: &'a str, raw: SecretBytes) -> PortFuture<'a, ()> {
+        let store = self.inner.storage.clone();
+        let provider = provider.to_owned();
+        self.inner.pool.submit(move || {
+            let record = parse(raw.expose())?;
+            let body = serde_json::to_vec(&json!({"revision":0,"credential":record}))
+                .map_err(|_| DomainError::InvalidInput("credential creation".into()))?;
+            store.commit_metadata("provider-credential", &provider, None, &body)?;
+            Ok(())
+        })
+    }
     fn acquire<'a>(&'a self, _provider: &'a str) -> PortFuture<'a, Box<dyn CredentialLease + 'a>> {
         Box::pin(async move {
             Ok(Box::new(self.inner.lock.clone().lock_owned().await) as Box<dyn CredentialLease>)

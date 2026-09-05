@@ -8,6 +8,7 @@ use std::{
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("") {
+        "package" => package_fixture(&args[2..]),
         "--model" => {
             // P06 fake model server: records the exact launch and waits for its owner.
             // This executable performs no inference and never opens a model endpoint.
@@ -33,6 +34,17 @@ fn main() {
         "protocol" => {
             eprintln!("diagnostic only");
             println!("{{\"type\":\"ready\"}}");
+        }
+        "address-space" => {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                assert_eq!(libc::getrlimit(libc::RLIMIT_AS, &mut limit), 0);
+                println!("{} {}", limit.rlim_cur, limit.rlim_max);
+            }
         }
         "deny-mutate" => {
             #[cfg(target_os = "linux")]
@@ -104,5 +116,114 @@ fn main() {
             }
         }
         _ => std::process::exit(2),
+    }
+}
+
+/// Deterministic package command port: only modifies the test's explicitly
+/// supplied temporary root. It never invokes npm/git or uses the network.
+fn package_fixture(args: &[String]) {
+    use std::fs::{self, OpenOptions};
+    let root = std::env::var("AG1_PACKAGE_FIXTURE_ROOT").unwrap();
+    let root = std::path::Path::new(&root);
+    let marker = root.join("commands.jsonl");
+    let mut log = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(marker)
+        .unwrap();
+    writeln!(log, "{}", serde_json::json!({"args":args,"cwd":std::env::current_dir().unwrap(),"prefix":std::env::var("npm_config_prefix").ok(),"userconfig":std::env::var("npm_config_userconfig").ok(),"home":std::env::var("HOME").ok()})).unwrap();
+    log.sync_all().unwrap();
+    eprintln!("fixture diagnostic");
+    if args.iter().any(|a| a == "slow") {
+        fs::write(root.join("started"), std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+    if args.iter().any(|a| a == "fail") {
+        println!("fixture failure output");
+        std::process::exit(17);
+    }
+    if args.iter().any(|a| a == "flood") {
+        let mut stdout = std::io::stdout().lock();
+        for _ in 0..1024 {
+            stdout.write_all(&[b'x'; 8192]).unwrap();
+        }
+        return;
+    }
+    let command = args.get(1).map(String::as_str).unwrap_or("");
+    let bound = |path: &std::path::Path| {
+        assert!(path.starts_with(root));
+        assert!(
+            !path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        );
+    };
+    if args[0] == "git-query" {
+        if command == "rev-parse" {
+            println!(
+                "{}",
+                if args.iter().any(|a| a == "--abbrev-ref") {
+                    "origin/main".into()
+                } else {
+                    "a".repeat(40)
+                }
+            );
+        } else if command == "ls-remote" {
+            println!("{}\t{}", "b".repeat(40), args.last().unwrap());
+        } else {
+            panic!("unexpected fixture Git query");
+        }
+    } else if args[0] == "npm" {
+        let prefix = args
+            .windows(2)
+            .find(|p| p[0] == "--prefix")
+            .map(|p| p[1].clone())
+            .unwrap_or_else(|| std::env::var("npm_config_prefix").unwrap());
+        let prefix = std::path::Path::new(&prefix);
+        bound(prefix);
+        if command == "root" {
+            println!("{}/lib/node_modules", prefix.display());
+            return;
+        }
+        let modules = prefix.join(if args.iter().any(|a| a == "-g") {
+            "lib/node_modules"
+        } else {
+            "node_modules"
+        });
+        if command == "uninstall" {
+            if modules.join("fixture").exists() {
+                fs::remove_dir_all(modules.join("fixture")).unwrap();
+            }
+        } else {
+            fs::create_dir_all(modules.join("fixture")).unwrap();
+            let version = args
+                .get(2)
+                .and_then(|spec| spec.strip_prefix("fixture@"))
+                .filter(|version| *version != "latest")
+                .unwrap_or("1.0.0");
+            fs::write(
+                modules.join("fixture/package.json"),
+                serde_json::json!({"version":version}).to_string(),
+            )
+            .unwrap();
+        }
+        println!("fixture npm complete");
+    } else if command == "clone" {
+        let target = std::path::Path::new(args.last().unwrap());
+        bound(target);
+        fs::create_dir_all(target).unwrap();
+        fs::write(target.join("package.json"), b"{\"name\":\"fixture\"}").unwrap();
+        println!("fixture clone complete");
+    } else if command == "rev-parse" {
+        println!(
+            "{}",
+            if args.iter().any(|a| a == "--abbrev-ref") {
+                "origin/main"
+            } else {
+                "same-head"
+            }
+        );
+    } else {
+        println!("fixture git complete");
     }
 }

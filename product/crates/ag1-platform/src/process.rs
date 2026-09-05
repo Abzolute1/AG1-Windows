@@ -24,6 +24,8 @@ use std::{
 pub const MAX_LOG_MEMORY: usize = 64 * 1024;
 pub const MAX_LOG_DISK: usize = 8 * 1024 * 1024;
 pub const STOP_DEADLINE_MS: u64 = 3000;
+/// Host-only argv placeholder consumed by spawn_tool_with_cwd.
+pub const PINNED_CWD_FD: &str = "@AG1_PINNED_CWD_FD@";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -152,6 +154,7 @@ struct Spool {
     written: usize,
     seen: u64,
     truncated: bool,
+    disk_limit: usize,
     error: Option<String>,
 }
 #[derive(Clone, Debug)]
@@ -165,7 +168,9 @@ pub struct LogView {
 impl Spool {
     fn append(&mut self, bytes: &[u8]) {
         self.seen = self.seen.saturating_add(bytes.len() as u64);
-        let keep = bytes.len().min(MAX_LOG_DISK.saturating_sub(self.written));
+        let keep = bytes
+            .len()
+            .min(self.disk_limit.saturating_sub(self.written));
         if self.error.is_none() && keep > 0 {
             if let Err(error) = self.file.write_all(&bytes[..keep]) {
                 self.error = Some(error.to_string());
@@ -246,6 +251,13 @@ pub struct ProcessSupervisor {
     helper_identity: (u64, u64),
     active: Arc<std::sync::atomic::AtomicUsize>,
 }
+#[derive(Clone, Copy)]
+struct SpawnLimits {
+    capture_stdout: bool,
+    address_space: Option<u64>,
+    disk_bytes: usize,
+    inherit_cwd: bool,
+}
 struct ActiveLease(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActiveLease {
     fn drop(&mut self) {
@@ -271,7 +283,90 @@ impl ProcessSupervisor {
         spec: ProcessSpec,
         spool_path: &Path,
     ) -> Result<OwnedProcess, DomainError> {
-        self.spawn_configured(spec, spool_path, None, false)
+        self.spawn_configured(
+            spec,
+            spool_path,
+            None,
+            SpawnLimits {
+                capture_stdout: false,
+                address_space: None,
+                disk_bytes: MAX_LOG_DISK,
+                inherit_cwd: false,
+            },
+        )
+    }
+    /// Host-only memory bound for tool transports. Existing model/PTY paths retain their settings.
+    pub fn spawn_protocol_limited(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        address_space: u64,
+    ) -> Result<OwnedProcess, DomainError> {
+        if !(64 * 1024 * 1024..=8 * 1024 * 1024 * 1024).contains(&address_space) {
+            return Err(DomainError::InvalidInput(
+                "tool process address space".into(),
+            ));
+        }
+        self.spawn_configured(
+            spec,
+            spool_path,
+            None,
+            SpawnLimits {
+                capture_stdout: false,
+                address_space: Some(address_space),
+                disk_bytes: MAX_LOG_DISK,
+                inherit_cwd: false,
+            },
+        )
+    }
+    /// Tool/job merged log capture with an explicit host-owned retention quota.
+    /// Reaching the quota is observable through LogView::truncated; the tool owner
+    /// stops its process and must not describe the retained prefix as complete.
+    pub fn spawn_tool(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        disk_bytes: usize,
+        address_space: Option<u64>,
+    ) -> Result<OwnedProcess, DomainError> {
+        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, false)
+    }
+    /// Inherit the pinned cwd descriptor for bubblewrap's --bind-fd. The helper
+    /// replaces the paired PINNED_CWD_FD placeholder without changing ProcessSpec's schema.
+    pub fn spawn_tool_with_cwd(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        disk_bytes: usize,
+        address_space: Option<u64>,
+    ) -> Result<OwnedProcess, DomainError> {
+        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, true)
+    }
+    fn spawn_tool_bound(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        disk_bytes: usize,
+        address_space: Option<u64>,
+        inherit_cwd: bool,
+    ) -> Result<OwnedProcess, DomainError> {
+        if !(1024..=64 * 1024 * 1024).contains(&disk_bytes)
+            || address_space
+                .is_some_and(|bytes| !(64 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&bytes))
+        {
+            return Err(DomainError::InvalidInput("tool process limits".into()));
+        }
+        self.spawn_configured(
+            spec,
+            spool_path,
+            None,
+            SpawnLimits {
+                capture_stdout: true,
+                address_space,
+                disk_bytes,
+                inherit_cwd,
+            },
+        )
     }
     pub fn spawn_pty(
         &self,
@@ -321,14 +416,24 @@ impl ProcessSupervisor {
         spool_path: &Path,
         pty: Option<File>,
     ) -> Result<OwnedProcess, DomainError> {
-        self.spawn_configured(spec, spool_path, pty, true)
+        self.spawn_configured(
+            spec,
+            spool_path,
+            pty,
+            SpawnLimits {
+                capture_stdout: true,
+                address_space: None,
+                disk_bytes: MAX_LOG_DISK,
+                inherit_cwd: false,
+            },
+        )
     }
     fn spawn_configured(
         &self,
         spec: ProcessSpec,
         spool_path: &Path,
         pty: Option<File>,
-        capture_stdout: bool,
+        limits: SpawnLimits,
     ) -> Result<OwnedProcess, DomainError> {
         spec.validate()?;
         if self
@@ -345,16 +450,16 @@ impl ProcessSupervisor {
             spool_path,
             pty,
             ActiveLease(self.active.clone()),
-            capture_stdout,
+            limits,
         )
     }
     fn launch(
         &self,
-        spec: ProcessSpec,
+        mut spec: ProcessSpec,
         spool_path: &Path,
         pty: Option<File>,
         lease: ActiveLease,
-        capture_stdout: bool,
+        limits: SpawnLimits,
     ) -> Result<OwnedProcess, DomainError> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = OpenOptions::new()
@@ -370,6 +475,7 @@ impl ProcessSupervisor {
             written: 0,
             seen: 0,
             truncated: false,
+            disk_limit: limits.disk_bytes,
             error: None,
         }));
         let (mut control, child_control) = UnixStream::pair().map_err(io_error)?;
@@ -382,6 +488,17 @@ impl ProcessSupervisor {
         let fd = child_control.as_raw_fd();
         let cwd_handle = File::open(&spec.cwd).map_err(io_error)?;
         let cwd_fd = cwd_handle.as_raw_fd();
+        if limits.inherit_cwd {
+            let index = spec
+                .argv
+                .windows(2)
+                .position(|pair| pair[0] == "--bind-fd" && pair[1] == PINNED_CWD_FD)
+                .ok_or_else(|| {
+                    DomainError::InvalidInput("pinned directory binding required".into())
+                })?
+                + 1;
+            spec.argv[index] = cwd_fd.to_string();
+        }
         let mut command = Command::new(&self.helper);
         command
             .arg(fd.to_string())
@@ -400,6 +517,18 @@ impl ProcessSupervisor {
         }
         unsafe {
             command.pre_exec(move || {
+                if let Some(bytes) = limits.address_space {
+                    let limit = libc::rlimit {
+                        rlim_cur: bytes as libc::rlim_t,
+                        rlim_max: bytes as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                if limits.inherit_cwd && libc::fcntl(cwd_fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::setsid() < 0
                     || libc::fcntl(fd, libc::F_SETFD, 0) < 0
                     || libc::fchdir(cwd_fd) < 0
@@ -451,10 +580,11 @@ impl ProcessSupervisor {
             spool,
             done,
             status: None,
+            completion: None,
             lease: Some(lease),
             stdout: None,
         };
-        if !capture_stdout {
+        if !limits.capture_stdout {
             process.stdout = process
                 .child
                 .stdout
@@ -482,6 +612,13 @@ impl ProcessSupervisor {
     }
 }
 
+/// Root-child termination is distinct from the supervisor helper's numeric exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessCompletion {
+    Exited(i32),
+    Signaled(i32),
+    TimedOut,
+}
 pub struct OwnedProcess {
     identity: ProcessIdentity,
     _pidfd: OwnedFd,
@@ -492,6 +629,7 @@ pub struct OwnedProcess {
     spool: Arc<Mutex<Spool>>,
     done: Arc<AtomicBool>,
     status: Option<ExitStatus>,
+    completion: Option<ProcessCompletion>,
     lease: Option<ActiveLease>,
     stdout: Option<File>,
 }
@@ -541,6 +679,19 @@ impl OwnedProcess {
         nonblocking(stdin.as_raw_fd())?;
         stdin.write(bytes).map_err(io_error)
     }
+    /// Protocol transports retry backpressure while continuing to drain stdout.
+    pub fn try_write_input(&mut self, bytes: &[u8]) -> Result<Option<usize>, DomainError> {
+        if bytes.len() > 32 * 1024 {
+            return Err(DomainError::LimitExceeded("process input".into()));
+        }
+        let stdin = self.stdin.as_mut().ok_or(DomainError::NotFound)?;
+        nonblocking(stdin.as_raw_fd())?;
+        match stdin.write(bytes) {
+            Ok(count) => Ok(Some(count)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(io_error(error)),
+        }
+    }
     pub fn close_input(&mut self) {
         self.stdin.take();
     }
@@ -553,7 +704,26 @@ impl OwnedProcess {
         }
         Ok(self.status)
     }
+    pub fn completion(&self) -> Option<ProcessCompletion> {
+        self.completion
+    }
     fn finish(&mut self) {
+        if self.completion.is_none()
+            && let Some(control) = &mut self.control
+        {
+            // The helper has exited; its private control socket now contains either
+            // one bounded terminal receipt or EOF. Root children never inherit it.
+            let mut frame = [0u8; 6];
+            if control.read_exact(&mut frame).is_ok() && frame[0] == 2 {
+                let code = i32::from_le_bytes(frame[2..].try_into().unwrap());
+                self.completion = match frame[1] {
+                    0 => Some(ProcessCompletion::Exited(code)),
+                    1 => Some(ProcessCompletion::Signaled(code)),
+                    2 => Some(ProcessCompletion::TimedOut),
+                    _ => None,
+                };
+            }
+        }
         self.done.store(true, Ordering::Release);
         for reader in self.readers.drain(..) {
             let _ = reader.join();
@@ -786,6 +956,7 @@ pub fn helper_main() -> Result<i32, DomainError> {
     let started = Instant::now();
     let mut ending: Option<Instant> = None;
     let mut exit_code = None;
+    let mut root_completion: Option<(u8, i32)> = None;
     loop {
         let mut status = 0;
         loop {
@@ -794,6 +965,11 @@ pub fn helper_main() -> Result<i32, DomainError> {
                 break;
             }
             if pid == root_pid {
+                root_completion.get_or_insert(if libc::WIFEXITED(status) {
+                    (0, libc::WEXITSTATUS(status))
+                } else {
+                    (1, libc::WTERMSIG(status))
+                });
                 exit_code = Some(if libc::WIFEXITED(status) {
                     libc::WEXITSTATUS(status)
                 } else {
@@ -815,6 +991,7 @@ pub fn helper_main() -> Result<i32, DomainError> {
         if !spec.resident && started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
             ending.get_or_insert_with(Instant::now);
             exit_code.get_or_insert(124);
+            root_completion.get_or_insert((2, 124));
         }
         if let Some(since) = ending {
             let sig = if since.elapsed() >= Duration::from_millis(spec.grace_ms) {
@@ -824,6 +1001,11 @@ pub fn helper_main() -> Result<i32, DomainError> {
             };
             kill_direct_children(sig)?;
             if direct_children()?.is_empty() {
+                if let Some((kind, code)) = root_completion {
+                    let mut frame = [2, kind, 0, 0, 0, 0];
+                    frame[2..].copy_from_slice(&code.to_le_bytes());
+                    let _ = control.write_all(&frame);
+                }
                 return Ok(exit_code.unwrap_or(130));
             }
             if since.elapsed() > Duration::from_millis(STOP_DEADLINE_MS - 500) {

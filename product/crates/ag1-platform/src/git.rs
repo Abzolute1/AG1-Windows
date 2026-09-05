@@ -39,7 +39,7 @@ impl GitService {
         })
     }
     fn run(&self, workspace: &Workspace, args: &[String]) -> Result<Vec<u8>, DomainError> {
-        workspace.verify_root()?;
+        let pinned = workspace.pin_directory("")?;
         let spool = self.spools.join(format!(
             "git-{}-{}.log",
             std::process::id(),
@@ -67,7 +67,7 @@ impl GitService {
                 resident: false,
                 executable: self.executable.clone(),
                 argv,
-                cwd: workspace.root().to_path_buf(),
+                cwd: pinned.process_cwd(),
                 env,
                 timeout_ms: 10_000,
                 grace_ms: 100,
@@ -85,6 +85,7 @@ impl GitService {
             if view.truncated || view.total_seen > MAX_GIT_BYTES as u64 {
                 return Err(DomainError::LimitExceeded("Git output".into()));
             }
+            pinned.verify_identity()?;
             let mut bytes = vec![];
             while bytes.len() < view.disk_bytes {
                 bytes.extend(child.log_page(bytes.len() as u64, 32 * 1024)?);
@@ -232,5 +233,116 @@ fn validate_oid(value: &str) -> Result<(), DomainError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+/// P09 read-only diff transport. Arguments are assembled by the native tool adapter;
+/// no shell or repository-configured external diff/text conversion is executed.
+impl GitService {
+    pub(crate) fn tool_diff(
+        &self,
+        workspace: &Workspace,
+        tail: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<(String, bool), DomainError> {
+        let _claim = workspace.claim()?;
+        let pinned = workspace.pin_directory("")?;
+        let check = || {
+            if cancel.load(Ordering::Acquire) {
+                Err(DomainError::Cancelled)
+            } else if std::time::Instant::now() >= deadline {
+                Err(DomainError::TimedOut)
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let mut argv: Vec<String> = [
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "--no-pager",
+            "--literal-pathspecs",
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--relative",
+        ]
+        .map(str::to_string)
+        .into();
+        argv.extend_from_slice(tail);
+        let spool = self.spools.join(format!(
+            "tool-git-{}-{}.log",
+            std::process::id(),
+            SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut child = self.supervisor.spawn_protocol_limited(
+            ProcessSpec {
+                executable: self.executable.clone(),
+                argv,
+                cwd: pinned.process_cwd(),
+                env: BTreeMap::from([
+                    ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+                    ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+                    ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
+                    ("GIT_TERMINAL_PROMPT".into(), "0".into()),
+                    ("LC_ALL".into(), "C".into()),
+                ]),
+                timeout_ms: deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .clamp(1, 86_400_000) as u64,
+                grace_ms: 100,
+                resident: false,
+            },
+            &spool,
+            1024 * 1024 * 1024,
+        )?;
+        // Spool ownership is obtained only after successful create_new/spawn.
+        struct SpoolCleanup(PathBuf);
+        impl Drop for SpoolCleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = SpoolCleanup(spool);
+        child.close_input();
+        let mut output = vec![];
+        let status;
+        loop {
+            check()?;
+            let bytes = child.read_stdout(32768)?;
+            let empty = bytes.is_empty();
+            output.extend(bytes);
+            if output.len() > 5 * 1024 * 1024 {
+                return Err(DomainError::LimitExceeded("Git diff output".into()));
+            }
+            if empty && let Some(exit) = child.try_wait()? {
+                status = exit;
+                break;
+            }
+            if empty {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        pinned.verify_identity()?;
+        check()?;
+        if status.success() {
+            Ok((
+                String::from_utf8(output)
+                    .map_err(|_| DomainError::InvalidInput("UTF-8 Git diff".into()))?,
+                true,
+            ))
+        } else {
+            Ok((
+                String::from_utf8_lossy(&child.tail(65536)?.bytes)
+                    .trim()
+                    .into(),
+                false,
+            ))
+        }
     }
 }

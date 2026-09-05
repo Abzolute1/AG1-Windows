@@ -47,4 +47,18 @@ pub trait StoragePort: Send + Sync {
         expected_sha256: Option<&str>,
         bytes: &[u8],
     ) -> Result<String, DomainError>;
+    /// Atomically acknowledge a native successful check and release this
+    /// session's verification leases. The executor supplies the completion
+    /// record only after retaining the native result; hooks cannot authorize it.
+    fn commit_verified_tool(
+        &self,
+        _session: &str,
+        _id: &str,
+        _expected_sha256: &str,
+        _bytes: &[u8],
+    ) -> Result<String, DomainError> {
+        Err(DomainError::Unavailable(
+            "atomic verification settlement".into(),
+        ))
+    }
 }

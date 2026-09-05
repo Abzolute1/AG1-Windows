@@ -14,6 +14,16 @@ impl Store {
         expected: Option<&str>,
         raw: &[u8],
     ) -> StorageResult<String> {
+        self.save_metadata_with_verification(kind, id, expected, raw, None)
+    }
+    fn save_metadata_with_verification(
+        &self,
+        kind: &str,
+        id: &str,
+        expected: Option<&str>,
+        raw: &[u8],
+        verified_session: Option<&str>,
+    ) -> StorageResult<String> {
         valid_id(kind)?;
         valid_id(id)?;
         if matches!(
@@ -41,6 +51,13 @@ impl Store {
         let hash = self.publish(raw)?;
         self.hit(Boundary::BeforeTransaction)?;
         let tx = db.transaction()?;
+        if let Some(session) = verified_session {
+            crate::journal::active_session(&tx, session)?;
+            tx.execute(
+                "DELETE FROM leases WHERE session=?1 AND release_on_verification=1",
+                [session],
+            )?;
+        }
         if let Some((previous, bytes)) = old {
             tx.execute(
                 "INSERT OR IGNORE INTO metadata VALUES('metadata-history',?1,?2,?3,1)",
@@ -60,6 +77,32 @@ impl Store {
     }
 }
 impl StoragePort for Store {
+    fn commit_verified_tool(
+        &self,
+        session: &str,
+        id: &str,
+        expected: &str,
+        bytes: &[u8],
+    ) -> Result<String, DomainError> {
+        let record: ag1_core::tools::executor::Record = serde_json::from_slice(bytes)
+            .map_err(|_| DomainError::InvalidInput("verified tool completion".into()))?;
+        if record.session != session
+            || record.tool != "check"
+            || record.status != ag1_core::tools::executor::Status::Completed
+            || record.native_result.is_none()
+            || record.result.is_none()
+        {
+            return Err(DomainError::PermissionDenied);
+        }
+        self.save_metadata_with_verification(
+            "tool-operation",
+            id,
+            Some(expected),
+            bytes,
+            Some(session),
+        )
+        .map_err(domain_error)
+    }
     fn journal_snapshot(&self, session: &SessionId) -> Result<StoredJournal, DomainError> {
         self.snapshot(session.as_str())
             .map(|s| StoredJournal {

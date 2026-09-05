@@ -283,6 +283,35 @@ impl Store {
         self.verify_blob(&hash)?;
         Ok(raw)
     }
+    /// Internal execution replay only. Renderer/model reads continue to use bounded authenticated cursors.
+    pub(crate) fn execution_artifact_bytes(
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        limit: u64,
+    ) -> StorageResult<Vec<u8>> {
+        let db = self.conn()?;
+        Self::ready(&db)?;
+        let (hash, encoding, size) = authorized(&db, session, origin, id)?;
+        if encoding != "utf8" || size > limit || limit > 128 * 1024 * 1024 {
+            return Err(StorageError::Limit("execution artifact bytes".into()));
+        }
+        let evicted: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM evictions WHERE origin=?1 AND artifact=?2)",
+            params![origin, id],
+            |r| r.get(0),
+        )?;
+        if evicted {
+            return Err(StorageError::Missing("evicted artifact".into()));
+        }
+        drop(db);
+        let bytes = self.blob_bytes(&hash)?;
+        if bytes.len() as u64 != size {
+            return Err(StorageError::Corrupt("execution artifact size".into()));
+        }
+        Ok(bytes)
+    }
     pub fn page(
         &self,
         session: &str,

@@ -56,6 +56,17 @@ impl SourceService {
         }
         SourceSnapshot::new(&relative, snapshot)
     }
+    /// Validation can hash a larger file without retaining its body in a SourceSnapshot.
+    fn capture_reference(&self, input: &str) -> Result<SourceReference, DomainError> {
+        let (path, relative) = self.canonical(input)?;
+        let revision =
+            self.workspace
+                .stream(&relative, crate::workspace::MAX_STREAM_READ, |_| Ok(()))?;
+        if self.canonical(input)?.0 != path {
+            return Err(DomainError::Conflict);
+        }
+        SourceReference::new(&relative, &revision.sha256)
+    }
     pub fn validate(&mut self, reference: &str) -> SourceValidation {
         let result = if !reference.starts_with("file:") {
             return SourceValidation {
@@ -81,9 +92,8 @@ impl SourceService {
             }
         };
         // Always re-read bytes through validated descriptors. Metadata-only caching cannot certify freshness.
-        match self.capture(parsed.path()) {
-            Ok(snapshot) => {
-                let current = snapshot.reference();
+        match self.capture_reference(parsed.path()) {
+            Ok(current) => {
                 let status =
                     if current.path() == parsed.path() && current.digest() == parsed.digest() {
                         Freshness::Current

@@ -1,0 +1,9 @@
+import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');const {createAllToolDefinitions}=await import(pathToFileURL(path.join(root,'reference/ag1-executable/packages/coding-agent/dist/core/tools/index.js')));
+const privateRoot=fs.mkdtempSync(path.join(root,'.local/p09-catalog-'));
+const inert={cwd:privateRoot,features:{typedEvidenceCursors:true,evidenceLeases:true,segmentedCatalogs:true}};
+const definitions=createAllToolDefinitions(privateRoot,{artifact:inert,taskState:inert,runtimeObservation:inert,episode:inert,task:inert,compact:inert});
+fs.rmdirSync(privateRoot);
+const catalog=Object.values(definitions).map(d=>({name:d.name,label:d.label,description:d.description,parameters:d.parameters,...(d.promptSnippet?{promptSnippet:d.promptSnippet}:{}),...(d.promptGuidelines?{promptGuidelines:d.promptGuidelines}:{})}));
+const out={version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',model_actions:0,network_actions:0,catalog};const target=path.join(root,'fixtures/tools/catalog-oracle.json');if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(out,null,2)+'\n');fs.writeFileSync(path.join(root,'product/crates/ag1-core/resources/tool-catalog.json'),JSON.stringify(catalog,null,2)+'\n');}else{assert.deepEqual(JSON.parse(JSON.stringify(out)),JSON.parse(fs.readFileSync(target,'utf8')));assert.deepEqual(JSON.parse(JSON.stringify(catalog)),JSON.parse(fs.readFileSync(path.join(root,'product/crates/ag1-core/resources/tool-catalog.json'),'utf8')));}
+console.log(JSON.stringify({status:'passed',definitions:catalog.length,model_actions:0,network_actions:0}));
