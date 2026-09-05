@@ -1,0 +1,28 @@
+--- a/packages/coding-agent/src/core/source-revision.ts
++++ b/packages/coding-agent/src/core/source-revision.ts
+@@ -69,6 +69,25 @@
+ 	} finally {
+ 		closeSync(fd);
+ 	}
++}
++
++/** Bridge B03: displayed bytes and digest come from one descriptor snapshot. */
++export function readSourceSnapshot(rootDir: string, inputPath: string, maxBytes = 2 * 1024 * 1024): { text: string; revision: SourceRevision } {
++	const resolved = resolveWorkspaceFile(rootDir, inputPath);
++	const fd = openSync(resolved.absolutePath, "r");
++	try {
++		const before = fstatSync(fd, { bigint: true });
++		if (!before.isFile() || before.size > BigInt(maxBytes)) throw new Error("Source file exceeds snapshot limit or is not regular.");
++		const bytes = Buffer.alloc(Number(before.size));
++		let offset = 0;
++		while (offset < bytes.length) { const n = readSync(fd, bytes, offset, bytes.length - offset, offset); if (!n) break; offset += n; }
++		const after = fstatSync(fd, { bigint: true });
++		const current = statSync(resolved.absolutePath, { bigint: true });
++		const signature = (v: typeof before) => `${v.dev}:${v.ino}:${v.size}:${v.mtimeNs}:${v.ctimeNs}`;
++		if (offset !== bytes.length || signature(before) !== signature(after) || signature(after) !== signature(current)) throw new Error("Source changed during read; retry.");
++		const sha256 = createHash("sha256").update(bytes).digest("hex");
++		return { text: bytes.toString("utf8"), revision: {path: resolved.path, sha256, bytes: bytes.length, reference: `file:${resolved.path}@sha256:${sha256}`} };
++	} finally { closeSync(fd); }
+ }
+ 
+ export function createSourceRevision(rootDir: string, inputPath: string): SourceRevision {

@@ -1,0 +1,17 @@
+# Implementation progress
+
+Implementation began with P01 on 2026-09-05 (Europe/Oslo). Follow `ROADMAP.md` and `phases/README.md`; the machine authority for completion is each phase's `completion.json`, including its tests, artifact hashes and pending gates.
+
+P01 implements the isolated reference/bootstrap, runtime fingerprinting, executable scenario catalog, launch/request/session captures, frontend provenance inputs and fail-closed validation tools. Python and JavaScript here are development/reference harnesses. The final product core remains Rust with Tauri and React.
+
+The expanded reference suite revealed a stale cross-turn prefix test. The current source intentionally attaches working-state projection to the latest user message, preserving canonical history and stability within a tool loop. Its exact original failure and a passing independent replacement capture are recorded in `evidence/P01/REFERENCE_DIVERGENCES.md`; it is not silently counted as passed. Credential-dependent and Windows-only tests remain explicit later gates.
+
+Original AG1, user profiles, GGUFs and all three tuned llama.cpp builds remain untouched. No product runtime or migration authority is transferred by P01.
+
+P02 adds the compiling Rust core/protocol workspace, generated JSON Schema and TypeScript, and a deterministic fake host. Its gate runs contract tests, Rust/TS/schema round trips, parser/admission/order checks, formatting, Clippy, licenses and runtime preservation checks. See `evidence/P02/completion.json` for its actual completion status. The generated frontend types do not constitute a desktop application. P03 supplies platform adapters next; P04 introduces the Tauri/React desktop and guarded original TypeScript worker.
+
+P03 implements Linux workspace/filesystem/Git foundations, byte snapshots and atomic revision-checked mutations, bounded indexing/search, an owned child-subreaper helper, process/PTY lifecycle and a separate worker stdout transport. HTTP/secret ports have explicit fakes. The gate exercises disposable workspaces and controlled process trees, rechecks P02 contracts and records small/large fixture timings. `evidence/P03/completion.json` is authoritative for completion; native Windows/macOS tests remain pending. Tuned llama.cpp ownership and settings remain unchanged.
+
+P04 implements the React/Tauri desktop, supervised original SDK bridge, durable command ledger, bounded projections and native file/approval flows. It records corrected B01–B04/D01 behavior, matched native visual evidence, five-minute process measurements and actual renderer/license closure. See [the P04 report](evidence/P04/REPORT.md), [completion authority](evidence/P04/completion.json) and [development run instructions](../product/apps/desktop/README.md). The TS SDK remains authoritative; live inference, other OS runners, interactive preview and final Rust parity remain later gates.
+
+P05 adds independent Rust SQLite/blob storage, restartable frozen imports, lossless export/restore, authenticated evidence closure across forks, corruption retention and command reconciliation. See [the storage guide](../product/crates/ag1-storage/README.md), [P05 report](evidence/P05/REPORT.md) and [completion authority](evidence/P05/completion.json) for actual results and remaining gates. The current desktop continues to use its TypeScript worker; no live journals or model runtimes migrate in P05. P06 has not started.

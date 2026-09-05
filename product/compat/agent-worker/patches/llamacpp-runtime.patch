@@ -1,0 +1,64 @@
+--- a/packages/coding-agent/src/core/llamacpp-runtime.ts
++++ b/packages/coding-agent/src/core/llamacpp-runtime.ts
+@@ -1,3 +1,4 @@
++import { bridgeRuntimeGuard } from "./bridge-runtime-guard.js";
+ /**
+  * Managed llama.cpp runtime.
+  *
+@@ -1253,6 +1254,7 @@
+ }
+ 
+ function killPid(pid: number, signal: NodeJS.Signals, deps?: LlamaCppRuntimeDeps): boolean {
++	if (!bridgeRuntimeGuard().owns(pid)) throw new Error("Refusing to signal an unowned or reused PID");
+ 	const kill = deps?.kill ?? ((target, nextSignal) => process.kill(target, nextSignal));
+ 	try {
+ 		kill(pid, signal);
+@@ -1305,15 +1307,8 @@
+ }
+ 
+ export function evictLlamaCppPort(port: number, deps?: LlamaCppRuntimeDeps): number[] {
+-	const pids = listListenPidsOnPort(port, deps);
+-	const evicted: number[] = [];
+-	for (const pid of pids) {
+-		if (!pidAlive(pid, deps)) continue;
+-		killPid(pid, "SIGTERM", deps);
+-		waitForPidExit(pid, deps);
+-		evicted.push(pid);
+-	}
+-	return evicted;
++	if (listListenPidsOnPort(port, deps).length) throw new Error("Runtime port conflict: automatic eviction is disabled");
++	return [];
+ }
+ 
+ export async function ensureLlamaCppServer(options: EnsureLlamaCppOptions): Promise<{
+@@ -1325,6 +1320,7 @@
+ 	providerConfig?: LlamaCppProviderConfig;
+ 	reason?: string;
+ }> {
++	bridgeRuntimeGuard().checkOptions(options);
+ 	const env = envOf(options.deps, options.env);
+ 	const origin = llamaCppBaseUrl(env);
+ 	if (!llamaCppEnabled(env)) {
+@@ -1472,11 +1468,14 @@
+ 		extraArgs: modelProfile?.extraArgs,
+ 		mmproj,
+ 	});
++	await bridgeRuntimeGuard().checkPlan({ binary, args, model, profile: modelProfile, env });
+ 	const argsKey = llamaCppRuntimeKey(binary, args, modelProfile?.environment);
+ 	const existing = readRuntimeState(options.agentDir);
++	if (existing && !bridgeRuntimeGuard().owns(existing.pid)) throw new Error("Runtime conflict: persisted process is not owned by this worker");
+ 	const fetchImpl = options.deps?.fetchImpl ?? fetch;
+ 	const alreadyUp = await llamaCppHealth(origin, fetchImpl);
+ 	const liveIdentity = alreadyUp.ok ? await llamaCppIdentity(origin, fetchImpl) : undefined;
++	if (alreadyUp.ok && (!existing || !bridgeRuntimeGuard().owns(existing.pid))) throw new Error("Runtime conflict: foreign listener; no eviction performed");
+ 	const liveMatches = identityMatchesGguf(liveIdentity, model);
+ 	const existingMatchesArgs = Boolean(
+ 		existing &&
+@@ -1549,6 +1548,7 @@
+ 	if (child.pid === undefined) {
+ 		return { origin, model, started: false, reused: false, ready: false, providerConfig, reason: "spawn-failed" };
+ 	}
++	bridgeRuntimeGuard().adopt(child);
+ 	const serverPid: number = child.pid;
+ 	child.unref();
+ 

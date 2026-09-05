@@ -1,0 +1,73 @@
+--- a/packages/coding-agent/src/core/memory-store.ts
++++ b/packages/coding-agent/src/core/memory-store.ts
+@@ -1,4 +1,4 @@
+-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { existsSync, mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, renameSync, unlinkSync } from "node:fs";
+ import { join } from "node:path";
+ import { getProjectConfigDir } from "../config.js";
+ import { withJsonFileLock } from "./json-file-lock.js";
+@@ -76,9 +76,10 @@
+  */
+ function migrateParsedStore(parsed: ParsedMemoryFile): MemoryStore {
+ 	if ((parsed.version !== 1 && parsed.version !== 2 && parsed.version !== 3) || !Array.isArray(parsed.entries)) {
+-		return emptyMemoryStore();
+-	}
+-	const entries = (parsed.entries as unknown[]).filter(isMemoryEntry);
++		throw new Error("Unsupported or malformed memory schema; original bytes retained.");
++	}
++	if (!parsed.entries.every(isMemoryEntry) || (parsed.archived !== undefined && (!Array.isArray(parsed.archived) || !parsed.archived.every(isMemoryEntry)))) throw new Error("Invalid memory entry; original bytes retained.");
++	const entries = parsed.entries as MemoryEntry[];
+ 	const archived = Array.isArray(parsed.archived) ? (parsed.archived as unknown[]).filter(isMemoryEntry) : [];
+ 	const activeIds = new Set(entries.map((entry) => entry.id));
+ 	const uniqueArchived = archived.filter((entry) => !activeIds.has(entry.id));
+@@ -94,32 +95,43 @@
+ 	if (!existsSync(path)) return emptyMemoryStore();
+ 	try {
+ 		const raw = readFileSync(path, "utf8").trim();
+-		if (!raw) return emptyMemoryStore();
++		if (!raw) throw new Error("Empty memory file");
+ 		return migrateParsedStore(JSON.parse(raw) as ParsedMemoryFile);
+-	} catch {
+-		return emptyMemoryStore();
++	} catch (cause) {
++		throw new Error(`Corrupt memory at ${path}; restore or repair this file before retrying. Original bytes retained.`, { cause });
+ 	}
+ }
+ 
+ function writeMemoryStoreUnlocked(cwd: string, store: MemoryStore): void {
+ 	const dir = getProjectConfigDir(cwd);
+ 	mkdirSync(dir, { recursive: true });
+-	writeFileSync(memoryStorePath(cwd), `${JSON.stringify(store, null, 2)}\n`, "utf8");
++	// Validate both old and new state before replacing anything.
++	readMemoryStoreUnlocked(cwd);
++	migrateParsedStore(store);
++	const temporary = memoryStorePath(cwd) + `.bridge-${process.pid}.tmp`;
++	const fd = openSync(temporary, "wx", 0o600);
++	try {
++		writeFileSync(fd, `${JSON.stringify(store, null, 2)}\n`); fsyncSync(fd);
++	} finally { closeSync(fd); }
++	try {
++		renameSync(temporary, memoryStorePath(cwd));
++		const directory = openSync(dir, "r"); try { fsyncSync(directory); } finally { closeSync(directory); }
++	} finally { if (existsSync(temporary)) unlinkSync(temporary); }
+ }
+ 
+ export function loadMemoryStore(cwd: string): MemoryStore {
+-	return withJsonFileLock(memoryStorePath(cwd), () => readMemoryStoreUnlocked(cwd));
++	return withJsonFileLock(memoryStorePath(cwd) + ".bridge-lock", () => readMemoryStoreUnlocked(cwd));
+ }
+ 
+ export function saveMemoryStore(cwd: string, store: MemoryStore): void {
+-	withJsonFileLock(memoryStorePath(cwd), () => {
++	withJsonFileLock(memoryStorePath(cwd) + ".bridge-lock", () => {
+ 		writeMemoryStoreUnlocked(cwd, store);
+ 	});
+ }
+ 
+ /** Load-mutate-save under the store lock so parallel memory tool calls cannot drop entries. */
+ export function updateMemoryStore(cwd: string, mutator: (store: MemoryStore) => MemoryStore): MemoryStore {
+-	return withJsonFileLock(memoryStorePath(cwd), () => {
++	return withJsonFileLock(memoryStorePath(cwd) + ".bridge-lock", () => {
+ 		const next = mutator(readMemoryStoreUnlocked(cwd));
+ 		writeMemoryStoreUnlocked(cwd, next);
+ 		return next;

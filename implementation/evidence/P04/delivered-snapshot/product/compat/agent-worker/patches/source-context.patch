@@ -1,0 +1,25 @@
+--- a/packages/coding-agent/src/core/tools/source-context.ts
++++ b/packages/coding-agent/src/core/tools/source-context.ts
+@@ -26,7 +26,7 @@
+ 	recentAccessScore,
+ 	type WorkingTreeSignals,
+ } from "../source-retrieval-signals.js";
+-import { createSourceRevision, SourceRevisionValidator } from "../source-revision.js";
++import { readSourceSnapshot, SourceRevisionValidator } from "../source-revision.js";
+ import { buildWorkspaceIndex } from "../workspace-index.js";
+ import { resolveContainedPath } from "./path-utils.js";
+ 
+@@ -263,11 +263,11 @@
+ 	const stats = statSync(absolutePath);
+ 	if (!stats.isFile()) throw new Error(`Not a regular file: ${path}`);
+ 	if (stats.size > MAX_SOURCE_BYTES) throw new Error(`Source file exceeds 2 MiB: ${path}`);
+-	const text = readFileSync(absolutePath, "utf8");
++	const { text, revision } = readSourceSnapshot(cwd, path, MAX_SOURCE_BYTES);
+ 	if (text.includes("\0")) throw new Error(`Binary source is unsupported: ${path}`);
+ 	return {
+ 		lines: text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n"),
+-		reference: createSourceRevision(cwd, path).reference,
++		reference: revision.reference,
+ 	};
+ }
+ 

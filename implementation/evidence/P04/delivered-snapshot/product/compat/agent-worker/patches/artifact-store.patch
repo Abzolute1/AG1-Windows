@@ -1,0 +1,28 @@
+--- a/packages/coding-agent/src/core/artifact-store.ts
++++ b/packages/coding-agent/src/core/artifact-store.ts
+@@ -948,6 +948,25 @@
+ 	}
+ 
+ 	decodeReadCursor(cursor: string): DecodedArtifactCursor {
++		try { return this.decodeOwnReadCursor(cursor); } catch (error) {
++			// Only explicit, copied branch roots can authenticate inherited cursors.
++			const manifest = join(this.rootDir, "bridge-origins.json");
++			if (!existsSync(manifest)) throw error;
++			const origins: string[] = JSON.parse(readFileSync(manifest, "utf8"));
++			for (const session of origins) {
++				if (!/^[a-zA-Z0-9_-]{1,128}$/.test(session)) throw new Error("Invalid artifact origin");
++				try {
++					const origin = new ArtifactStore(join(this.rootDir, "origins", session), session, { features: this.features });
++					const decoded = origin.decodeOwnReadCursor(cursor);
++					this.get(decoded.id); // Branch authorization is independent of authentication.
++					return decoded;
++				} catch { /* Try the next authorized origin, then fail closed. */ }
++			}
++			throw error;
++		}
++	}
++
++	private decodeOwnReadCursor(cursor: string): DecodedArtifactCursor {
+ 		if (!this.features.typedEvidenceCursors) throw new Error("Typed evidence cursors are disabled.");
+ 		if (cursor.length > 2_048) throw new Error("Artifact cursor is too long.");
+ 		if (cursor.startsWith("ac2.")) return this.decodeBinaryReadCursor(cursor);
