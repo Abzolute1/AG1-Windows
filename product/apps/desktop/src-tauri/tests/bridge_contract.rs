@@ -71,6 +71,7 @@ fn real_worker_is_supervised_and_scoped() {
     ];
     let mut worker = Worker::spawn(
         ProcessSpec {
+            resident: false,
             executable: root.join(".local/toolchains/node-v24.14.0-linux-x64/bin/node"),
             argv,
             cwd: ws,

@@ -48,6 +48,7 @@ fn setup() -> (tempfile::TempDir, WorkspaceService, Arc<Workspace>) {
 }
 fn spec(cwd: &Path, args: &[&str]) -> ProcessSpec {
     ProcessSpec {
+        resident: false,
         executable: PathBuf::from(FIXTURE),
         argv: args.iter().map(|s| s.to_string()).collect(),
         cwd: cwd.to_path_buf(),
@@ -55,6 +56,24 @@ fn spec(cwd: &Path, args: &[&str]) -> ProcessSpec {
         timeout_ms: 10_000,
         grace_ms: 100,
     }
+}
+
+#[test]
+fn resident_process_lifetime_ends_with_its_owner_control_connection() {
+    let directory = tempfile::tempdir().unwrap();
+    let pid_file = directory.path().join("resident.pid");
+    let supervisor = ProcessSupervisor::new(Path::new(HELPER)).unwrap();
+    let mut request = spec(directory.path(), &["hold", pid_file.to_str().unwrap()]);
+    request.timeout_ms = 20;
+    request.resident = true;
+    let mut child = supervisor
+        .spawn(request, &directory.path().join("resident.log"))
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert!(child.try_wait().unwrap().is_none());
+    let pid: u32 = fs::read_to_string(pid_file).unwrap().parse().unwrap();
+    child.stop().unwrap();
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
 }
 fn supervisor() -> ProcessSupervisor {
     ProcessSupervisor::new(Path::new(HELPER)).unwrap()
@@ -429,6 +448,7 @@ fn log_spool_memory_disk_and_tail_cost_are_bounded() {
 fn pty_bytes_resize_exit_and_disconnect_are_explicit() {
     let dir = tempfile::tempdir().unwrap();
     let request = ProcessSpec {
+        resident: false,
         executable: "/bin/sh".into(),
         argv: vec![
             "-c".into(),

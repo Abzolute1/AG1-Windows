@@ -89,6 +89,10 @@ pub struct ProcessSpec {
     pub env: BTreeMap<String, String>,
     pub timeout_ms: u64,
     pub grace_ms: u64,
+    /// A model resident is bounded by its private owner control connection instead
+    /// of a tool deadline. This is host-only and never accepted from renderer DTOs.
+    #[serde(default)]
+    pub resident: bool,
 }
 impl ProcessSpec {
     fn validate(&self) -> Result<(), DomainError> {
@@ -808,7 +812,7 @@ pub fn helper_main() -> Result<i32, DomainError> {
                 ending.get_or_insert_with(Instant::now);
             }
         }
-        if started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
+        if !spec.resident && started.elapsed() >= Duration::from_millis(spec.timeout_ms) {
             ending.get_or_insert_with(Instant::now);
             exit_code.get_or_insert(124);
         }

@@ -3,9 +3,11 @@ pub mod diagnostics;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod git;
+pub mod llama;
 pub mod ports;
 #[cfg(target_os = "linux")]
 pub mod process;
+pub mod provider;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 

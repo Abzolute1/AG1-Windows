@@ -351,6 +351,7 @@ impl Desktop {
             .keep();
         let worker = Worker::spawn(
             ProcessSpec {
+                resident: false,
                 executable,
                 argv,
                 cwd: workspace.clone(),

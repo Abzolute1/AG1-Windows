@@ -1,4 +1,7 @@
 //! GUI-independent domain boundaries. No filesystem, database, process or model implementation.
+pub mod inference;
+pub mod model;
+pub mod provider;
 pub mod storage;
 use std::{collections::VecDeque, future::Future, pin::Pin};
 
@@ -199,3 +202,8 @@ impl<T> EndpointQueue<T> {
         self.waiting.is_empty()
     }
 }
+
+pub mod tuning;
+
+pub mod fallback;
+pub mod isolated;

@@ -8,6 +8,15 @@ use std::{
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("") {
+        "--model" => {
+            // P06 fake model server: records the exact launch and waits for its owner.
+            // This executable performs no inference and never opens a model endpoint.
+            let record = std::env::var("AG1_MODEL_FIXTURE_RECORD").unwrap();
+            std::fs::write(record,serde_json::to_vec(&serde_json::json!({"pid":std::process::id(),"args":&args[1..],"library":std::env::var("LD_LIBRARY_PATH").ok()})).unwrap()).unwrap();
+            loop {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
         "echo" => {
             println!("cwd={}", std::env::current_dir().unwrap().display());
             println!(

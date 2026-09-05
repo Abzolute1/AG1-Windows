@@ -64,6 +64,7 @@ impl GitService {
         ]);
         let mut child = self.supervisor.spawn(
             ProcessSpec {
+                resident: false,
                 executable: self.executable.clone(),
                 argv,
                 cwd: workspace.root().to_path_buf(),
