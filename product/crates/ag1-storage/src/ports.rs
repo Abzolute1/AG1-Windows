@@ -132,3 +132,119 @@ impl StoragePort for Store {
             .map_err(domain_error)
     }
 }
+
+impl ag1_core::task::JournalWritePort for Store {
+    fn append_records(
+        &self,
+        session: &SessionId,
+        command: &str,
+        expected: u64,
+        records: &[Vec<u8>],
+    ) -> Result<(u64, u64), DomainError> {
+        self.append_batch(session.as_str(), command, expected, records)
+            .map(|ack| (ack.revision, ack.sequence))
+            .map_err(domain_error)
+    }
+}
+
+impl ag1_core::evidence::EvidencePort for Store {
+    fn record(
+        &self,
+        request: &ag1_core::evidence::EvidenceRequest,
+    ) -> Result<serde_json::Value, DomainError> {
+        let bytes = self
+            .artifact_record(
+                request.requester.as_str(),
+                &request.origin,
+                &request.artifact,
+            )
+            .map_err(domain_error)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|_| DomainError::InvalidInput("evidence metadata".into()))
+    }
+    fn page(
+        &self,
+        request: &ag1_core::evidence::EvidenceRequest,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<ag1_core::evidence::EvidencePage, DomainError> {
+        self.page(
+            request.requester.as_str(),
+            &request.origin,
+            &request.artifact,
+            offset,
+            max_bytes,
+        )
+        .map(|p| ag1_core::evidence::EvidencePage {
+            bytes: p.bytes,
+            offset: p.offset,
+            next_offset: p.next_offset,
+        })
+        .map_err(domain_error)
+    }
+    fn read_cursor(
+        &self,
+        requester: &SessionId,
+        cursor: &str,
+    ) -> Result<ag1_core::evidence::EvidencePage, DomainError> {
+        self.read_cursor(requester.as_str(), cursor)
+            .map(|p| ag1_core::evidence::EvidencePage {
+                bytes: p.bytes,
+                offset: p.offset,
+                next_offset: p.next_offset,
+            })
+            .map_err(domain_error)
+    }
+    fn cursor(
+        &self,
+        request: &ag1_core::evidence::EvidenceRequest,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<String, DomainError> {
+        self.cursor(
+            request.requester.as_str(),
+            &request.origin,
+            &request.artifact,
+            offset,
+            max_bytes,
+        )
+        .map_err(domain_error)
+    }
+    fn search(
+        &self,
+        requester: &SessionId,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ag1_core::evidence::EvidenceHit>, DomainError> {
+        self.search(requester.as_str(), query, limit)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|r| ag1_core::evidence::EvidenceHit {
+                        origin: r.origin,
+                        artifact: r.artifact,
+                        line: r.line,
+                        text: r.text,
+                    })
+                    .collect()
+            })
+            .map_err(domain_error)
+    }
+    fn lease(
+        &self,
+        request: &ag1_core::evidence::EvidenceRequest,
+        reason: &str,
+        ttl_ms: u64,
+        release_on_verification: bool,
+    ) -> Result<(), DomainError> {
+        self.lease(
+            request.requester.as_str(),
+            &request.origin,
+            &request.artifact,
+            reason,
+            ttl_ms,
+            release_on_verification,
+        )
+        .map(|_| ())
+        .map_err(domain_error)
+    }
+}

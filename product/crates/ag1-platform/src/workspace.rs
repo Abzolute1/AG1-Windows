@@ -57,9 +57,9 @@ fn beneath(directory: &File, path: &Path, flags: OFlags, mode: Mode) -> Result<F
     .map(File::from)
     .map_err(errno)
 }
-fn revision(metadata: &Metadata, bytes: &[u8]) -> FileRevision {
+fn revision(metadata: &Metadata, sha256: &str) -> FileRevision {
     FileRevision {
-        sha256: format!("{:x}", Sha256::digest(bytes)),
+        sha256: sha256.into(),
         device: metadata.dev(),
         inode: metadata.ino(),
         size: metadata.len(),
@@ -93,6 +93,16 @@ impl Workspace {
         Ok(())
     }
     pub fn snapshot(&self, name: &str, limit: usize) -> Result<ByteSnapshot, DomainError> {
+        self.snapshot_with_barrier(name, limit, || {})
+    }
+    /// Host instrumentation seam: runs after byte read and before identity validation.
+    /// Never exposed as a renderer command. Used to force mutation races deterministically.
+    pub fn snapshot_with_barrier(
+        &self,
+        name: &str,
+        limit: usize,
+        after_read: impl FnOnce(),
+    ) -> Result<ByteSnapshot, DomainError> {
         self.verify_root()?;
         if limit == 0 || limit > MAX_READ {
             return Err(DomainError::LimitExceeded("read bytes".into()));
@@ -116,8 +126,10 @@ impl Workspace {
         if bytes.len() > limit {
             return Err(DomainError::LimitExceeded("read bytes".into()));
         }
+        after_read();
         let after = file.metadata().map_err(io_error)?;
-        if revision(&before, &bytes) != revision(&after, &bytes) {
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if revision(&before, &digest) != revision(&after, &digest) {
             return Err(DomainError::Conflict);
         }
         // Reopen through the root capability to detect path replacement during the read.
@@ -129,11 +141,12 @@ impl Workspace {
         )?
         .metadata()
         .map_err(io_error)?;
-        if revision(&current, &bytes) != revision(&after, &bytes) {
+        if revision(&current, &digest) != revision(&after, &digest) {
             return Err(DomainError::Conflict);
         }
+        self.verify_root()?;
         Ok(ByteSnapshot {
-            revision: revision(&after, &bytes),
+            revision: revision(&after, &digest),
             bytes,
         })
     }

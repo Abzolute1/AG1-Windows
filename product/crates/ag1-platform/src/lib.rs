@@ -24,3 +24,6 @@ pub(crate) fn io_error(error: std::io::Error) -> ag1_core::DomainError {
         _ => DomainError::Io(error.to_string()),
     }
 }
+
+#[cfg(target_os = "linux")]
+pub mod source;
