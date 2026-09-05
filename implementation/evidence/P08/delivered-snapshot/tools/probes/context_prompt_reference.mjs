@@ -1,0 +1,11 @@
+import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const base=path.join(root,'reference/ag1-executable/packages/coding-agent/dist/core');
+const OriginalDate=Date;globalThis.Date=class extends OriginalDate{constructor(...args){super(...(args.length?args:['2026-09-05T00:00:00.000Z']));}static now(){return OriginalDate.parse('2026-09-05T00:00:00.000Z');}};
+const {buildSystemPrompt}=await import(pathToFileURL(path.join(base,'system-prompt.js')));
+const {capturePrefixShape}=await import(pathToFileURL(path.join(base,'prefix-shape.js')));
+const fixture=JSON.parse(fs.readFileSync(path.join(root,'fixtures/context/prompt-inputs.json'),'utf8'));
+const prompts=fixture.prompts.map(input=>({input,output:buildSystemPrompt(input)}));
+const prefixes=fixture.prefixes.map(input=>({input,output:capturePrefixShape(input.system,input.tools,input.rewrite)}));
+const out={version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',model_actions:0,network_actions:0,prompts,prefixes};const target=path.join(root,'fixtures/context/prompt-oracle.json');if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(out,null,2)+'\n');}else assert.deepEqual(out,JSON.parse(fs.readFileSync(target,'utf8')));console.log(JSON.stringify({status:'passed',prompts:prompts.length,prefixes:prefixes.length,model_actions:0,network_actions:0}));

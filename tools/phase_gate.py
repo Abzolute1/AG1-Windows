@@ -173,6 +173,9 @@ def main():
     elif args.phase=='P07':
         from evidence_gate import execute_p07
         execute_p07()
+    elif args.phase=='P08':
+        from context_gate import execute_p08
+        execute_p08()
     else:raise GateError(f'{args.phase} has no implemented gate yet; refusing a placeholder pass')
 
 

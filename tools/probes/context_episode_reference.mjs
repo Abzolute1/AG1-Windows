@@ -1,0 +1,17 @@
+import fs from 'node:fs';import path from 'node:path';import assert from 'node:assert/strict';import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const base=path.join(root,'reference/ag1-executable/packages/coding-agent/dist/core');
+const episode=await import(pathToFileURL(path.join(base,'episode-memory.js')));
+const retrieval=await import(pathToFileURL(path.join(base,'episode-retrieval.js')));
+const candidate=await import(pathToFileURL(path.join(base,'episode-candidate.js')));
+const {resolveContextArchitectureFeatures}=await import(pathToFileURL(path.join(base,'cv-architecture.js')));
+const fixture=JSON.parse(fs.readFileSync(path.join(root,'fixtures/context/episode-inputs.json'),'utf8'));
+const store={get:id=>{const row=fixture.artifacts.find(r=>r.id===id);if(!row)throw Error('missing');return row;}};
+const validator={validate:source=>({source,status:fixture.freshness[source]??'invalid'})};
+const records=fixture.records.map(input=>({input,output:episode.parseEpisodeRecord(input)??null}));
+const searches=fixture.queries.map(query=>({query,result:retrieval.searchEpisodeMemory({entries:fixture.entries,query,artifactStore:store,sourceRevisionValidator:validator}),addendum:retrieval.buildEpisodeContextAddendum({entries:fixture.entries,query,artifactStore:store,sourceRevisionValidator:validator})??null}));
+const candidates=fixture.candidates.map(input=>{try{const output=candidate.parseEpisodeCandidate(input.text,new Set(input.allowed));candidate.validateEpisodeCandidateVerification(output,store);return {input,output};}catch{return {input,output:null};}});
+const features=fixture.features.map(input=>({input,output:resolveContextArchitectureFeatures(input.explicit,input.env)}));
+const out={version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',model_actions:0,network_actions:0,records,searches,candidates,features};
+const target=path.join(root,'fixtures/context/episode-oracle.json');if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(out,null,2)+'\n');}else assert.deepEqual(out,JSON.parse(fs.readFileSync(target,'utf8')));console.log(JSON.stringify({status:'passed',records:records.length,searches:searches.length,candidates:candidates.length,features:features.length,model_actions:0,network_actions:0}));

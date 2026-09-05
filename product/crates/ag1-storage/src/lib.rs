@@ -1,5 +1,6 @@
 //! Shadow-only persistence. No model, process-control, renderer or live TS authority.
 mod artifacts;
+pub mod context;
 mod import;
 mod journal;
 mod persistence;

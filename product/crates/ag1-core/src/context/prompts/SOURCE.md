@@ -1,0 +1,1 @@
+Prompt text preserved from Cruzible e30f0b4b238ee5618928bcd17b4571eb046e7038, packages/coding-agent/src/core/compaction/{compaction,utils}.ts and episode-candidate.ts. AG1/Cruzible MIT license; see product/licenses for notices. These are application prompt resources, not instructions for the implementation agent.

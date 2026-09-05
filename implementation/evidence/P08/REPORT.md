@@ -1,0 +1,16 @@
+# P08 retrieval, episodes and context compilation
+
+The gate executed 81 Rust contracts, eleven unchanged SDK probes, validator rejection tests, strict Clippy/formatting and three alternating-order measurement runs per runtime. See [completion authority](completion.json), [performance and noise](performance.json), [coverage](coverage.json), and [the API guide](delivered-snapshot/product/crates/ag1-core/CONTEXT.md).
+
+Original request and journal custody must acknowledge durable bytes before a reduction runs. Failure injection covers blob sync, rename, transaction, commit and acknowledgement boundaries; restart retains uncertain evidence, rejects orphans and detects concurrent journal revisions. Episode close retains original trajectory bytes, branches preserve evidence authorization, and candidate drafting remains non-authoritative.
+
+- TS remains executing desktop/session authority until P13. P08 delivers Rust context/retrieval shadow services and durable projection receipts; live admission, compaction epochs, retries and sequential isolated calls integrate in P10.
+- No desktop, real model, GPU, foreign process or credential-dependent provider was launched. Optional drafts and summary requests use actual SDK fixture providers; Rust requests bind the P06 same-model identity and existing scheduler permit contract.
+- Snapshot estimates are cached only on private immutable owned messages; every pass refreshes artifact authorization and leases. Source freshness still rereads validated bytes. The compatibility Vec<Value> API materializes owned output and is not the hot-path timing API.
+- All 201 protected messages remain recoverable; protected over-target diagnostics are accepted without deleting protected evidence. Large input contains over two million estimated tokens; all selected evidence and raw output hashes are compared unchanged.
+- Source host runs owned Linux rg or a bounded CPU fallback. Git/recent signals consume explicit captured state. Filesystem tie ordering is deterministic path order; source metadata never proves freshness.
+- Historical dates require RFC3339 and UTF-16 clipping retains complete Unicode scalars. Capsule display paths must match source-reference paths; malformed paths are rejected. Pair-boundary correction can retain more history than the legacy SDK cut.
+- Legacy PTL head-drop is a stateless analysis transform; durable pinned user intent/task state and raw trajectory are retained separately. Controlled storage projections reject orphan tool results and reject a changed journal revision before returning.
+- Summary preparation JSON omits JavaScript undefined properties at the persisted JSON boundary. Random artifact IDs/clocks alone are normalized; selection, ordering, claim kinds, full prompts and raw evidence digests are unchanged.
+- Compiler/retrieval measurements are synthetic offline workloads, not whole-application or model-throughput results. P05 durable custody/reopen/page timings and retained file sizes are reported separately; no physical device-write or universal fsync guarantee is claimed.
+- Windows/macOS, real native/visual integration, live per-model quality and 8h/24h release workloads remain explicit P11–P14 gates. The three tuned llama.cpp builds, linked libraries, GGUFs and original profiles remain unchanged.

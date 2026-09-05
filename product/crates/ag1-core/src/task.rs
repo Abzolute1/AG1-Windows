@@ -33,7 +33,11 @@ pub(crate) fn text(value: &str, cap: usize) -> String {
         .collect()
 }
 pub(crate) fn units(value: &str) -> usize {
-    value.encode_utf16().count()
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.encode_utf16().count()
+    }
 }
 pub(crate) fn list(value: &Value, cap: usize) -> Result<Vec<String>, DomainError> {
     let rows = value
