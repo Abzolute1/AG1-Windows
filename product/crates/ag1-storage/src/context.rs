@@ -149,6 +149,17 @@ impl<'a> ContextStore<'a> {
         }
         Ok(origins[0].clone())
     }
+    /// Host command materialization, with an explicit bound before allocation.
+    /// Renderer reads continue to use pages. Inherited origins remain subject
+    /// to the requesting session's access closure and immutable content hash.
+    pub fn bounded_text(&self, id: &str, limit: u64) -> Result<String, DomainError> {
+        let origin = self.origin_for(id)?;
+        let bytes = self
+            .store
+            .execution_artifact_bytes(self.session.as_str(), &origin, id, limit)
+            .map_err(domain_error)?;
+        String::from_utf8(bytes).map_err(|_| DomainError::InvalidInput("artifact UTF-8".into()))
+    }
 }
 impl ContextArtifactPort for ContextStore<'_> {
     fn put_text(

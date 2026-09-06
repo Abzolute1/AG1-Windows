@@ -25,3 +25,21 @@ pub mod web_presentation;
 pub mod websearch;
 
 pub mod targets;
+
+pub mod memory;
+pub mod repo;
+pub mod task_state;
+
+pub mod artifact_scan;
+
+pub mod submit_plan;
+pub mod todo;
+
+pub mod observation;
+/// Derived journal records and the tool presentation published after their acknowledgement.
+pub struct JournalToolPlan {
+    pub records: Vec<serde_json::Value>,
+    pub result: serde_json::Value,
+}
+
+pub mod episode;

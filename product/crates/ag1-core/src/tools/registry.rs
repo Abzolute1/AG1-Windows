@@ -53,7 +53,7 @@ impl ValidatedCall {
         self.origin
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Registry {
     definitions: BTreeMap<String, Definition>,
     active: BTreeSet<String>,

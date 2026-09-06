@@ -1,5 +1,7 @@
 # Implementation progress
 
+P10 delivers the native session/runtime facade in isolated workspaces. Its authoritative status, exact commands, hashes, trace coverage and later gates are in [completion evidence](evidence/P10/completion.json), with the [report](evidence/P10/REPORT.md) and [session guide](../product/crates/ag1-platform/SESSION.md). The normal desktop remains TypeScript authority and all tuned llama.cpp runtimes/settings remain preserved. Earlier P10 checkpoints are archived in [history](evidence/P10/HISTORY.md).
+
 Implementation began with P01 on 2026-09-05 (Europe/Oslo). Follow `ROADMAP.md` and `phases/README.md`; the machine authority for completion is each phase's `completion.json`, including its tests, artifact hashes and pending gates.
 
 P01 implements the isolated reference/bootstrap, runtime fingerprinting, executable scenario catalog, launch/request/session captures, frontend provenance inputs and fail-closed validation tools. Python and JavaScript here are development/reference harnesses. The final product core remains Rust with Tauri and React.

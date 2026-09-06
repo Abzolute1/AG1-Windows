@@ -16,6 +16,8 @@ pub struct GenerationLimits {
     pub max_output_bytes: usize,
     pub prefill_ms: u64,
     pub idle_ms: u64,
+    /// Zero disables the overall watchdog, matching disabled long-reasoning
+    /// limits. Cancellation, byte limits and any nonzero watchdog still apply.
     pub overall_ms: u64,
 }
 pub struct GenerationRequest {
@@ -134,8 +136,7 @@ async fn generation_with_admission(
     mut observer: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
 ) -> Result<ProviderSnapshot, GenerationFailure> {
     let limits = &generation.limits;
-    if limits.overall_ms == 0
-        || limits.overall_ms > 86_400_000
+    if limits.overall_ms > 86_400_000
         || limits.prefill_ms > 86_400_000
         || limits.idle_ms > 86_400_000
     {
@@ -146,7 +147,8 @@ async fn generation_with_admission(
         ));
     }
     let started = Instant::now();
-    let hard_deadline = started + Duration::from_millis(limits.overall_ms);
+    let hard_deadline =
+        (limits.overall_ms != 0).then(|| started + Duration::from_millis(limits.overall_ms));
     let prepared = (|| {
         http.validate_request(&generation.request)?;
         if cancel.cancelled() {
@@ -177,19 +179,20 @@ async fn generation_with_admission(
         reducer
             .watchdog_deadline_ms(limits.prefill_ms, limits.idle_ms)
             .map(|ms| started + Duration::from_millis(ms))
-            .unwrap_or(hard_deadline)
-            .min(hard_deadline)
+            .into_iter()
+            .chain(hard_deadline)
+            .min()
     };
     let redactor = ErrorRedactor::new(&generation.request);
     let mut response = http
-        .send(generation.request, deadline(&reducer), cancel)
+        .send_until(generation.request, deadline(&reducer), cancel)
         .await
         .map_err(|e| failure(e, Some(&reducer)))?;
     if !(200..300).contains(&response.status()) {
         let status = response.status();
         let mut body = vec![];
         while let Some(bytes) = response
-            .chunk(hard_deadline, cancel)
+            .chunk_until(hard_deadline, cancel)
             .await
             .map_err(|e| failure(e, Some(&reducer)))?
         {
@@ -235,7 +238,7 @@ async fn generation_with_admission(
         Frames::Sse(SseDecoder::new(2 * 1024 * 1024).map_err(|e| failure(e, Some(&reducer)))?)
     };
     while let Some(bytes) = response
-        .chunk(deadline(&reducer), cancel)
+        .chunk_until(deadline(&reducer), cancel)
         .await
         .map_err(|e| failure(e, Some(&reducer)))?
     {

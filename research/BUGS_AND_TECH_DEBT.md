@@ -30,6 +30,26 @@ This violates the purpose of provenance and freshness. `source-revision.ts` chec
 
 **Target regression:** fork a session with source capsules, compaction/episode/tool artifacts, binary evidence and active cursors; prove the child can resolve its authorized historical evidence after restart and parent archival/deletion policy. Choose shared immutable blobs with explicit cross-branch authorization/reference ownership or a complete remapping/import transaction; never leave dangling references or weaken cross-session access checks. Apply the same closure check to JSONL-only import/export. Retention must not delete evidence still referenced by another branch.
 
+### B05 — Removing label records during a fork breaks message ancestry
+
+**Confirmed during P10 implementation against the pinned reference, in disposable files.** `A:core/session-manager.ts:createBranchedSession` removes historical label entries and appends resolved labels, but leaves retained messages pointing to the removed label IDs. `walkBranchPath` stops when a parent is absent. A message following an interleaved label therefore loses its earlier ancestors from the fork's traversed history even though those records remain physically present.
+
+`tools/probes/runtime_session_fork_reference.mjs` captures six real SessionManager cases in `fixtures/runtime/session-fork-oracle.json`. Five label-bearing cases contain a dangling parent and omit the first message from `getBranch`; the plain case retains both messages. The captures also establish current label updates, removal and re-addition ordering, and exclusion of labels whose targets are outside the selected branch. This is a history-loss defect, not an intentional label display rule. Cruzible remains unchanged.
+
+**Native correction and regression:** `SessionSeed::RuntimeFork` creates a new header, retains the source's resolved-label behavior, and reconnects retained entries through the previous retained ancestor before appending new labels. The original parent journal is unchanged. `product/crates/ag1-storage/tests/runtime_fork/mod.rs` compares all six source captures with that explicit ancestry correction and verifies complete traversable history, empty-fork authority, atomic origin/receipt custody, lost acknowledgements and exact retry after the parent advances. The lower-level lossless `SessionSeed::Fork` primitive remains available for storage compatibility; the product session transition uses `RuntimeFork`.
+
+### B06 — Discarding an executing plan can restore its previous state on reload
+
+**Confirmed during P10 against the pinned plan state functions.** `A:modes/interactive/interactive-plan-artifacts.ts:updateInteractivePlanArtifactStatus` retains execution-step fields when changing an executing plan to discarded. Its parser rejects those fields on non-executing plans. The latest-plan lookup then skips the new discarded record and returns the older executing record. The interactive clear command uses this status update without clearing the execution fields.
+
+`tools/probes/runtime_plan_state_reference.mjs` captures the actual transition, reload result and all 64 source status-transition decisions in `fixtures/runtime/plan-state-oracle.json`. No original source is changed. The Rust plan reducer clears execution fields when leaving executing state. Its regression checks that a discarded plan remains discarded, exact plan/revision references distinguish independent threads, and an invalid transition or clarification index is rejected. This is a domain regression; the complete native plan command workflow is still being implemented.
+
+### B07 — Completing one plan step can hide its review and progress on reload
+
+**Confirmed during P10 against the pinned plan functions.** `A:modes/interactive/interactive-plan-artifacts.ts:recordInteractivePlanStepExecutionReview` clears execution-step fields after an assistant review reports completion, but retains `executing` status when other steps remain. Its parser requires those fields for executing plans, so the latest lookup skips the new review and restores the older record with no completed steps.
+
+`tools/probes/runtime_plan_workflow_reference.mjs` reproduces the state update and reload with a two-step plan, alongside structured submission and review cases in `fixtures/runtime/plan-workflow-oracle.json`. Rust moves that plan back to `accepted`, matching the source's manual step-completion behavior, and preserves the recorded review and next unfinished step. All steps complete still yields `completed`. Reviews remain assistant-reported workflow progress, never host verification evidence. Original source is unchanged.
+
 ## Strongly evidenced risks and debt
 
 | ID / classification | Evidence and impact | Target action / required evidence |

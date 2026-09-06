@@ -2,7 +2,7 @@
 //! incomplete tool arguments are never executable. EOF settles exactly once.
 use crate::DomainError;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,4 +466,64 @@ impl ProviderSnapshot {
         };
         self.usage.cost(rates.map(|rate| rate * multiplier))
     }
+}
+
+fn stop(reason: Option<StopReason>) -> &'static str {
+    match reason {
+        Some(StopReason::Length) => "length",
+        Some(StopReason::ToolUse) => "toolUse",
+        Some(StopReason::Error) => "error",
+        Some(StopReason::Aborted) => "aborted",
+        _ => "stop",
+    }
+}
+/// Shared lossless SDK-shaped message projection for the session runtime and optional host.
+pub fn assistant_message(
+    s: &ProviderSnapshot,
+    model: &Value,
+    timestamp: u64,
+) -> Result<Value, DomainError> {
+    let mut content = vec![];
+    for block in &s.content {
+        let mut value = match block.kind {
+            BlockKind::Text => json!({"type":"text","text":block.text}),
+            BlockKind::Thinking => json!({"type":"thinking","thinking":block.text}),
+            BlockKind::Tool => {
+                json!({"type":"toolCall","id":block.id,"name":block.name,"arguments":block.arguments.clone().unwrap_or_else(||json!({}))})
+            }
+        };
+        if !block.signature.is_empty() {
+            value[match block.kind {
+                BlockKind::Thinking => "thinkingSignature",
+                BlockKind::Tool => "thoughtSignature",
+                BlockKind::Text => "textSignature",
+            }] = json!(block.signature);
+        }
+        if block.kind == BlockKind::Tool
+            && matches!(
+                s.family,
+                ApiFamily::Responses | ApiFamily::AzureResponses | ApiFamily::CodexResponses
+            )
+        {
+            value["partialJson"] = json!(block.text);
+        }
+        if block.redacted {
+            value["redacted"] = json!(true);
+        }
+        if block.malformed_arguments {
+            value["_argumentsTruncated"] = json!(true);
+        }
+        content.push(value);
+    }
+    let rates = ["input", "output", "cacheRead", "cacheWrite"]
+        .map(|key| model["cost"][key].as_f64().unwrap_or(0.));
+    let cost = s.cost(rates)?;
+    let mut result = json!({"role":"assistant","content":content,"api":s.family,"provider":model["provider"],"model":model["id"],"usage":{"input":s.usage.input,"output":s.usage.output,"cacheRead":s.usage.cache_read,"cacheWrite":s.usage.cache_write,"totalTokens":s.usage.total,"cost":{"input":cost[0],"output":cost[1],"cacheRead":cost[2],"cacheWrite":cost[3],"total":cost[4]}},"stopReason":stop(s.stop_reason),"timestamp":timestamp});
+    if let Some(error) = &s.error {
+        result["errorMessage"] = json!(error);
+    }
+    if let Some(id) = &s.response_id {
+        result["responseId"] = json!(id);
+    }
+    Ok(result)
 }

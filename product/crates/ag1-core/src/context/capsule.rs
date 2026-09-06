@@ -141,6 +141,37 @@ pub fn prepare(
     command: super::episode::EpisodeCommand<'_>,
     draft: &CapsuleDraft,
 ) -> Result<PreparedCapsule, DomainError> {
+    let journal = store.journal_snapshot(&command.session)?;
+    let entries = branch_values(&journal)?;
+    let (record, created) =
+        prepare_record(&entries, artifacts, command.now, command.command, draft)?;
+    if !created {
+        return Ok(PreparedCapsule {
+            record,
+            commit: None,
+        });
+    }
+    let row = json!({"type":"custom","customType":"context_capsule","id":command.entry_id,"parentId":journal.leaf,"timestamp":command.now,"data":record});
+    Ok(PreparedCapsule {
+        record,
+        commit: Some(PreparedStateCommit {
+            session: SessionId::new(command.session.as_str())?,
+            command: command.command.into(),
+            expected: journal.revision,
+            records: vec![row.to_string().into_bytes()],
+        }),
+    })
+}
+
+/// Retain immutable slices without writing session metadata. The native session
+/// supplies its captured branch and commits a new record through its own owner.
+pub fn prepare_record(
+    entries: &[Value],
+    artifacts: &mut impl ContextArtifactPort,
+    now: &str,
+    call_id: &str,
+    draft: &CapsuleDraft,
+) -> Result<(CapsuleRecord, bool), DomainError> {
     let suffix = format!("\ncapsule_id: {}", draft.id);
     let body = draft
         .body
@@ -155,39 +186,19 @@ pub fn prepare(
     {
         return Err(invalid("capsule body hash/count"));
     }
-    let journal = store.journal_snapshot(&command.session)?;
-    let entries = branch_values(&journal)?;
-    if let Some(record) = find(&entries, &draft.id) {
+    if let Some(record) = find(entries, &draft.id) {
         let artifact = artifacts.get(&record.artifact_id)?;
         if artifact.kind != "source-capsule"
             || artifact.sha256 != format!("{:x}", Sha256::digest(draft.body.as_bytes()))
         {
             return Err(invalid("capsule artifact mismatch"));
         }
-        return Ok(PreparedCapsule {
-            record,
-            commit: None,
-        });
+        return Ok((record, false));
     }
-    let input = json!({"version":1,"id":draft.id,"query":draft.query,"createdAt":command.now,"artifactId":"art_00000000000000000000000000000000","chars":draft.chars,"truncated":draft.truncated,"files":draft.files,"relations":draft.relations});
+    let input = json!({"version":1,"id":draft.id,"query":draft.query,"createdAt":now,"artifactId":"art_00000000000000000000000000000000","chars":draft.chars,"truncated":draft.truncated,"files":draft.files,"relations":draft.relations});
     let mut record = CapsuleRecord::parse(&input)?;
     record.artifact_id = artifacts
-        .put_text(
-            &draft.body,
-            "source-capsule",
-            "sourceContext",
-            command.command,
-            &[],
-        )?
+        .put_text(&draft.body, "source-capsule", "sourceContext", call_id, &[])?
         .id;
-    let row = json!({"type":"custom","customType":"context_capsule","id":command.entry_id,"parentId":journal.leaf,"timestamp":command.now,"data":record});
-    Ok(PreparedCapsule {
-        record,
-        commit: Some(PreparedStateCommit {
-            session: SessionId::new(command.session.as_str())?,
-            command: command.command.into(),
-            expected: journal.revision,
-            records: vec![row.to_string().into_bytes()],
-        }),
-    })
+    Ok((record, true))
 }

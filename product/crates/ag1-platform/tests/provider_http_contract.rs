@@ -241,7 +241,7 @@ fn origin_identity_and_header_validation_prevent_alias_and_injection_errors() {
 
 #[tokio::test]
 async fn generation_pipeline_holds_one_permit_through_stop_usage_and_transport_eof() {
-    for reason in ["stop", "length"] {
+    for (reason, watchdog) in [("stop", 0), ("stop", 3000), ("length", 0), ("length", 3000)] {
         let body = format!(
             "data: {{\"choices\":[{{\"delta\":{{\"content\":\"hello\"}},\"finish_reason\":\"{reason}\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":3}}}}\n\ndata: [DONE]\n\n"
         );
@@ -271,9 +271,9 @@ async fn generation_pipeline_holds_one_permit_through_stop_usage_and_transport_e
                 request: request(&origin, 8192),
                 limits: GenerationLimits {
                     max_output_bytes: 4096,
-                    prefill_ms: 1000,
-                    idle_ms: 1000,
-                    overall_ms: 3000,
+                    prefill_ms: watchdog,
+                    idle_ms: watchdog,
+                    overall_ms: watchdog,
                 },
             },
             permit,
@@ -302,7 +302,7 @@ async fn generation_pipeline_holds_one_permit_through_stop_usage_and_transport_e
 }
 #[tokio::test]
 async fn generation_pipeline_quarantines_ignored_abort_and_unexpected_eof_with_partial_output() {
-    for aborted in [false, true] {
+    for (aborted, watchdog) in [(false, 0), (false, 3000), (true, 0), (true, 3000)] {
         let (done_tx, done_rx) = mpsc::channel();
         let (origin, server) = fixture(move |mut socket| {
             let input = read_request(&mut socket);
@@ -335,9 +335,9 @@ async fn generation_pipeline_quarantines_ignored_abort_and_unexpected_eof_with_p
                 request: request(&origin, 8192),
                 limits: GenerationLimits {
                     max_output_bytes: 4096,
-                    prefill_ms: 1000,
-                    idle_ms: 1000,
-                    overall_ms: 3000,
+                    prefill_ms: watchdog,
+                    idle_ms: watchdog,
+                    overall_ms: watchdog,
                 },
             },
             permit,

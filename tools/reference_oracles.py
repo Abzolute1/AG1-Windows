@@ -179,11 +179,15 @@ def suite_llama(env, commands):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--suite', required=True, choices=['selected', 'known-defects', 'llama', 'catalog', 'session', 'context-differential'])
+    parser.add_argument('--suite', required=True, choices=['selected', 'known-defects', 'llama', 'catalog', 'session', 'context-differential', 'runtime-differential'])
     parser.add_argument('--offline', action='store_true', required=True)
     args = parser.parse_args()
     if args.suite == 'context-differential':
         from context_gate import differential
+        differential()
+        return
+    if args.suite == 'runtime-differential':
+        from runtime_differential import differential
         differential()
         return
     fingerprints = input_fingerprints()

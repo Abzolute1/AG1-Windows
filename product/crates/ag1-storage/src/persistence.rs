@@ -20,6 +20,7 @@ pub enum StorageError {
     Corrupt(String),
     Invalid(String),
     Conflict(String),
+    RevisionConflict { expected: u64, actual: u64 },
     Missing(String),
     Denied,
     Unsupported(String),
@@ -33,6 +34,11 @@ impl std::fmt::Display for StorageError {
     }
 }
 impl std::error::Error for StorageError {}
+impl From<StorageError> for ag1_core::DomainError {
+    fn from(error: StorageError) -> Self {
+        domain_error(error)
+    }
+}
 impl From<std::io::Error> for StorageError {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
@@ -65,6 +71,11 @@ pub enum Boundary {
 }
 pub trait FaultInjector: Send + Sync {
     fn check(&self, boundary: Boundary) -> StorageResult<()>;
+    /// Journal-command targeting avoids timing-dependent injections into an
+    /// unrelated artifact transaction when accepted native work drains together.
+    fn check_journal_command(&self, _command: &str, boundary: Boundary) -> StorageResult<()> {
+        self.check(boundary)
+    }
 }
 struct NoFault;
 impl FaultInjector for NoFault {
@@ -83,12 +94,22 @@ impl Clock for SystemClock {
     }
 }
 
+struct WriterLease(File);
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // Closing alone leaves flock held by an unrelated fork's inherited
+        // open description until it execs. Release this owner's lease explicitly.
+        #[cfg(target_os = "linux")]
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
 pub struct Store {
     pub(crate) root: PathBuf,
     pub(crate) db: Mutex<Connection>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) faults: Arc<dyn FaultInjector>,
-    _writer: File,
+    // Keep last: the database connection must close before another writer enters.
+    _writer: WriterLease,
 }
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Health {
@@ -105,7 +126,9 @@ pub fn digest(bytes: &[u8]) -> String {
 pub(crate) fn domain_error(e: StorageError) -> ag1_core::DomainError {
     match e {
         StorageError::Denied => ag1_core::DomainError::PermissionDenied,
-        StorageError::Conflict(_) => ag1_core::DomainError::Conflict,
+        StorageError::Conflict(_) | StorageError::RevisionConflict { .. } => {
+            ag1_core::DomainError::Conflict
+        }
         StorageError::Missing(_) => ag1_core::DomainError::NotFound,
         StorageError::Limit(s) => ag1_core::DomainError::LimitExceeded(s),
         StorageError::Invalid(s) => ag1_core::DomainError::InvalidInput(s),
@@ -296,6 +319,7 @@ impl Store {
             rustix::fs::FlockOperation::NonBlockingLockExclusive,
         )
         .map_err(|_| StorageError::Conflict("Destination already has a writer".into()))?;
+        let writer = WriterLease(writer);
         for name in ["blobs", "staging", "quarantine"] {
             let p = root.join(name);
             if p.exists() {
@@ -326,7 +350,7 @@ impl Store {
                 ));
             }
         }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000;")?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA temp_store=FILE; PRAGMA temp.cache_size=-2048;")?;
         if version == 0 {
             let tx = db.transaction()?;
             tx.execute_batch(include_str!("schema.sql"))?;
@@ -376,6 +400,9 @@ impl Store {
     }
     pub(crate) fn hit(&self, b: Boundary) -> StorageResult<()> {
         self.faults.check(b)
+    }
+    pub(crate) fn hit_journal_command(&self, command: &str, b: Boundary) -> StorageResult<()> {
+        self.faults.check_journal_command(command, b)
     }
     pub(crate) fn next_sequence(db: &Connection) -> StorageResult<u64> {
         let value: u64 = db.query_row(

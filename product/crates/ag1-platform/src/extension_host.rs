@@ -24,6 +24,7 @@ use std::{
 };
 static SERIAL: AtomicU64 = AtomicU64::new(1);
 const FRAME_BYTES: usize = 1024 * 1024;
+mod snapshot;
 pub struct Config {
     pub node: PathBuf,
     pub host_script: PathBuf,
@@ -323,6 +324,22 @@ impl ExtensionService {
     }
 }
 impl ExtensionHost {
+    /// The native owner may advance an idle host within its existing session.
+    /// Prepared tool capabilities retain their old exact scope and cannot follow.
+    pub(crate) fn advance_scope(&mut self, scope: &Scope) -> Result<(), DomainError> {
+        if !self.alive
+            || scope.workspace != self.scope.workspace
+            || scope.session != self.scope.session
+            || scope.epoch < self.scope.epoch
+            || scope.revision < self.scope.revision
+            || !self.deferred.is_empty()
+            || self.parked_count != 0
+        {
+            return Err(DomainError::Conflict);
+        }
+        self.scope = scope.clone();
+        Ok(())
+    }
     pub(crate) fn verify_workspace(&self, cwd: &Path) -> Result<(), DomainError> {
         if self.workspace.root() != cwd {
             return Err(DomainError::PermissionDenied);
@@ -442,6 +459,8 @@ impl ExtensionHost {
                 | "load"
                 | "bind"
                 | "catalog"
+                | "snapshot.begin"
+                | "snapshot.append"
                 | "models.update"
                 | "flags.set"
                 | "flags.values"

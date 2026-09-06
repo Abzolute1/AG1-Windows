@@ -1,0 +1,17 @@
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO meta VALUES('sequence','0');
+CREATE TABLE commands(id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, intent BLOB NOT NULL, state TEXT NOT NULL CHECK(state IN ('intent','completed','uncertain')), result BLOB, sequence INTEGER NOT NULL);
+CREATE TABLE sessions(id TEXT PRIMARY KEY, header BLOB NOT NULL, leaf TEXT, revision INTEGER NOT NULL DEFAULT 0, source_version INTEGER NOT NULL, archived INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE entries(session TEXT NOT NULL REFERENCES sessions(id), id TEXT NOT NULL, parent TEXT, ordinal INTEGER NOT NULL, raw BLOB NOT NULL, normalized BLOB NOT NULL, PRIMARY KEY(session,id), UNIQUE(session,ordinal));
+CREATE INDEX entries_parent ON entries(session,parent);
+CREATE TABLE origins(id TEXT PRIMARY KEY, session TEXT NOT NULL, key BLOB NOT NULL CHECK(length(key)=32));
+CREATE TABLE artifacts(origin TEXT NOT NULL REFERENCES origins(id), id TEXT NOT NULL, digest TEXT NOT NULL, record_digest TEXT NOT NULL, record BLOB NOT NULL, encoding TEXT NOT NULL, bytes INTEGER NOT NULL, PRIMARY KEY(origin,id));
+CREATE TABLE access(session TEXT NOT NULL REFERENCES sessions(id), origin TEXT NOT NULL, artifact TEXT NOT NULL, root TEXT NOT NULL, PRIMARY KEY(session,origin,artifact), FOREIGN KEY(origin,artifact) REFERENCES artifacts(origin,id));
+CREATE INDEX artifact_digest ON artifacts(digest);
+CREATE TABLE evictions(origin TEXT NOT NULL, artifact TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(origin,artifact), FOREIGN KEY(origin,artifact) REFERENCES artifacts(origin,id));
+CREATE TABLE leases(session TEXT NOT NULL, origin TEXT NOT NULL, artifact TEXT NOT NULL, reason TEXT NOT NULL, expires INTEGER NOT NULL, release_on_verification INTEGER NOT NULL, raw BLOB NOT NULL, PRIMARY KEY(session,origin,artifact), FOREIGN KEY(origin,artifact) REFERENCES artifacts(origin,id));
+CREATE TABLE memory(id TEXT PRIMARY KEY, status TEXT NOT NULL CHECK(status IN ('valid','corrupt')), digest TEXT NOT NULL, normalized BLOB, diagnostic TEXT);
+CREATE TABLE metadata(kind TEXT NOT NULL, id TEXT NOT NULL, digest TEXT NOT NULL, raw BLOB NOT NULL, historical INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(kind,id));
+CREATE TABLE imports(id TEXT PRIMARY KEY, manifest BLOB NOT NULL, checkpoint INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL CHECK(state IN ('staging','complete')));
+CREATE TABLE archives(import_id TEXT NOT NULL REFERENCES imports(id), path TEXT NOT NULL, digest TEXT NOT NULL, descriptor BLOB NOT NULL, PRIMARY KEY(import_id,path));
+CREATE TABLE catalog(origin TEXT NOT NULL, artifact TEXT NOT NULL, text_digest TEXT NOT NULL, PRIMARY KEY(origin,artifact));

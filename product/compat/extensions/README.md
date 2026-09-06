@@ -71,6 +71,18 @@ host leaves an uncertain intent, which is never automatically executed again.
 
 ## Transport and bounds
 
+Native session inspection can use an additional snapshot transfer: ordered 64 KiB
+chunks, an 8 MiB total limit, a verified SHA-256 and a single-use reference consumed
+by the callback. Snapshot JSON retains a depth limit of 48 and a separate 250,000-value
+bound. Callback/action/result frames still use the ordinary 1 MiB limit, and the
+helper keeps its existing 128 MiB heap setting. Oversized history reports a limit
+error. No callback runs against a partial or corrupted uploaded snapshot.
+
+When supplied by the native session adapter, inspection includes physical entries,
+the selected branch, alternate branch traversal, resolved labels, session title,
+header and workspace. Tree getters derive detached nodes from those entries. Native
+storage does not expose a fabricated JSONL session-file path.
+
 Private stdin/stdout JSON lines use protocol version 1. One parent operation is
 active at a time. Requests, results, native callbacks, stream events and cancellation
 have distinct packet kinds. Native callbacks bind the active operation, loaded
@@ -178,3 +190,10 @@ The `test` directory runs owned fixture code. Source oracle probes in
 pinned SDK behavior, independent of this implementation. Rust tests additionally
 exercise trust/scope fences, owned process death, durable execution and the native
 inference transport. These checks do not constitute completion of the P09 gate.
+
+
+## P10 native session binding
+
+`NativeExtensions` composes static admitted tools and input/start/context/payload/tool/compaction/tree/lifecycle/resource callbacks with the native session owner. Current snapshots include active and registered tools, thinking, model, title, physical history and active branch. Prepared arguments undergo the source-compatible scalar coercion and native schema/policy/approval checks. Original native outputs remain durable before callback projection; extension effects are Unknown.
+
+This binding uses `DenyBridge` for callback mutation/provider/process/UI requests, and fences dynamic registration until a new admitted binding. P09's standalone broker capabilities are not a promise that every native session callback action is wired. P12 owns final SDK/CLI/UI compatibility routing under D05. Protected payload fields (selected model/tools/stream and private endpoint/credentials) cannot be overridden. Direct queue delivery does not add an input hook absent in the source. See `ag1-platform/SESSION.md` and `fixtures/runtime/scope.json` for current scope.

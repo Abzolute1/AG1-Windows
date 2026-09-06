@@ -8,6 +8,8 @@ pub mod ports;
 #[cfg(target_os = "linux")]
 pub mod process;
 pub mod provider;
+#[cfg(target_os = "linux")]
+pub mod session;
 pub mod web_http;
 #[cfg(target_os = "linux")]
 pub mod workspace;
@@ -91,3 +93,23 @@ pub mod extension_auth;
 pub mod extension_auth_bridge;
 
 pub mod extension_login;
+
+#[cfg(target_os = "linux")]
+pub mod artifact_tools;
+#[cfg(target_os = "linux")]
+pub mod memory_tools;
+#[cfg(target_os = "linux")]
+pub mod repo_tools;
+#[cfg(target_os = "linux")]
+pub mod task_tools;
+
+#[cfg(target_os = "linux")]
+pub mod source_tools;
+
+#[cfg(target_os = "linux")]
+pub mod todo_tools;
+
+#[cfg(target_os = "linux")]
+pub mod observation_tools;
+
+pub mod episode_tools;

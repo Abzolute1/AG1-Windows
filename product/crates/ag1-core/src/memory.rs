@@ -283,7 +283,7 @@ impl MemoryStore {
         e["updatedAt"] = json!(now);
         let mut out = self.0.clone();
         for key in ["entries", "archived"] {
-            if let Some(rows) = out[key].as_array_mut() {
+            if let Some(rows) = out.get_mut(key).and_then(Value::as_array_mut) {
                 for row in rows {
                     if row["id"] == id {
                         *row = e.clone();
@@ -305,7 +305,7 @@ impl MemoryStore {
         }
         let mut out = self.0.clone();
         for key in ["entries", "archived"] {
-            if let Some(rows) = out[key].as_array_mut() {
+            if let Some(rows) = out.get_mut(key).and_then(Value::as_array_mut) {
                 rows.retain(|e| e["id"] != id);
             }
         }

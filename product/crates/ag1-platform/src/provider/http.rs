@@ -8,6 +8,14 @@ use reqwest::{
 use std::{collections::BTreeSet, time::Duration};
 use tokio::{sync::watch, time::Instant};
 
+/// A disabled watchdog has no timer, rather than a distant synthetic deadline.
+async fn deadline_reached(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 pub struct CancelSource {
     sender: watch::Sender<bool>,
 }
@@ -149,6 +157,14 @@ impl ProviderHttp {
         deadline: Instant,
         cancel: &mut CancelToken,
     ) -> Result<HttpResponse, DomainError> {
+        self.send_until(request, Some(deadline), cancel).await
+    }
+    pub(crate) async fn send_until(
+        &self,
+        request: HttpRequest,
+        deadline: Option<Instant>,
+        cancel: &mut CancelToken,
+    ) -> Result<HttpResponse, DomainError> {
         self.validate_request(&request)?;
         if cancel.cancelled() {
             return Err(DomainError::Cancelled);
@@ -166,7 +182,7 @@ impl ProviderHttp {
         let response = tokio::select! {
             biased;
             _=cancel.wait()=>return Err(DomainError::Cancelled),
-            _=tokio::time::sleep_until(deadline)=>return Err(DomainError::TimedOut),
+            _=deadline_reached(deadline)=>return Err(DomainError::TimedOut),
             value=pending=>value.map_err(|e|if e.is_timeout(){DomainError::TimedOut}else{DomainError::Unavailable("provider HTTP connection failed".into())})?,
         };
         if response
@@ -216,6 +232,13 @@ impl HttpResponse {
         deadline: Instant,
         cancel: &mut CancelToken,
     ) -> Result<Option<Vec<u8>>, DomainError> {
+        self.chunk_until(Some(deadline), cancel).await
+    }
+    pub(crate) async fn chunk_until(
+        &mut self,
+        deadline: Option<Instant>,
+        cancel: &mut CancelToken,
+    ) -> Result<Option<Vec<u8>>, DomainError> {
         if self.ended {
             return Ok(None);
         }
@@ -225,7 +248,7 @@ impl HttpResponse {
         let result = tokio::select! {
             biased;
             _=cancel.wait()=>return Err(DomainError::Cancelled),
-            _=tokio::time::sleep_until(deadline)=>return Err(DomainError::TimedOut),
+            _=deadline_reached(deadline)=>return Err(DomainError::TimedOut),
             value=self.response.chunk()=>value.map_err(|_|DomainError::Unavailable("provider response interrupted".into()))?,
         };
         if let Some(bytes) = result {

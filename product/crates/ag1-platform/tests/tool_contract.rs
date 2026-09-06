@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+mod readonly_shell;
 use ag1_core::{
     DomainError,
     tools::{
@@ -2304,6 +2305,53 @@ fn owned_jobs_kill_quota_and_restart_never_adopt_historical_pids_or_foreign_scop
     );
     let mut foreign = scope.clone();
     foreign.session = "other-session".into();
+    // Compaction preserves the service's process ownership, but an approval
+    // issued for the earlier request context must still fail at consumption.
+    let later = Scope {
+        epoch: scope.epoch + 1,
+        ..scope.clone()
+    };
+    let old_call = call(
+        &registry,
+        "stale-job-kill",
+        "job",
+        json!({"action":"kill","id":id}),
+    );
+    let old_ticket = search_ticket(
+        old_call,
+        jobs.target_revision(),
+        &registry,
+        &scope,
+        dir.path().to_str().unwrap(),
+    );
+    assert!(matches!(
+        jobs.execute(
+            None,
+            old_ticket,
+            ShellExecution {
+                registry: &registry,
+                scope: &later,
+                policy_revision: 1,
+                now: || 12,
+                cancel: &AtomicBool::new(false),
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
+            &mut artifacts
+        ),
+        Err(DomainError::Conflict)
+    ));
+    assert_eq!(
+        run(
+            &jobs,
+            "fresh-later-context",
+            json!({"action":"poll","id":id}),
+            &later,
+            &mut artifacts
+        )
+        .unwrap()
+        .result["details"]["status"],
+        "running"
+    );
     assert!(matches!(
         run(
             &jobs,

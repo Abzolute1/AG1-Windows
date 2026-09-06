@@ -17,6 +17,14 @@ pub struct CommandResult {
     pub result: Option<Vec<u8>>,
     pub sequence: u64,
 }
+/// Only a newly acknowledged insertion may be handed to an execution queue.
+/// An existing intent can be a lost acknowledgement or interrupted execution;
+/// its presence alone must never create another execution owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandAdmission {
+    pub record: CommandResult,
+    pub inserted: bool,
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JournalEntry {
     pub id: String,
@@ -198,7 +206,7 @@ impl Store {
         if revision != expected {
             return Err(StorageError::Conflict("Journal revision".into()));
         }
-        self.hit(Boundary::BeforeTransaction)?;
+        self.hit_journal_command(command_id, Boundary::BeforeTransaction)?;
         let tx = db.transaction()?;
         let mut ordinal: u64 = tx.query_row(
             "SELECT COALESCE(MAX(ordinal),0) FROM entries WHERE session=?1",
@@ -234,6 +242,75 @@ impl Store {
                 ack.sequence
             ],
         )?;
+        self.hit_journal_command(command_id, Boundary::BeforeCommit)?;
+        tx.commit()?;
+        self.hit_journal_command(command_id, Boundary::AfterCommit)?;
+        self.hit_journal_command(command_id, Boundary::BeforeAck)?;
+        Ok(ack)
+    }
+    pub fn select_leaf(
+        &self,
+        session: &str,
+        command_id: &str,
+        expected: u64,
+        leaf: Option<&str>,
+    ) -> StorageResult<Ack> {
+        valid_id(session)?;
+        valid_id(command_id)?;
+        if let Some(leaf) = leaf {
+            valid_id(leaf)?;
+        }
+        let intent = serde_json::to_vec(&("select_leaf", session, expected, leaf))?;
+        let hash = digest(&intent);
+        let mut db = self.conn()?;
+        Self::ready(&db)?;
+        if let Some(old) = command(&db, command_id, &hash)? {
+            if old.state != "completed" {
+                return Err(StorageError::Conflict(
+                    "Branch command requires reconciliation".into(),
+                ));
+            }
+            return Ok(serde_json::from_slice(old.result.as_deref().ok_or_else(
+                || StorageError::Corrupt("Missing branch acknowledgement".into()),
+            )?)?);
+        }
+        if active_session(&db, session)? != expected {
+            return Err(StorageError::Conflict("Journal revision".into()));
+        }
+        if let Some(leaf) = leaf {
+            let exists: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM entries WHERE session=?1 AND id=?2)",
+                params![session, leaf],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(StorageError::Missing("Branch leaf".into()));
+            }
+        }
+        let revision = expected
+            .checked_add(1)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or_else(|| StorageError::Limit("Revision exhausted".into()))?;
+        self.hit(Boundary::BeforeTransaction)?;
+        let tx = db.transaction()?;
+        tx.execute(
+            "UPDATE sessions SET leaf=?2,revision=?3 WHERE id=?1",
+            params![session, leaf, revision],
+        )?;
+        let ack = Ack {
+            sequence: Self::next_sequence(&tx)?,
+            revision,
+        };
+        tx.execute(
+            "INSERT INTO commands VALUES(?1,?2,?3,'completed',?4,?5)",
+            params![
+                command_id,
+                hash,
+                intent,
+                serde_json::to_vec(&ack)?,
+                ack.sequence
+            ],
+        )?;
         self.hit(Boundary::BeforeCommit)?;
         tx.commit()?;
         self.hit(Boundary::AfterCommit)?;
@@ -241,6 +318,52 @@ impl Store {
         Ok(ack)
     }
     pub fn record_intent(&self, id: &str, intent: &[u8]) -> StorageResult<CommandResult> {
+        self.record_fenced_intent(id, intent, None)
+            .map(|admission| admission.record)
+    }
+    /// Native command admission binds its immutable payload to the selected
+    /// session revision in the same transaction. Return the stored wrapper as
+    /// the intent for settle_intent; it preserves absent versus explicit null.
+    /// A prior identical admission wins over a later revision check. Restart
+    /// still marks pending intent uncertain: admission alone never proves work
+    /// ran, and this API grants no automatic replay of an external effect.
+    pub fn record_session_intent(
+        &self,
+        session: &str,
+        id: &str,
+        expected: u64,
+        payload: &Value,
+    ) -> StorageResult<CommandResult> {
+        self.admit_session_command(session, id, expected, payload)
+            .map(|admission| admission.record)
+    }
+    /// Same immutable record as record_session_intent, with the insertion result
+    /// decided under the writer lock. Native dispatch must use this form rather
+    /// than checking command_result separately and racing another admission.
+    pub fn admit_session_command(
+        &self,
+        session: &str,
+        id: &str,
+        expected: u64,
+        payload: &Value,
+    ) -> StorageResult<CommandAdmission> {
+        valid_id(session)?;
+        if !payload.is_object() || serde_json::to_vec(payload)?.len() > 64 * 1024 {
+            return Err(StorageError::Limit(
+                "Native command payload must be a bounded object".into(),
+            ));
+        }
+        let intent = serde_json::to_vec(
+            &serde_json::json!({"version":1,"kind":"native-session-command","session":session,"expectedRevision":expected.to_string(),"payload":payload}),
+        )?;
+        self.record_fenced_intent(id, &intent, Some((session, expected)))
+    }
+    fn record_fenced_intent(
+        &self,
+        id: &str,
+        intent: &[u8],
+        fence: Option<(&str, u64)>,
+    ) -> StorageResult<CommandAdmission> {
         valid_id(id)?;
         if intent.len() > 1024 * 1024 {
             return Err(StorageError::Limit("Intent exceeds 1 MiB".into()));
@@ -249,10 +372,19 @@ impl Store {
         let mut db = self.conn()?;
         Self::ready(&db)?;
         if let Some(old) = command(&db, id, &hash)? {
-            return Ok(old);
+            return Ok(CommandAdmission {
+                record: old,
+                inserted: false,
+            });
         }
         self.hit(Boundary::BeforeTransaction)?;
         let tx = db.transaction()?;
+        if let Some((session, expected)) = fence {
+            let actual = active_session(&tx, session)?;
+            if actual != expected {
+                return Err(StorageError::RevisionConflict { expected, actual });
+            }
+        }
         let sequence = Self::next_sequence(&tx)?;
         tx.execute(
             "INSERT INTO commands VALUES(?1,?2,?3,'intent',NULL,?4)",
@@ -262,11 +394,14 @@ impl Store {
         tx.commit()?;
         self.hit(Boundary::AfterCommit)?;
         self.hit(Boundary::BeforeAck)?;
-        Ok(CommandResult {
-            state: "intent".into(),
-            intent: intent.into(),
-            result: None,
-            sequence,
+        Ok(CommandAdmission {
+            inserted: true,
+            record: CommandResult {
+                state: "intent".into(),
+                intent: intent.into(),
+                result: None,
+                sequence,
+            },
         })
     }
     pub fn settle_intent(
@@ -367,7 +502,7 @@ impl Store {
         let snapshot = self.snapshot(session)?;
         Self::branch_snapshot(&snapshot, leaf)
     }
-    fn branch_snapshot(
+    pub(crate) fn branch_snapshot(
         snapshot: &JournalSnapshot,
         leaf: Option<&str>,
     ) -> StorageResult<Vec<JournalEntry>> {

@@ -7,6 +7,26 @@ import os from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { SnapshotTransfer } from "../snapshot-transfer.mjs";
+
+test("snapshot transfer rejects missing, corrupt, reordered and reused data", () => {
+	const bytes = Buffer.from(JSON.stringify({ session: { id: "native" } }));
+	const metadata = { id: "snapshot-1", bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+	const transfer = new SnapshotTransfer();
+	transfer.begin(metadata);
+	assert.throws(() => transfer.take(metadata.id), /Incomplete/);
+	transfer.begin(metadata);
+	assert.throws(() => transfer.append({ id: metadata.id, offset: 1, data: bytes.toString("base64") }), /Invalid/);
+	assert.throws(() => transfer.take(metadata.id), /Incomplete/);
+	transfer.begin({ ...metadata, sha256: "0".repeat(64) });
+	transfer.append({ id: metadata.id, offset: 0, data: bytes.toString("base64") });
+	assert.throws(() => transfer.take(metadata.id), /Incomplete/);
+	transfer.begin(metadata);
+	transfer.append({ id: metadata.id, offset: 0, data: bytes.toString("base64") });
+	assert.deepEqual(transfer.take(metadata.id), { session: { id: "native" } });
+	assert.throws(() => transfer.take(metadata.id), /Incomplete/);
+	assert.throws(() => transfer.begin({ ...metadata, bytes: 8 * 1024 * 1024 + 1 }), /Invalid/);
+});
 function child(t, code, bridge = async () => undefined) {
 	const root = fs.mkdtempSync(
 		path.join(os.tmpdir(), "ag1-extension-transport-"),

@@ -306,8 +306,8 @@ impl Store {
             return Err(StorageError::Missing("evicted artifact".into()));
         }
         drop(db);
-        let bytes = self.blob_bytes(&hash)?;
-        if bytes.len() as u64 != size {
+        let (actual_size, bytes) = self.blob_window(&hash, 0, limit as usize)?;
+        if actual_size != size || bytes.len() as u64 != size {
             return Err(StorageError::Corrupt("execution artifact size".into()));
         }
         Ok(bytes)
@@ -377,6 +377,39 @@ impl Store {
         offset: u64,
         max_bytes: u32,
     ) -> StorageResult<String> {
+        self.cursor_for_range(session, origin, id, (offset, max_bytes), None)
+    }
+    /// Authenticated surrounding-context navigation uses the same wire format
+    /// and fallback range as the pinned SDK. The returned cursor remains subject
+    /// to requester authorization on every read, including after fork/reopen.
+    pub fn context_cursor(
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        range: std::ops::Range<u64>,
+        anchor_line: u32,
+    ) -> StorageResult<String> {
+        if range.end < range.start || range.end > 9_007_199_254_740_991 || anchor_line == 0 {
+            return Err(StorageError::Invalid("Context cursor range/anchor".into()));
+        }
+        let exact = range.end - range.start;
+        let (offset, max_bytes) = if (1..=32768).contains(&exact) {
+            (range.start, exact as u32)
+        } else {
+            (range.start.saturating_sub(256), 1024)
+        };
+        self.cursor_for_range(session, origin, id, (offset, max_bytes), Some(anchor_line))
+    }
+    fn cursor_for_range(
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        range: (u64, u32),
+        anchor_line: Option<u32>,
+    ) -> StorageResult<String> {
+        let (offset, max_bytes) = range;
         artifact_id(id)?;
         if offset > 9_007_199_254_740_991 || max_bytes == 0 || max_bytes > 32768 {
             return Err(StorageError::Limit("Cursor bounds".into()));
@@ -389,6 +422,8 @@ impl Store {
         })?;
         let mut bytes = [0u8; 32];
         bytes[0] = 2;
+        bytes[1] = u8::from(anchor_line.is_some());
+        bytes[28..32].copy_from_slice(&anchor_line.unwrap_or(0).to_be_bytes());
         for i in 0..16 {
             bytes[2 + i] = u8::from_str_radix(&id[4 + i * 2..6 + i * 2], 16)
                 .map_err(|_| StorageError::Invalid("Artifact ID".into()))?;
@@ -590,8 +625,34 @@ impl Store {
         ttl_ms: u64,
         release_on_verification: bool,
     ) -> StorageResult<Lease> {
+        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification)
+            .map(|(lease, _)| lease)
+    }
+    /// Returns the exact record captured in the acknowledged transaction, not a
+    /// later lookup that could observe a concurrent renewal or release.
+    pub fn lease_record(
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        reason: &str,
+        ttl_ms: u64,
+        release_on_verification: bool,
+    ) -> StorageResult<Value> {
+        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification)
+            .map(|(_, record)| record)
+    }
+    fn write_lease(
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        reason: &str,
+        ttl_ms: u64,
+        release_on_verification: bool,
+    ) -> StorageResult<(Lease, Value)> {
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-        if reason.is_empty() || reason.chars().count() > 240 {
+        if reason.is_empty() || reason.encode_utf16().count() > 240 {
             return Err(StorageError::Invalid("Lease reason".into()));
         }
         let now = self.clock.now_ms();
@@ -633,14 +694,20 @@ impl Store {
             ],
         )?;
         Self::next_sequence(&tx)?;
+        self.hit(Boundary::BeforeCommit)?;
         tx.commit()?;
-        Ok(Lease {
-            origin: origin.into(),
-            artifact: id.into(),
-            reason,
-            expires,
-            release_on_verification,
-        })
+        self.hit(Boundary::AfterCommit)?;
+        self.hit(Boundary::BeforeAck)?;
+        Ok((
+            Lease {
+                origin: origin.into(),
+                artifact: id.into(),
+                reason,
+                expires,
+                release_on_verification,
+            },
+            serde_json::from_slice(&raw)?,
+        ))
     }
     pub fn leases(&self, session: &str) -> StorageResult<Vec<Lease>> {
         let db = self.conn()?;

@@ -568,3 +568,127 @@ pub fn prepare_full(entries: &[Value], settings: &Settings) -> Result<Option<Val
     }
     Ok(Some(value))
 }
+
+/// Assemble the reference's deterministic state/file lists around model-authored
+/// summary text. An automatic compaction may apply its documented size guard.
+/// Reference coordinator's persistent checkpoint, used only after raw custody.
+/// It deliberately makes no inferred claim about the unexamined history.
+pub fn emergency_checkpoint(preparation: &Value, cause: &str) -> Result<Value, DomainError> {
+    crate::task::bounded_json(preparation)?;
+    let list = |key: &str| -> BTreeSet<String> {
+        preparation["fileOps"][key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let read = list("read");
+    let modified = list("edited");
+    let mut lines = vec![
+        "[Semantic summary unavailable; deterministic recovery checkpoint]".into(),
+        format!("cause: {}", slice_utf16(cause, 500)),
+        "No historical semantic claim was inferred. Use the structured task state for current work and rehydrate the raw trajectory for earlier exact evidence.".into(),
+    ];
+    for (label, paths) in [("read_files", &read), ("modified_files", &modified)] {
+        if !paths.is_empty() {
+            lines.push(format!(
+                "{label}: {}",
+                paths.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    Ok(
+        json!({"summary":lines.join("\n"),"firstKeptEntryId":preparation["firstKeptEntryId"],"tokensBefore":preparation["tokensBefore"],"details":{"method":"persistent_emergency_checkpoint","readFiles":read,"modifiedFiles":modified,"workingMemory":preparation["workingMemory"]}}),
+    )
+}
+
+pub fn attach_provenance(
+    result: &mut Value,
+    artifact: &super::ContextArtifact,
+) -> Result<(), DomainError> {
+    let summary = result["summary"]
+        .as_str()
+        .ok_or_else(|| invalid("compaction summary"))?;
+    let summary = format!(
+        "[COMPACTION WORKING INDEX — MODEL-AUTHORED; NOT PRIMARY EVIDENCE]\nraw_trajectory_artifact: {}\nraw_trajectory_sha256: {}\nUse artifact grep/read to rehydrate original evidence when exactness, conflict resolution, or a material code change depends on this history.\n\n{summary}",
+        artifact.id, artifact.sha256
+    );
+    if !result["details"].is_object() {
+        result["details"] = result
+            .get("details")
+            .map(|value| json!({"priorDetails":value}))
+            .unwrap_or(json!({}));
+    }
+    result["summary"] = summary.into();
+    result["details"]["trajectoryArtifactId"] = json!(artifact.id);
+    result["details"]["trajectorySha256"] = json!(artifact.sha256);
+    result["details"]["summaryAuthority"] = json!("model-authored-index");
+    Ok(())
+}
+
+pub fn finish_summary(
+    preparation: &Value,
+    history: &str,
+    prefix: Option<&str>,
+    automatic_window: Option<u64>,
+) -> Result<Value, DomainError> {
+    crate::task::bounded_json(preparation)?;
+    if history.len() + prefix.map_or(0, str::len) > 16 * 1024 * 1024 {
+        return Err(invalid("summary output budget"));
+    }
+    let mut summary = match prefix {
+        Some(prefix) => format!("{history}\n\n---\n\n**Turn Context (split turn):**\n\n{prefix}"),
+        None => history.into(),
+    };
+    let primary = super::working_memory::primary(&preparation["workingMemory"])?;
+    if !primary.is_empty() {
+        summary = format!("{primary}\n\n---\n\n{summary}");
+    }
+    let files = &preparation["fileOps"];
+    let list = |key: &str| -> BTreeSet<String> {
+        files[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|value| value.as_str().map(str::to_owned))
+            .collect()
+    };
+    let modified: BTreeSet<_> = list("written").union(&list("edited")).cloned().collect();
+    let read: BTreeSet<_> = list("read").difference(&modified).cloned().collect();
+    for (name, paths) in [("read-files", &read), ("modified-files", &modified)] {
+        if !paths.is_empty() {
+            summary.push_str(&format!(
+                "\n\n<{name}>\n{}\n</{name}>",
+                paths.iter().cloned().collect::<Vec<_>>().join("\n")
+            ));
+        }
+    }
+    let mut result = json!({"summary":summary,"firstKeptEntryId":preparation["firstKeptEntryId"],"tokensBefore":preparation["tokensBefore"],"details":{"readFiles":read,"modifiedFiles":modified,"workingMemory":preparation["workingMemory"]}});
+    if let Some(window) = automatic_window {
+        guard_summary(&mut result, window)?;
+    }
+    Ok(result)
+}
+
+/// Applied after provenance is attached, matching the coordinator's final guard.
+pub fn guard_summary(result: &mut Value, window: u64) -> Result<(), DomainError> {
+    if window == 0 || window > 16_000_000 {
+        return Err(invalid("summary context window"));
+    }
+    let summary = result["summary"]
+        .as_str()
+        .ok_or_else(|| invalid("compaction summary"))?;
+    let estimate = (crate::task::units(summary) as u64).div_ceil(4);
+    if estimate > window / 2 {
+        let target = window * 4 / 10;
+        result["summary"] = format!(
+            "{}\n\n[Summary truncated from ~{} to ~{} tokens to fit the context window]",
+            slice_utf16(summary, (target * 4) as usize),
+            super::commas(estimate),
+            super::commas(target)
+        )
+        .into();
+    }
+    Ok(())
+}

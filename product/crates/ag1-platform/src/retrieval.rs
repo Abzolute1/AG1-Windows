@@ -35,15 +35,14 @@ impl SourceHost {
     fn cpu_search(
         &self,
         terms: &[String],
+        check: &impl Fn() -> Result<(), DomainError>,
     ) -> Result<BTreeMap<String, BTreeSet<usize>>, DomainError> {
         let mut out: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
         let mut count = 0;
         let terms: Vec<_> = terms.iter().map(|s| s.to_lowercase()).collect();
         let mut bytes = 0;
         for path in self.workspace.scan(1000)? {
-            if self.cancelled() {
-                return Err(DomainError::Cancelled);
-            }
+            check()?;
             let Ok(snapshot) = self.workspace.snapshot(&path, 2 * 1024 * 1024) else {
                 continue;
             };
@@ -72,17 +71,40 @@ impl SourceRetrievalPort for SourceHost {
         self.source.capture(path)
     }
     fn lexical(&self, terms: &[String]) -> Result<BTreeMap<String, BTreeSet<usize>>, DomainError> {
+        self.lexical_checked(terms, &|| {
+            if self.cancelled() {
+                Err(DomainError::Cancelled)
+            } else {
+                Ok(())
+            }
+        })
+    }
+    fn working_tree(&self) -> Result<WorkingTree, DomainError> {
+        Ok(self.tree.clone())
+    }
+    fn recent_accesses(&self) -> Result<Vec<RecentAccess>, DomainError> {
+        Ok(self.recent.clone())
+    }
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+impl SourceHost {
+    pub fn lexical_checked(
+        &self,
+        terms: &[String],
+        check: &impl Fn() -> Result<(), DomainError>,
+    ) -> Result<BTreeMap<String, BTreeSet<usize>>, DomainError> {
         if terms.is_empty() {
             return Ok(BTreeMap::new());
         }
-        if self.cancelled() {
-            return Err(DomainError::Cancelled);
-        }
+        check()?;
         if terms.len() > 12 || terms.iter().any(|s| s.len() > 800) {
             return Err(DomainError::LimitExceeded("lexical query".into()));
         }
         let Some(executable) = &self.rg else {
-            return self.cpu_search(terms);
+            return self.cpu_search(terms, check);
         };
         self.workspace.verify_root()?;
         let pattern = terms
@@ -136,9 +158,9 @@ impl SourceRetrievalPort for SourceHost {
         )?;
         let started = Instant::now();
         let status = loop {
-            if self.cancelled() {
+            if let Err(error) = check() {
                 child.stop()?;
-                return Err(DomainError::Cancelled);
+                return Err(error);
             }
             if started.elapsed() > Duration::from_secs(12) {
                 child.stop()?;
@@ -192,14 +214,5 @@ impl SourceRetrievalPort for SourceHost {
             }
         }
         Ok(out)
-    }
-    fn working_tree(&self) -> Result<WorkingTree, DomainError> {
-        Ok(self.tree.clone())
-    }
-    fn recent_accesses(&self) -> Result<Vec<RecentAccess>, DomainError> {
-        Ok(self.recent.clone())
-    }
-    fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
     }
 }

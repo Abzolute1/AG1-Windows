@@ -26,6 +26,8 @@ pub const MAX_LOG_DISK: usize = 8 * 1024 * 1024;
 pub const STOP_DEADLINE_MS: u64 = 3000;
 /// Host-only argv placeholder consumed by spawn_tool_with_cwd.
 pub const PINNED_CWD_FD: &str = "@AG1_PINNED_CWD_FD@";
+pub(crate) const READONLY_FILTER_FD: &str = "@AG1_READONLY_FILTER_FD@";
+mod readonly_filter;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -257,6 +259,7 @@ struct SpawnLimits {
     address_space: Option<u64>,
     disk_bytes: usize,
     inherit_cwd: bool,
+    readonly_filter: bool,
 }
 struct ActiveLease(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActiveLease {
@@ -292,6 +295,7 @@ impl ProcessSupervisor {
                 address_space: None,
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
+                readonly_filter: false,
             },
         )
     }
@@ -316,6 +320,7 @@ impl ProcessSupervisor {
                 address_space: Some(address_space),
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
+                readonly_filter: false,
             },
         )
     }
@@ -329,7 +334,7 @@ impl ProcessSupervisor {
         disk_bytes: usize,
         address_space: Option<u64>,
     ) -> Result<OwnedProcess, DomainError> {
-        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, false)
+        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, false, false)
     }
     /// Inherit the pinned cwd descriptor for bubblewrap's --bind-fd. The helper
     /// replaces the paired PINNED_CWD_FD placeholder without changing ProcessSpec's schema.
@@ -340,7 +345,16 @@ impl ProcessSupervisor {
         disk_bytes: usize,
         address_space: Option<u64>,
     ) -> Result<OwnedProcess, DomainError> {
-        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, true)
+        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, true, false)
+    }
+    pub(crate) fn spawn_readonly_tool(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        disk_bytes: usize,
+        address_space: Option<u64>,
+    ) -> Result<OwnedProcess, DomainError> {
+        self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, true, true)
     }
     fn spawn_tool_bound(
         &self,
@@ -349,6 +363,7 @@ impl ProcessSupervisor {
         disk_bytes: usize,
         address_space: Option<u64>,
         inherit_cwd: bool,
+        readonly_filter: bool,
     ) -> Result<OwnedProcess, DomainError> {
         if !(1024..=64 * 1024 * 1024).contains(&disk_bytes)
             || address_space
@@ -365,6 +380,7 @@ impl ProcessSupervisor {
                 address_space,
                 disk_bytes,
                 inherit_cwd,
+                readonly_filter,
             },
         )
     }
@@ -425,6 +441,7 @@ impl ProcessSupervisor {
                 address_space: None,
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
+                readonly_filter: false,
             },
         )
     }
@@ -492,12 +509,33 @@ impl ProcessSupervisor {
             let index = spec
                 .argv
                 .windows(2)
-                .position(|pair| pair[0] == "--bind-fd" && pair[1] == PINNED_CWD_FD)
+                .position(|pair| {
+                    matches!(pair[0].as_str(), "--bind-fd" | "--ro-bind-fd")
+                        && pair[1] == PINNED_CWD_FD
+                })
                 .ok_or_else(|| {
                     DomainError::InvalidInput("pinned directory binding required".into())
                 })?
                 + 1;
             spec.argv[index] = cwd_fd.to_string();
+        }
+        // Bubblewrap installs this immutable filter after namespace setup and
+        // closes the descriptor. Neither the helper nor normal processes get it.
+        let filter = limits
+            .readonly_filter
+            .then(readonly_filter::file)
+            .transpose()?;
+        let filter_fd = filter.as_ref().map(AsRawFd::as_raw_fd);
+        if let Some(filter_fd) = filter_fd {
+            let index = spec
+                .argv
+                .windows(2)
+                .position(|pair| pair[0] == "--seccomp" && pair[1] == READONLY_FILTER_FD)
+                .ok_or_else(|| {
+                    DomainError::InvalidInput("readonly filter binding required".into())
+                })?
+                + 1;
+            spec.argv[index] = filter_fd.to_string();
         }
         let mut command = Command::new(&self.helper);
         command
@@ -517,6 +555,11 @@ impl ProcessSupervisor {
         }
         unsafe {
             command.pre_exec(move || {
+                if let Some(filter_fd) = filter_fd
+                    && libc::fcntl(filter_fd, libc::F_SETFD, 0) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if let Some(bytes) = limits.address_space {
                     let limit = libc::rlimit {
                         rlim_cur: bytes as libc::rlim_t,

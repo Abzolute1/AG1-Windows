@@ -1,0 +1,30 @@
+// Pure pinned plan workflow state, with a retained invalid-transition regression.
+import fs from 'node:fs';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const source='packages/coding-agent/src/modes/interactive/interactive-plan-artifacts.ts';
+const ref=await import(pathToFileURL(path.join(root,'reference/ag1-executable/packages/coding-agent/dist/modes/interactive/interactive-plan-artifacts.js')));
+const now='2026-09-06T00:00:00.000Z';
+const states=['draft','clarifying','accepted','rejected','superseded','discarded','executing','completed'];
+const transitions=states.flatMap(from=>states.map(to=>({from,to,allowed:ref.canTransitionInteractivePlanArtifact(from,to)})));
+const draft=ref.buildInteractivePlanArtifactFromSubmission({goal:'Add endpoint',submission:{summary:'Local API',steps:['Inspect inputs','Implement endpoint'],openQuestions:[]},now});
+draft.planId='plan-a';
+const clarifying=ref.buildInteractivePlanArtifactFromSubmission({goal:'Choose deployment',submission:{summary:'Need a choice',openQuestions:[{question:'Target?',options:['Web','Native']}]},now});
+clarifying.planId='plan-b';
+const accepted=ref.updateInteractivePlanArtifactStatus(draft,'accepted',now);
+const executing=ref.updateInteractivePlanArtifactStatus(accepted,'executing',now,{executionStepIndex:0,executionStep:accepted.steps[0]});
+const discarded=ref.updateInteractivePlanArtifactStatus(executing,'discarded',now);
+const entry=data=>({type:'custom',customType:'interactive_plan_artifact',data});
+const observed=ref.getLatestInteractivePlanArtifact([entry(accepted),entry(executing),entry(discarded)]);
+assert.equal(observed.status,'executing');
+const answered=ref.setInteractivePlanClarificationAnswer(clarifying,0,' Web ',now);
+const selection=ref.createInteractivePlanSelection(undefined,{planning:ref.createInteractivePlanArtifactRef(clarifying),accepted:ref.createInteractivePlanArtifactRef(accepted),executing:ref.createInteractivePlanArtifactRef(executing)},now);
+const result=JSON.parse(JSON.stringify({version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',source_files:[{path:source,sha256:createHash('sha256').update(fs.readFileSync(path.join(root,'reference/ag1-executable',source))).digest('hex')}],transitions,draft,clarifying,accepted,executing,answered,selection,discarded,observedAfterDiscard:observed.status,model_actions:0,network_actions:0}));
+const target=path.join(root,'fixtures/runtime/plan-state-oracle.json');
+if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(result,null,2)+'\n');}
+else assert.deepEqual(result,JSON.parse(fs.readFileSync(target,'utf8')));
+console.log(JSON.stringify({status:'passed',transitions:transitions.length,confirmed_discard_regression:true,model_actions:0,network_actions:0}));

@@ -12,6 +12,7 @@ pub struct IsolatedInput<'a> {
     pub model_max: u64,
     pub root_session: Option<&'a str>,
 }
+#[derive(Clone)]
 pub struct IsolatedContext {
     pub context: Value,
     pub max_tokens: u64,

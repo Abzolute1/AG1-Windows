@@ -1,0 +1,1678 @@
+[
+  {
+    "name": "read",
+    "label": "read",
+    "description": "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "path"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path to the file to read (relative or absolute)",
+          "type": "string"
+        },
+        "offset": {
+          "description": "Line number to start reading from (1-indexed)",
+          "type": "number"
+        },
+        "limit": {
+          "description": "Maximum number of lines to read",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Read file contents",
+    "promptGuidelines": [
+      "Use read to examine files instead of cat or sed.",
+      "Use find to locate files when the path is uncertain before retrying read.",
+      "Use grep to locate symbols or strings before opening candidate files with read.",
+      "For large logs, generated JSON, or traces, grep for discriminating markers and read narrow windows; do not bulk-read several such files in parallel.",
+      "Use ls to inspect directories before reading files inside them.",
+      "After grep or find identifies the target, prefer a narrow read with offset/limit around the relevant range instead of reopening large files from the top."
+    ]
+  },
+  {
+    "name": "bash",
+    "label": "bash",
+    "description": "Execute a bash command in the current working directory. Use this for pipelines, tests, git log/blame, jq, and other shell work — not as a substitute for read, grep, find, ls, repo, job, or memory. Returns stdout and stderr. Oversized output is externalized when session artifacts are available; the active preview is limited to the last 2000 lines or 50KB. Default timeout: 300s.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "command"
+      ],
+      "properties": {
+        "command": {
+          "description": "Bash command to execute",
+          "type": "string"
+        },
+        "timeout": {
+          "description": "Timeout in seconds. Default: 300s.",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Shell for pipelines, git log/blame, jq, tests — not a substitute for read/grep/find/ls/repo/job",
+    "promptGuidelines": [
+      "Prefer read, grep, find, and ls for routine inspection when those dedicated tools are sufficient.",
+      "Use bash when shell semantics, compound commands, or tools outside the dedicated toolset are actually needed.",
+      "After an inspection-style bash command surfaces the needed path or status, switch to a targeted read/grep/find step instead of repeating shell discovery.",
+      "Do not start python -m http.server, npx serve, or similar just to screenshot static HTML — call screenshot_url or verify_ui with the file path.",
+      "Do not bash-sleep to wait on a background test/build. Use job wait with the job id.",
+      "Do not bash tsc, cargo check, go build, gcc, or cmake --build — use check."
+    ]
+  },
+  {
+    "name": "edit",
+    "label": "edit",
+    "description": "Edit a single file using exact text replacement. Each edits[].oldText must match a unique, non-overlapping region of the original file; merge nearby changes into one edit and keep oldText minimal.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "path",
+        "edits"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path to the file to edit (relative or absolute)",
+          "type": "string"
+        },
+        "edits": {
+          "description": "One or more targeted replacements, matched against the original file (not incrementally).",
+          "type": "array",
+          "items": {
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "oldText",
+              "newText"
+            ],
+            "properties": {
+              "oldText": {
+                "description": "Exact text for one targeted replacement.",
+                "type": "string"
+              },
+              "newText": {
+                "description": "Replacement text for this targeted edit.",
+                "type": "string"
+              }
+            }
+          }
+        },
+        "allowFuzzyMatch": {
+          "description": "Allow matching after quote/space normalization when exact matching fails (default false).",
+          "type": "boolean"
+        }
+      }
+    },
+    "promptSnippet": "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+    "promptGuidelines": [
+      "Use edit for precise changes (edits[].oldText must match exactly)",
+      "When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls"
+    ]
+  },
+  {
+    "name": "editPreview",
+    "label": "edit_preview",
+    "description": "Preview an edit by returning a unified diff without modifying any files. Use this to inspect changes before applying them.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "path",
+        "oldText"
+      ],
+      "properties": {
+        "path": {
+          "description": "File path relative to cwd.",
+          "type": "string"
+        },
+        "oldText": {
+          "description": "Exact text to replace.",
+          "type": "string"
+        },
+        "newText": {
+          "default": "",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Preview a change as a unified diff without touching any files",
+    "promptGuidelines": [
+      "Use editPreview to see a unified diff before committing changes",
+      "After approving the diff, use editApply to commit the changes",
+      "If oldText matches multiple times, add more context to make it unique"
+    ]
+  },
+  {
+    "name": "editApply",
+    "label": "edit_apply",
+    "description": "Apply pre-approved edits to a file. This commits changes that were previously inspected via editPreview. Returns a confirmation with the count of applied edits.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "path",
+        "edits"
+      ],
+      "properties": {
+        "path": {
+          "description": "File path relative to cwd.",
+          "type": "string"
+        },
+        "edits": {
+          "description": "List of ordered edits to apply.",
+          "type": "array",
+          "items": {
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "oldText",
+              "newText"
+            ],
+            "properties": {
+              "oldText": {
+                "description": "The old text to find.",
+                "type": "string"
+              },
+              "newText": {
+                "description": "The replacement text.",
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "promptSnippet": "Apply pre-approved edits to a file",
+    "promptGuidelines": [
+      "Use editApply only after reviewing the diff from editPreview",
+      "Each edit.oldText must match exactly; add more context if needed",
+      "Edits are applied in order within a single call"
+    ]
+  },
+  {
+    "name": "write",
+    "label": "write",
+    "description": "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "path",
+        "content"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path to the file to write (relative or absolute)",
+          "type": "string"
+        },
+        "content": {
+          "description": "Content to write to the file",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Create or overwrite files",
+    "promptGuidelines": [
+      "Use write only for new files or complete rewrites."
+    ]
+  },
+  {
+    "name": "grep",
+    "label": "grep",
+    "description": "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "pattern"
+      ],
+      "properties": {
+        "pattern": {
+          "description": "Search pattern (regex or literal string)",
+          "type": "string"
+        },
+        "path": {
+          "description": "Directory or file to search (default: current directory)",
+          "type": "string"
+        },
+        "glob": {
+          "description": "Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'",
+          "type": "string"
+        },
+        "ignoreCase": {
+          "description": "Case-insensitive search (default: false)",
+          "type": "boolean"
+        },
+        "literal": {
+          "description": "Treat pattern as literal string instead of regex (default: false)",
+          "type": "boolean"
+        },
+        "context": {
+          "description": "Number of lines to show before and after each match (default: 0)",
+          "type": "number"
+        },
+        "limit": {
+          "description": "Maximum number of matches to return (default: 100)",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Search file contents for patterns (respects .gitignore)",
+    "promptGuidelines": [
+      "Use grep to locate symbols, functions, error strings, or identifiers before reading files.",
+      "Prefer grep over guessing file paths when you know text that should appear in the code.",
+      "After grep finds a candidate file and line, use read on that file or nearby range for detail.",
+      "When grep returns one decisive source hit, read only a small nearby range, or answer immediately for pure location questions."
+    ]
+  },
+  {
+    "name": "find",
+    "label": "find",
+    "description": "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "pattern"
+      ],
+      "properties": {
+        "pattern": {
+          "description": "Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'",
+          "type": "string"
+        },
+        "path": {
+          "description": "Directory to search in (default: current directory)",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum number of results (default: 1000)",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Find files by glob pattern (respects .gitignore)",
+    "promptGuidelines": [
+      "Use find when the filename or path is uncertain instead of guessing where a file lives.",
+      "After a path-not-found error from read, switch to find or ls before retrying.",
+      "Use find to narrow candidate files, then read or grep the matches.",
+      "If find returns one decisive path for a pure location question, answer immediately instead of running another search.",
+      "For sibling script/file roles, do not search for one filename containing every role term; use the shared anchor or inspect the likely shared parent directory such as `scripts/`."
+    ]
+  },
+  {
+    "name": "ls",
+    "label": "ls",
+    "description": "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Directory to list (default: current directory)",
+          "type": "string"
+        },
+        "limit": {
+          "description": "Maximum number of entries to return (default: 500)",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "List directory contents",
+    "promptGuidelines": [
+      "Use ls to inspect unfamiliar directories before reading files inside them.",
+      "After read says a path is a directory or a path is uncertain, use ls before retrying.",
+      "Use ls to confirm the project structure, then switch to find, grep, or read for specifics.",
+      "If ls fully answers a directory inventory question, answer from the listing instead of following with find or grep."
+    ]
+  },
+  {
+    "name": "webSearch",
+    "label": "webSearch",
+    "description": "Search the web using DuckDuckGo. No API key required. Returns titles, URLs, and snippets. Use to find documentation, APIs, error messages, or current information.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "query"
+      ],
+      "properties": {
+        "query": {
+          "description": "Search query",
+          "type": "string"
+        },
+        "maxResults": {
+          "description": "Maximum results to return (default: 3)",
+          "default": 3,
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Search the web for current information, documentation, or error messages",
+    "promptGuidelines": [
+      "Use webSearch when the task needs current online information, references, or research beyond the local codebase."
+    ]
+  },
+  {
+    "name": "webFetch",
+    "label": "webFetch",
+    "description": "Fetch a URL and convert HTML to markdown. Useful for reading documentation, API docs, and web pages. Returns a compact preview to preserve context and caches results for 15 minutes.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "URL to fetch",
+          "type": "string"
+        },
+        "credential": {
+          "description": "Optional named allowlisted credential (never a raw secret). Hosts and env vars come from .ag1/credentials.json.",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Fetch and read a URL directly (optional named credential)",
+    "promptGuidelines": [
+      "Use webFetch after webSearch when you need the contents of a specific result URL.",
+      "For authenticated hosts, pass credential as a configured name — never paste tokens."
+    ]
+  },
+  {
+    "name": "submit_plan",
+    "label": "submit_plan",
+    "description": "Submit a structured plan (or clarifying questions) in planning mode. Delivers the plan to the user for review instead of printing markdown. No side effects.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "summary"
+      ],
+      "properties": {
+        "summary": {
+          "description": "One short paragraph summarizing the plan",
+          "type": "string"
+        },
+        "steps": {
+          "description": "Implementation steps in execution order",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openQuestions": {
+          "description": "Open decisions or clarifying questions for the user",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "question"
+            ],
+            "properties": {
+              "question": {
+                "description": "A full question or decision label",
+                "type": "string"
+              },
+              "options": {
+                "description": "Candidate choices for this decision",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "assumptions": {
+          "description": "Assumptions the plan relies on",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "constraints": {
+          "description": "Constraints that bound the plan",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "description": "Risks and how to mitigate them",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "description": "How to verify the finished work",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Submit a structured plan for user review in planning mode",
+    "promptGuidelines": [
+      "In planning mode, call submit_plan exactly once to deliver the plan; do not print the plan as markdown text.",
+      "Put implementation steps in steps, open decisions in openQuestions with inline options when choices are obvious.",
+      "If foundational choices are still open, submit only summary and openQuestions without steps."
+    ]
+  },
+  {
+    "name": "todo",
+    "label": "todo",
+    "description": "Track progress on multi-step tasks as a todo list. Use near the START of any task with 3+ steps; never create a retrospective completed list. Every call replaces the whole list, so always pass ALL items with stable ids, titles, and current statuses. Keep exactly one item in_progress, leave later steps pending, and move a pending item to in_progress before completing it in a later update. Mark the active item completed immediately after finishing it and activate the next item in the same update. Call with clear=true only after all work is complete, or with no arguments to query the current list.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "planAction": {
+          "anyOf": [
+            {
+              "description": "Archive the current plan and leave no active checklist.",
+              "const": "archive",
+              "type": "string"
+            },
+            {
+              "description": "Archive the current plan and start a fresh checklist.",
+              "const": "new-plan",
+              "type": "string"
+            }
+          ]
+        },
+        "phase": {
+          "description": "Optional stable phase label for this checklist.",
+          "type": "string"
+        },
+        "todos": {
+          "description": "Full replacement list. Every call must pass the entire list with updated statuses.",
+          "type": "array",
+          "items": {
+            "additionalProperties": false,
+            "type": "object",
+            "required": [
+              "title"
+            ],
+            "properties": {
+              "id": {
+                "description": "Stable id for the item. Omit to have one assigned; keep ids stable across calls.",
+                "type": "string"
+              },
+              "title": {
+                "description": "Short imperative description of the task, e.g. \"Add validation tests\".",
+                "type": "string"
+              },
+              "status": {
+                "description": "Item status. Defaults to \"pending\" when omitted. At most one item may be in_progress.",
+                "anyOf": [
+                  {
+                    "const": "pending",
+                    "type": "string"
+                  },
+                  {
+                    "const": "in_progress",
+                    "type": "string"
+                  },
+                  {
+                    "const": "completed",
+                    "type": "string"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "clear": {
+          "description": "Set true to wipe the todo list entirely.",
+          "type": "boolean"
+        }
+      }
+    },
+    "promptSnippet": "Track multi-step tasks in a todo list (full-list replace on every call)",
+    "promptGuidelines": [
+      "Create todo near the start of any task with 3+ steps; skip it for single-step requests and never manufacture a completed list after the work.",
+      "Always pass the full list on every todo call; it replaces the previous list entirely.",
+      "Keep exactly one todo in_progress. Later items stay pending until activated; mark the active item completed immediately after finishing it.",
+      "When the task or phase materially changes, use planAction=new-plan with a prospective list instead of rewriting the old plan's ids and titles."
+    ]
+  },
+  {
+    "name": "repo",
+    "label": "repo",
+    "description": "Native git state and a cheap codebase map: branch, dirty files, conflicts, diffstat, stack, entry points, top-level layout. Prefer this over ad-hoc git bash for orientation.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "view": {
+          "description": "status = git state, map = stack/layout, all = both (default).",
+          "anyOf": [
+            {
+              "const": "status",
+              "type": "string"
+            },
+            {
+              "const": "map",
+              "type": "string"
+            },
+            {
+              "const": "all",
+              "type": "string"
+            }
+          ]
+        }
+      }
+    },
+    "promptSnippet": "Show git state and a codebase orientation map",
+    "promptGuidelines": [
+      "At the start of work in an unfamiliar or dirty tree, call repo before grepping at random.",
+      "Use repo instead of bash git status/diff/log for a first look at the working tree."
+    ]
+  },
+  {
+    "name": "sourceContext",
+    "label": "sourceContext",
+    "description": "Build, list, and validate bounded revision-aware source capsules. Capsules use deterministic lexical and symbol discovery, persist exact slices as immutable artifacts when session storage is available, and expose canonical file@SHA-256 provenance.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "Build current source context, rehydrate current context with historical pointers, list capsules, or validate one.",
+          "anyOf": [
+            {
+              "const": "build",
+              "type": "string"
+            },
+            {
+              "const": "rehydrate",
+              "type": "string"
+            },
+            {
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "const": "status",
+              "type": "string"
+            }
+          ]
+        },
+        "query": {
+          "description": "Why this source is needed or the symbols/behavior being investigated.",
+          "type": "string"
+        },
+        "capsuleId": {
+          "description": "Saved cap_... id for status.",
+          "type": "string"
+        },
+        "limit": {
+          "minimum": 1,
+          "maximum": 50,
+          "type": "integer"
+        },
+        "paths": {
+          "maxItems": 8,
+          "description": "Known workspace-relative files to include and revision-bind; lexical search is used when omitted.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "symbols": {
+          "maxItems": 12,
+          "description": "Exact identifiers or error strings to prioritize.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contextLines": {
+          "minimum": 2,
+          "maximum": 20,
+          "description": "Lines around each hit.",
+          "type": "integer"
+        },
+        "maxChars": {
+          "minimum": 4000,
+          "maximum": 24000,
+          "description": "Maximum returned capsule size.",
+          "type": "integer"
+        }
+      }
+    },
+    "promptSnippet": "Retrieve bounded exact source slices with revision provenance",
+    "promptGuidelines": [
+      "Use sourceContext when a problem spans several symbols/files or when durable code facts need revision-bound provenance.",
+      "Use ordinary grep plus read for a single obvious location; sourceContext is for a bounded multi-file working set, not every lookup.",
+      "If a capsule says it was truncated, narrow the query or pass explicit paths instead of immediately expanding the context budget.",
+      "Saved capsules are historical evidence. Validate them with action=status after edits; rebuild stale capsules before relying on source claims.",
+      "Rehydrate exact saved slices with artifact read/grep when a capsule materially affects a change, is ambiguous, or conflicts with current evidence.",
+      "Use sourceContext action=rehydrate for a current-first working set plus a small set of relevant historical capsule pointers; historical pointers are secondary evidence."
+    ]
+  },
+  {
+    "name": "memory",
+    "label": "memory",
+    "description": "Durable revision-aware project memory that survives sessions. Store short dated decisions, style, breakage, and facts; component-scoped code claims carry provenance and become historical when source revisions change.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "description": "list hot memories, search all retained memories, add one, update one by id, remove one, or clear all.",
+          "anyOf": [
+            {
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "const": "search",
+              "type": "string"
+            },
+            {
+              "const": "add",
+              "type": "string"
+            },
+            {
+              "const": "update",
+              "type": "string"
+            },
+            {
+              "const": "remove",
+              "type": "string"
+            },
+            {
+              "const": "clear",
+              "type": "string"
+            }
+          ]
+        },
+        "kind": {
+          "description": "Required for add; optional for update: decision, style, breakage, or fact.",
+          "anyOf": [
+            {
+              "const": "decision",
+              "type": "string"
+            },
+            {
+              "const": "style",
+              "type": "string"
+            },
+            {
+              "const": "breakage",
+              "type": "string"
+            },
+            {
+              "const": "fact",
+              "type": "string"
+            }
+          ]
+        },
+        "text": {
+          "description": "Short durable note. Required for add/update.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Required for search. Finds relevant hot and archived memory.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Memory id to update or remove.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "Optional priority (default normal). Core memories are always injected into context and never auto-evicted; use sparingly for durable architecture/process decisions.",
+          "anyOf": [
+            {
+              "const": "core",
+              "type": "string"
+            },
+            {
+              "const": "normal",
+              "type": "string"
+            }
+          ]
+        },
+        "component": {
+          "description": "Optional subsystem scope, for example ContextManager or AuthService.",
+          "type": "string"
+        },
+        "sources": {
+          "maxItems": 8,
+          "description": "Provenance references. Use canonical file:path@sha256 references for code claims.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Read or write durable project memory (decisions, style, breakage, facts)",
+    "promptGuidelines": [
+      "When you learn a decision, style rule, or breakage that should survive this session, store it with memory add.",
+      "If a stored memory becomes wrong or outdated, correct it with memory update instead of adding a contradictory entry.",
+      "Mark long-lived architectural decisions as priority core so they are always in context.",
+      "For component facts or breakage, set component and sources using canonical references returned by sourceContext.",
+      "Treat stale/missing memory as historical evidence; inspect current source and update the memory instead of trusting it.",
+      "Use memory search with focused component, decision, or failure terms when older retained knowledge may matter.",
+      "Do not dump transcripts into memory; one short sentence per entry."
+    ]
+  },
+  {
+    "name": "job",
+    "label": "job",
+    "description": "Run a long command in the background and come back later. start returns an id; poll/log report status and output; the harness pings when a job exits.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "description": "start a command in the background, poll/log/kill by id, or list jobs.",
+          "anyOf": [
+            {
+              "const": "start",
+              "type": "string"
+            },
+            {
+              "const": "poll",
+              "type": "string"
+            },
+            {
+              "const": "log",
+              "type": "string"
+            },
+            {
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "const": "kill",
+              "type": "string"
+            }
+          ]
+        },
+        "command": {
+          "description": "Command to run. Required for start.",
+          "type": "string"
+        },
+        "id": {
+          "description": "Job id for poll, log, or kill.",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Start or poll a background command (tests, builds) and get pinged when it finishes",
+    "promptGuidelines": [
+      "Use job start for long test/build commands instead of blocking bash.",
+      "After starting a job, keep working; poll or wait for the finished-job notice.",
+      "A terminal poll includes the output tail automatically; inspect it before diagnosing the result."
+    ]
+  },
+  {
+    "name": "check",
+    "label": "check",
+    "description": "Run this project's compiler or typechecker and return file:line errors. Call with no arguments. AG1 does not ship compilers — it uses tsc/cargo/go/dotnet/mypy/cmake/make/meson already in the repo or on PATH.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "description": "Optional. Limit to these project files when the compiler supports it (TypeScript). Omit to check the whole project. Do not pass a compiler name.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Typecheck/compile this project (no args). Do not name a compiler.",
+    "promptGuidelines": [
+      "After edits in a typed/compiled project, call check with no arguments.",
+      "Do not pass a language or compiler name. Do not bash tsc/cargo check/go build/gcc/make — use check.",
+      "If check says the toolchain is missing, read the listed source files and fix the error. Do not apt/pacman/pip install a compiler."
+    ]
+  },
+  {
+    "name": "append",
+    "label": "append",
+    "description": "Append text to the end of a file, creating it if it doesn't exist. Automatically adds a newline separator between existing content and new content. Returns full file content after append for verification.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "path",
+        "content"
+      ],
+      "properties": {
+        "path": {
+          "description": "File path relative to cwd. Creates it if missing.",
+          "type": "string"
+        },
+        "content": {
+          "description": "Text to append to the end of the file.",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Append text to a file, creating it if needed",
+    "promptGuidelines": [
+      "Use append(path='src/index.ts', content='\\nexport { Foo } from \"./foo\";') to add exports.",
+      "Use append(path='new-file.md', content='# Title\\n\\nContent') to create a new file.",
+      "Use append(path='README.md', content='\\n## Changelog\\n\\n...') to add sections.",
+      "For multiple appends, each call appends sequentially."
+    ]
+  },
+  {
+    "name": "diff",
+    "label": "diff",
+    "description": "Dedicated diff tool that returns structured diff output instead of raw unified-diff text. Supports single-file (vs HEAD), two-file, branch, and commit comparison modes.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from": {
+          "description": "File or git ref to compare FROM.",
+          "type": "string"
+        },
+        "to": {
+          "description": "File or git ref to compare TO.",
+          "type": "string"
+        },
+        "againstBranch": {
+          "description": "Git branch to diff against.",
+          "type": "string"
+        },
+        "againstCommit": {
+          "description": "Git commit hash to diff against.",
+          "type": "string"
+        },
+        "paths": {
+          "description": "Limit to specific files.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "maxChanges": {
+          "default": 500,
+          "description": "Max changed lines to return.",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Compare files or git refs with structured diff output",
+    "promptGuidelines": [
+      "Use diff(from='path') to see working-tree changes vs HEAD for a single file.",
+      "Use diff(from='old', to='new') to compare two files directly.",
+      "Use diff(againstBranch='main') to see all changes vs a branch.",
+      "Use diff(againstCommit='abc123', paths=['file.ts']) to diff against a commit.",
+      "Increase maxChanges for large diffs; the result indicates truncation via truncated: true."
+    ]
+  },
+  {
+    "name": "artifact",
+    "label": "artifact",
+    "description": "Recover immutable raw evidence externalized from active context. Search an unknown id, then execute its returned surrounding-context readCall directly. Grep only a known artifact with no supplied readCall.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "description": "List/search/recover immutable artifacts or manage bounded evidence leases.",
+          "anyOf": [
+            {
+              "description": "List recent artifacts.",
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "description": "Search exact literal text across the catalog. A match returns an executable surrounding-context readCall; use that call directly.",
+              "const": "search",
+              "type": "string"
+            },
+            {
+              "description": "Inspect metadata for one artifact.",
+              "const": "meta",
+              "type": "string"
+            },
+            {
+              "description": "Read exact evidence by artifact id or supplied cursor.",
+              "const": "read",
+              "type": "string"
+            },
+            {
+              "description": "Find literal text inside one known artifact only when no supplied readCall already targets the needed context. Never repeat a search query that returned a readCall.",
+              "const": "grep",
+              "type": "string"
+            },
+            {
+              "description": "Keep one decisive artifact resident through later context pressure. Creating a lease does not read it; execute the returned readCall when exact content is needed.",
+              "const": "lease",
+              "type": "string"
+            },
+            {
+              "description": "Manually release a lease only after its evidence is no longer needed. Verification-scoped leases release automatically after a successful verifier.",
+              "const": "release",
+              "type": "string"
+            },
+            {
+              "description": "List active evidence leases.",
+              "const": "leases",
+              "type": "string"
+            }
+          ]
+        },
+        "id": {
+          "description": "Artifact id. Required for meta/grep/lease/release; read accepts id or cursor.",
+          "type": "string"
+        },
+        "cursor": {
+          "maxLength": 2048,
+          "description": "Opaque typed cursor returned by artifact read/grep.",
+          "type": "string"
+        },
+        "offset": {
+          "minimum": 0,
+          "description": "UTF-8 byte offset for read (not a grep line number). Default 0.",
+          "type": "integer"
+        },
+        "maxBytes": {
+          "minimum": 1,
+          "maximum": 32768,
+          "description": "Maximum bytes returned by read (default 8192, hard limit 32768).",
+          "type": "integer"
+        },
+        "query": {
+          "maxLength": 512,
+          "description": "Literal text query for catalog-wide search or known-id grep.",
+          "type": "string"
+        },
+        "ignoreCase": {
+          "description": "Case-insensitive grep. Default true.",
+          "type": "boolean"
+        },
+        "kind": {
+          "description": "Optional artifact-kind filter for global search.",
+          "anyOf": [
+            {
+              "const": "tool-output",
+              "type": "string"
+            },
+            {
+              "const": "terminal-output",
+              "type": "string"
+            },
+            {
+              "const": "test-output",
+              "type": "string"
+            },
+            {
+              "const": "compiler-output",
+              "type": "string"
+            },
+            {
+              "const": "web-response",
+              "type": "string"
+            },
+            {
+              "const": "diff",
+              "type": "string"
+            },
+            {
+              "const": "source-capsule",
+              "type": "string"
+            },
+            {
+              "const": "episode-trajectory",
+              "type": "string"
+            },
+            {
+              "const": "compaction-trajectory",
+              "type": "string"
+            },
+            {
+              "const": "text",
+              "type": "string"
+            }
+          ]
+        },
+        "limit": {
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Maximum list entries, global-search artifacts (hard limit 50), or grep matches.",
+          "type": "integer"
+        },
+        "matchesPerArtifact": {
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Maximum exact lines shown per artifact in global search. Default 3.",
+          "type": "integer"
+        },
+        "reason": {
+          "maxLength": 240,
+          "description": "Why exact evidence must remain resident until verification.",
+          "type": "string"
+        },
+        "ttlMinutes": {
+          "minimum": 1,
+          "maximum": 1440,
+          "description": "Evidence lease lifetime in minutes. Default 120; hard maximum 1440.",
+          "type": "integer"
+        },
+        "releaseOnVerification": {
+          "description": "Release this lease after a successful verifier. Default true.",
+          "type": "boolean"
+        }
+      }
+    },
+    "promptSnippet": "Search the artifact catalog or rehydrate immutable raw evidence by id",
+    "promptGuidelines": [
+      "Artifact navigation priority: execute a supplied readCall/nextCall exactly; otherwise search when the id is unknown; otherwise grep a known id. Never insert grep between a search result and its readCall.",
+      "A cursor read needs no id or offset; do not translate line numbers or byte offsets. readCallPurpose=exactPreviousMatchNextLines means that call already returns the surrounding context.",
+      "Use unambiguous salient exact lines directly; when an externalized reference is incomplete, ambiguous, or conflicting without clear status, use artifact grep/read instead of guessing.",
+      "When a write/edit result names an omitted diff byte range, page that range before claiming the full diff was verified; its structured summary is triage evidence, not a substitute for omitted exact changes.",
+      "When the relevant artifact id has been evicted from active context, use artifact search with a distinctive identifier or error fragment; do not list and inspect artifacts one by one.",
+      "When the id is unknown, use artifact search. When the id is known and no supplied readCall already targets the needed context, prefer artifact grep before paging through it.",
+      "Grep returns exact matching lines. Do not read again when a match fully answers the question; grep line numbers are not byte offsets.",
+      "Lease only decisive exact artifacts that must survive until verification. Creating a lease does not read it: execute artifactLease.readCall when exact content is needed.",
+      "Do not release evidence merely because the current response is complete when it is needed after later context pressure. Verification-scoped leases release automatically after a successful verifier; use manual release only when the evidence is definitely no longer needed."
+    ]
+  },
+  {
+    "name": "taskState",
+    "label": "taskState",
+    "description": "Maintain compact control state for the current long-horizon task. Todo tracks declared steps; taskState tracks the objective, phase, constraints, open questions, and typed knowledge without promoting claims to verified truth. FACT/OBSERVATION/RESULT/FAILURE require provenance. Use reset when starting a materially different task.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "const": "show",
+              "type": "string"
+            },
+            {
+              "const": "reset",
+              "type": "string"
+            },
+            {
+              "const": "set",
+              "type": "string"
+            },
+            {
+              "const": "record",
+              "type": "string"
+            },
+            {
+              "const": "update",
+              "type": "string"
+            },
+            {
+              "const": "remove",
+              "type": "string"
+            }
+          ]
+        },
+        "objective": {
+          "description": "Task objective for reset/set. Reset starts a new task state.",
+          "type": "string"
+        },
+        "taskStatus": {
+          "anyOf": [
+            {
+              "const": "active",
+              "type": "string"
+            },
+            {
+              "const": "completed",
+              "type": "string"
+            },
+            {
+              "const": "blocked",
+              "type": "string"
+            }
+          ]
+        },
+        "currentPhase": {
+          "description": "Current work phase; pass an empty string to clear.",
+          "type": "string"
+        },
+        "currentSubgoal": {
+          "type": "string"
+        },
+        "nextAction": {
+          "type": "string"
+        },
+        "blockerId": {
+          "description": "Active FAILURE entry id; empty string clears the link.",
+          "type": "string"
+        },
+        "checkpointId": {
+          "description": "RESULT entry backed by a successful check tool-call source; empty string clears.",
+          "type": "string"
+        },
+        "attemptIds": {
+          "maxItems": 10,
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "constraints": {
+          "maxItems": 20,
+          "description": "Full replacement constraint list.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "openQuestions": {
+          "maxItems": 20,
+          "description": "Full replacement open-question list.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "id": {
+          "description": "Entry id for update/remove.",
+          "type": "string"
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "const": "FACT",
+              "type": "string"
+            },
+            {
+              "const": "OBSERVATION",
+              "type": "string"
+            },
+            {
+              "const": "HYPOTHESIS",
+              "type": "string"
+            },
+            {
+              "const": "DECISION",
+              "type": "string"
+            },
+            {
+              "const": "CONSTRAINT",
+              "type": "string"
+            },
+            {
+              "const": "ASSUMPTION",
+              "type": "string"
+            },
+            {
+              "const": "RESULT",
+              "type": "string"
+            },
+            {
+              "const": "FAILURE",
+              "type": "string"
+            }
+          ]
+        },
+        "statement": {
+          "description": "Human-readable epistemic statement for record/update.",
+          "type": "string"
+        },
+        "entryStatus": {
+          "anyOf": [
+            {
+              "const": "active",
+              "type": "string"
+            },
+            {
+              "const": "resolved",
+              "type": "string"
+            },
+            {
+              "const": "superseded",
+              "type": "string"
+            }
+          ]
+        },
+        "confidence": {
+          "anyOf": [
+            {
+              "const": "low",
+              "type": "string"
+            },
+            {
+              "const": "medium",
+              "type": "string"
+            },
+            {
+              "const": "high",
+              "type": "string"
+            }
+          ]
+        },
+        "reason": {
+          "description": "Rationale, especially for decisions or hypotheses.",
+          "type": "string"
+        },
+        "sources": {
+          "maxItems": 10,
+          "description": "Artifact ids, file@revision references, test runs, or session-entry ids supporting the statement.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Maintain objective, phase, constraints, questions, and provenance-bearing task knowledge",
+    "promptGuidelines": [
+      "The session initializes the objective from the user request. Use show/set to refine it; reset only for a materially different task. Record currentSubgoal and nextAction at meaningful boundaries.",
+      "Record verified facts and results with artifact, file@revision, test-run, or session-entry sources; record uncertainty as HYPOTHESIS or ASSUMPTION.",
+      "Capture durable engineering choices as DECISION with a reason; mark disproven or obsolete entries resolved/superseded instead of leaving contradictions active.",
+      "Link unresolved FAILURE entries with blockerId, link attempts with attemptIds, and resolve/supersede blockers when evidence disproves them.",
+      "Use checkpointId for a RESULT citing tool-call:<id> from a successful check; a compiler checkpoint does not prove runtime or task completion.",
+      "Set taskStatus completed only after requested work and verification are complete."
+    ]
+  },
+  {
+    "name": "runtimeObservation",
+    "label": "runtimeObservation",
+    "description": "Record structured runtime evidence separately from source, typecheck, and build results. Use this for user testing, browser testing, verifier outcomes, or runtime blockers.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "feature",
+        "result",
+        "environment",
+        "revision",
+        "reporter",
+        "reproduction",
+        "notes"
+      ],
+      "properties": {
+        "feature": {
+          "description": "The gameplay, visual, or runtime behavior being observed.",
+          "type": "string"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "const": "pass",
+              "type": "string"
+            },
+            {
+              "const": "fail",
+              "type": "string"
+            },
+            {
+              "const": "partial",
+              "type": "string"
+            },
+            {
+              "const": "blocked",
+              "type": "string"
+            }
+          ]
+        },
+        "environment": {
+          "description": "Runtime environment, for example local browser or desktop build.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "Revision identity, for example current workspace or a commit SHA.",
+          "type": "string"
+        },
+        "reporter": {
+          "anyOf": [
+            {
+              "const": "user",
+              "type": "string"
+            },
+            {
+              "const": "agent",
+              "type": "string"
+            },
+            {
+              "const": "verifier",
+              "type": "string"
+            }
+          ]
+        },
+        "reproduction": {
+          "description": "Short steps that reproduce or verify the behavior.",
+          "type": "string"
+        },
+        "notes": {
+          "description": "Observed result, including what is still unresolved.",
+          "type": "string"
+        },
+        "sources": {
+          "maxItems": 8,
+          "description": "Optional supporting test, artifact, or session references.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Record pass/fail/partial/blocked runtime evidence",
+    "promptGuidelines": [
+      "Record decisive user or automated runtime feedback immediately; do not summarize it only in prose.",
+      "Keep runtime status separate from compilation: a passing check does not imply runtime verification.",
+      "Use result=blocked when the test environment prevents verification, and include the missing capability in notes."
+    ]
+  },
+  {
+    "name": "episode",
+    "label": "episode",
+    "description": "Explicitly bracket a substantial work phase. Draft can ask the same active model, sequentially and in an isolated tool-free context, for a non-authoritative candidate. Closing preserves the exact active-branch trajectory and stores only an explicitly accepted provenance-bearing index. Search ranks off-context episode indexes deterministically and reports source conflicts. Episodes are not automatically injected into context.",
+    "parameters": {
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "anyOf": [
+            {
+              "const": "begin",
+              "type": "string"
+            },
+            {
+              "const": "draft",
+              "type": "string"
+            },
+            {
+              "const": "close",
+              "type": "string"
+            },
+            {
+              "const": "list",
+              "type": "string"
+            },
+            {
+              "const": "search",
+              "type": "string"
+            },
+            {
+              "const": "show",
+              "type": "string"
+            }
+          ]
+        },
+        "id": {
+          "description": "Episode id for show.",
+          "type": "string"
+        },
+        "query": {
+          "description": "Concrete problem, symbol, decision, or failure for search.",
+          "type": "string"
+        },
+        "goal": {
+          "description": "Concrete phase goal. Required for begin.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Short optional phase title.",
+          "type": "string"
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "const": "completed",
+              "type": "string"
+            },
+            {
+              "const": "partial",
+              "type": "string"
+            },
+            {
+              "const": "failed",
+              "type": "string"
+            },
+            {
+              "const": "abandoned",
+              "type": "string"
+            }
+          ]
+        },
+        "synopsis": {
+          "description": "Concise non-authoritative index of what happened. Required for close; exact trajectory remains external.",
+          "type": "string"
+        },
+        "claims": {
+          "maxItems": 20,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "kind",
+              "statement",
+              "sources"
+            ],
+            "properties": {
+              "kind": {
+                "anyOf": [
+                  {
+                    "const": "FACT",
+                    "type": "string"
+                  },
+                  {
+                    "const": "OBSERVATION",
+                    "type": "string"
+                  },
+                  {
+                    "const": "HYPOTHESIS",
+                    "type": "string"
+                  },
+                  {
+                    "const": "DECISION",
+                    "type": "string"
+                  },
+                  {
+                    "const": "CONSTRAINT",
+                    "type": "string"
+                  },
+                  {
+                    "const": "ASSUMPTION",
+                    "type": "string"
+                  },
+                  {
+                    "const": "RESULT",
+                    "type": "string"
+                  },
+                  {
+                    "const": "FAILURE",
+                    "type": "string"
+                  }
+                ]
+              },
+              "statement": {
+                "type": "string"
+              },
+              "confidence": {
+                "anyOf": [
+                  {
+                    "const": "low",
+                    "type": "string"
+                  },
+                  {
+                    "const": "medium",
+                    "type": "string"
+                  },
+                  {
+                    "const": "high",
+                    "type": "string"
+                  }
+                ]
+              },
+              "sources": {
+                "maxItems": 12,
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "fileRevisions": {
+          "maxItems": 20,
+          "description": "Canonical file:path@sha256 references materially used by this phase.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verificationSources": {
+          "maxItems": 12,
+          "description": "Artifact ids or other exact evidence for checks and test results.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "minimum": 1,
+          "maximum": 100,
+          "type": "integer"
+        }
+      }
+    },
+    "promptSnippet": "Bracket and preserve substantial completed work phases without making summaries authoritative",
+    "promptGuidelines": [
+      "Use episode begin/close only for substantial phases of a long task, not routine turns or every tool sequence.",
+      "Draft is optional and costs one additional same-model generation. It never runs concurrently and never closes or persists an episode candidate automatically.",
+      "Close an episode only at a genuine phase boundary; include exact file revisions and verification artifacts when available.",
+      "FACT, OBSERVATION, RESULT, and FAILURE claims require explicit sources. A synopsis is an index, never evidence.",
+      "Before a prior episode materially affects code, inspect current source and rehydrate its exact artifact when needed.",
+      "Use search for a concrete historical problem or stable identifier. Search results and matching claims are indexes, not evidence; conflicts require exact rehydration."
+    ]
+  },
+  {
+    "name": "task",
+    "label": "task",
+    "description": "Delegate a self-contained subtask to an isolated subagent with its own context and tools; receive only its final result.\n\nUse when a subtask would flood your context (multi-file exploration, log-heavy test runs) or benefits from isolation. Do not delegate a single path lookup, one file read, or one grep; use find/read/grep directly. The subagent sees ONLY your prompt — include everything it needs; it cannot ask questions or spawn subagents. Runs in the foreground; the result is the final summary plus capped evidence, never the transcript.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "description",
+        "type",
+        "prompt"
+      ],
+      "properties": {
+        "description": {
+          "description": "3-5 word task label shown in the UI",
+          "type": "string"
+        },
+        "type": {
+          "description": "Subagent profile: explore (read-only inspection, file:line evidence), research (explore + web, source URLs), implement (full tools, makes and verifies changes), verify (read-only + bash checks, reports commands + exit codes), plan (read-only, step-by-step plan)",
+          "anyOf": [
+            {
+              "const": "explore",
+              "type": "string"
+            },
+            {
+              "const": "research",
+              "type": "string"
+            },
+            {
+              "const": "implement",
+              "type": "string"
+            },
+            {
+              "const": "verify",
+              "type": "string"
+            },
+            {
+              "const": "plan",
+              "type": "string"
+            }
+          ]
+        },
+        "prompt": {
+          "description": "Self-contained task brief. The subagent sees NOTHING else — no conversation, no context. Include file paths, goals, and constraints.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Optional model override as provider/id. Default: routed by type (implement/plan use the current model; explore/research/verify may use a cheaper eligible model).",
+          "type": "string"
+        },
+        "maxTurns": {
+          "description": "Max assistant turns (default 12, hard cap 25)",
+          "type": "number"
+        },
+        "timeout": {
+          "description": "Wall-clock timeout in seconds (default 300)",
+          "type": "number"
+        },
+        "resumeFrom": {
+          "description": "Checkpoint ID from a previous failed run. The subagent resumes from where it left off, with prior findings injected as context.",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Delegate a self-contained subtask to an isolated subagent (result-only return)",
+    "promptGuidelines": [
+      "Do not use task for a single path lookup, one file read, or one grep; use find/read/grep directly."
+    ]
+  },
+  {
+    "name": "explore",
+    "label": "explore",
+    "description": "Fan out read-only explore workers over several questions, merge their findings, and keep a shared board so later explores see prior answers. Use instead of isolated one-off task calls when you need coordinated discovery.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "questions"
+      ],
+      "properties": {
+        "questions": {
+          "minItems": 1,
+          "maxItems": 4,
+          "description": "1-4 focused exploration questions. Each runs as a read-only worker; results are merged.",
+          "type": "array",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          }
+        }
+      }
+    },
+    "promptSnippet": "Run coordinated parallel read-only exploration and merge findings",
+    "promptGuidelines": [
+      "Use explore when you have 2+ independent questions about the codebase that can be answered in parallel.",
+      "Workers are read-only and isolated; they share only the merged findings board, not live write access."
+    ]
+  },
+  {
+    "name": "compact",
+    "label": "compact",
+    "description": "Compact the conversation to reduce token usage. Summarizes older conversation and retains only the summary plus recent messages. Useful when the conversation is getting long and you want to reduce the context size.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "description": "Optional reason for compaction (e.g. 'conversation getting long', 'saving tokens').",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Compact the conversation to reduce token usage",
+    "promptGuidelines": [
+      "Use compact when the conversation is getting long and context is running low.",
+      "Call compact to compress older messages into a summary, keeping only recent context.",
+      "After compaction, review the saved tokens and continue your task."
+    ]
+  }
+]

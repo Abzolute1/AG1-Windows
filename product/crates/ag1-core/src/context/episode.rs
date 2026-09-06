@@ -331,13 +331,23 @@ pub fn prepare_begin(
     title: Option<&str>,
 ) -> Result<PreparedStateCommit, DomainError> {
     let journal = store.journal_snapshot(&command.session)?;
-    if find_open(&branch_values(&journal)?).is_some() {
+    let record = begin_record(&branch_values(&journal)?, command.now, id, goal, title)?;
+    prepared(&journal, command, record)
+}
+/// Prepare metadata without acquiring a competing session writer.
+pub fn begin_record(
+    entries: &[Value],
+    now: &str,
+    id: &str,
+    goal: &str,
+    title: Option<&str>,
+) -> Result<EpisodeRecord, DomainError> {
+    if find_open(entries).is_some() {
         return Err(invalid("episode already open"));
     }
-    let record = EpisodeRecord::parse(
-        &json!({"version":1,"event":"begin","id":id,"goal":goal,"title":title,"createdAt":command.now}),
-    )?;
-    prepared(&journal, command, record)
+    EpisodeRecord::parse(
+        &json!({"version":1,"event":"begin","id":id,"goal":goal,"title":title,"createdAt":now}),
+    )
 }
 pub fn prepare_close(
     store: &impl StoragePort,
@@ -346,11 +356,22 @@ pub fn prepare_close(
     input: &Value,
 ) -> Result<PreparedStateCommit, DomainError> {
     let journal = store.journal_snapshot(&command.session)?;
-    let entries = branch_values(&journal)?;
+    let record = close_record(&journal, artifacts, command.now, command.command, input)?;
+    prepared(&journal, command, record)
+}
+/// Capture exact durable bytes; the caller still owns metadata publication.
+pub fn close_record(
+    journal: &crate::storage::StoredJournal,
+    artifacts: &mut impl ContextArtifactPort,
+    now: &str,
+    call_id: &str,
+    input: &Value,
+) -> Result<EpisodeRecord, DomainError> {
+    let entries = branch_values(journal)?;
     let (open, start) = find_open(&entries).ok_or_else(|| invalid("no open episode"))?;
     let selected = &entries[start..];
     let start_id = string(&entries[start], "id");
-    let mut record = json!({"version":1,"event":"closed","id":open.0["id"],"goal":open.0["goal"],"title":open.0["title"],"openedAt":open.0["createdAt"],"closedAt":command.now,"startEntryId":start_id,"endEntryId":selected.last().unwrap()["id"],"entryCount":selected.len(),"outcome":input["outcome"],"synopsis":input["synopsis"],"synopsisAuthority":"model-authored-index","trajectoryArtifactId":"art_00000000000000000000000000000000","claims":input.get("claims").cloned().unwrap_or(json!([])),"fileRevisions":input.get("fileRevisions").cloned().unwrap_or(json!([])),"verificationSources":input.get("verificationSources").cloned().unwrap_or(json!([]))});
+    let mut record = json!({"version":1,"event":"closed","id":open.0["id"],"goal":open.0["goal"],"title":open.0["title"],"openedAt":open.0["createdAt"],"closedAt":now,"startEntryId":start_id,"endEntryId":selected.last().unwrap()["id"],"entryCount":selected.len(),"outcome":input["outcome"],"synopsis":input["synopsis"],"synopsisAuthority":"model-authored-index","trajectoryArtifactId":"art_00000000000000000000000000000000","claims":input.get("claims").cloned().unwrap_or(json!([])),"fileRevisions":input.get("fileRevisions").cloned().unwrap_or(json!([])),"verificationSources":input.get("verificationSources").cloned().unwrap_or(json!([]))});
     EpisodeRecord::parse(&record)?;
     let mut trajectory = format!(
         "{{\"type\":\"ag1_episode_trajectory\",\"version\":1,\"episodeId\":{},\"startEntryId\":{},\"entryCount\":{}}}\n",
@@ -380,10 +401,10 @@ pub fn prepare_close(
     let artifact = artifacts.put_evidence(
         &trajectory,
         "episode-trajectory",
-        &json!({"type":"tool","name":"episode","callId":command.command}),
+        &json!({"type":"tool","name":"episode","callId":call_id}),
         &[],
         Some(start_id),
     )?;
     record["trajectoryArtifactId"] = artifact.id.into();
-    prepared(&journal, command, EpisodeRecord::parse(&record)?)
+    EpisodeRecord::parse(&record)
 }

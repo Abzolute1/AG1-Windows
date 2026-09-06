@@ -34,6 +34,8 @@ pub enum Sandbox {
     Off,
     Workspace,
     Strict,
+    /// Host-selected delegated shell: no writable filesystem opens or sockets.
+    ReadOnly,
 }
 impl Sandbox {
     pub fn parse(value: Option<&str>) -> Option<Self> {
@@ -112,6 +114,7 @@ pub(crate) struct RunningShell {
     command: String,
     deadline: Instant,
     timeout: f64,
+    terminal: Option<Exit>,
 }
 impl Drop for RunningShell {
     fn drop(&mut self) {
@@ -120,6 +123,28 @@ impl Drop for RunningShell {
     }
 }
 impl ShellService {
+    /// Separate capability and authorization stamp; cannot weaken this service
+    /// or be selected by model arguments/environment sandbox settings.
+    pub fn readonly(&self) -> Result<Self, DomainError> {
+        let mut config = self.config.clone();
+        config.sandbox = Sandbox::ReadOnly;
+        if !config
+            .bubblewrap
+            .as_ref()
+            .is_some_and(|path| path.is_file())
+        {
+            return Err(DomainError::Unavailable(
+                "readonly shell requires bubblewrap".into(),
+            ));
+        }
+        Self::new_with_network(
+            self.workspace.clone(),
+            self.processes.clone(),
+            &self.spools,
+            config,
+            false,
+        )
+    }
     pub fn new(
         workspace: Arc<Workspace>,
         processes: Arc<ProcessSupervisor>,
@@ -366,6 +391,9 @@ impl ShellService {
         // No interactive/login startup files or inherited environment are evaluated.
         env.remove("BASH_ENV");
         env.remove("ENV");
+        if self.config.sandbox == Sandbox::ReadOnly {
+            env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
+        }
         let mut executable = self.config.executable.clone();
         let mut argv = vec![
             "--noprofile".into(),
@@ -398,8 +426,24 @@ impl ShellService {
             let mut sandbox: Vec<String> = ["--unshare-ipc", "--unshare-pid", "--unshare-user"]
                 .map(str::to_string)
                 .into();
-            if self.config.sandbox == Sandbox::Strict || !self.network {
+            if matches!(self.config.sandbox, Sandbox::Strict | Sandbox::ReadOnly) || !self.network {
                 sandbox.push("--unshare-net".into());
+            }
+            let readonly = self.config.sandbox == Sandbox::ReadOnly;
+            if readonly {
+                sandbox.extend(
+                    [
+                        "--disable-userns",
+                        "--new-session",
+                        "--cap-drop",
+                        "ALL",
+                        "--tmpfs",
+                        "/run",
+                        "--seccomp",
+                        crate::process::READONLY_FILTER_FD,
+                    ]
+                    .map(str::to_string),
+                );
             }
             // The supervisor passes an owned cwd descriptor through the private helper.
             // --bind-fd stays valid after user/pid namespaces hide the parent's /proc.
@@ -417,7 +461,11 @@ impl ShellService {
                     "/dev",
                     "--dir",
                     "/tmp/ag1-home",
-                    "--bind-fd",
+                    if readonly {
+                        "--ro-bind-fd"
+                    } else {
+                        "--bind-fd"
+                    },
                     crate::process::PINNED_CWD_FD,
                     cwd,
                     "--setenv",
@@ -457,7 +505,14 @@ impl ShellService {
             grace_ms: 100,
             resident: false,
         };
-        let mut child = if self.config.sandbox == Sandbox::Off {
+        let mut child = if self.config.sandbox == Sandbox::ReadOnly {
+            self.processes.spawn_readonly_tool(
+                spec,
+                &spool,
+                self.config.output_bytes,
+                self.config.address_space,
+            )?
+        } else if self.config.sandbox == Sandbox::Off {
             self.processes.spawn_tool(
                 spec,
                 &spool,
@@ -480,11 +535,20 @@ impl ShellService {
             command: command.into(),
             deadline,
             timeout,
+            terminal: None,
         })
     }
 }
 impl RunningShell {
     pub(crate) fn poll(&mut self, cancel: &AtomicBool) -> Result<Option<Exit>, DomainError> {
+        if let Some(exit) = self.terminal {
+            return Ok(Some(exit));
+        }
+        let result = self.poll_terminal(cancel)?;
+        self.terminal = result;
+        Ok(result)
+    }
+    fn poll_terminal(&mut self, cancel: &AtomicBool) -> Result<Option<Exit>, DomainError> {
         if cancel.load(Ordering::Acquire) {
             self.child.stop()?;
             return Ok(Some(Exit::Cancelled));
@@ -580,6 +644,10 @@ impl RunningShell {
             Exit::Timeout(_) => "timeout",
             Exit::OutputLimit => "output_limit",
         });
+        result["details"]["exitCode"] = match exit {
+            Exit::Code(code) => json!(code),
+            _ => Value::Null,
+        };
         // Shell commands may have changed files even after an error or cancellation.
         Ok(AdapterOutcome {
             result,

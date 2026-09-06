@@ -246,6 +246,27 @@ impl GitService {
         cancel: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
     ) -> Result<(String, bool), DomainError> {
+        let mut args = [
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--relative",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        args.extend_from_slice(tail);
+        self.tool_command(workspace, &args, cancel, deadline, 5 * 1024 * 1024)
+    }
+    /// Host-assembled read-only commands, sharing owned process drain and bounds.
+    pub(crate) fn tool_command(
+        &self,
+        workspace: &Workspace,
+        args: &[String],
+        cancel: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<(String, bool), DomainError> {
         let _claim = workspace.claim()?;
         let pinned = workspace.pin_directory("")?;
         let check = || {
@@ -265,15 +286,10 @@ impl GitService {
             "core.hooksPath=/dev/null",
             "--no-pager",
             "--literal-pathspecs",
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--relative",
         ]
         .map(str::to_string)
         .into();
-        argv.extend_from_slice(tail);
+        argv.extend_from_slice(args);
         let spool = self.spools.join(format!(
             "tool-git-{}-{}.log",
             std::process::id(),
@@ -317,8 +333,8 @@ impl GitService {
             let bytes = child.read_stdout(32768)?;
             let empty = bytes.is_empty();
             output.extend(bytes);
-            if output.len() > 5 * 1024 * 1024 {
-                return Err(DomainError::LimitExceeded("Git diff output".into()));
+            if output.len() > max_bytes {
+                return Err(DomainError::LimitExceeded("Git command output".into()));
             }
             if empty && let Some(exit) = child.try_wait()? {
                 status = exit;

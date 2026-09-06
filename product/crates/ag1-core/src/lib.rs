@@ -2,6 +2,7 @@
 pub mod inference;
 pub mod model;
 pub mod provider;
+pub mod runtime;
 pub mod storage;
 use std::{collections::VecDeque, future::Future, pin::Pin};
 

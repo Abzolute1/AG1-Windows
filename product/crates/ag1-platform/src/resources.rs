@@ -25,7 +25,7 @@ pub enum DiscoveryReason {
     Startup,
     Reload,
 }
-fn extension_resource_paths(
+pub(crate) fn extension_resource_paths(
     result: &Value,
     host: &crate::extension_host::ExtensionHost,
 ) -> Result<Paths, DomainError> {
@@ -304,6 +304,9 @@ fn entries(value: Option<&Value>) -> Result<Vec<String>, DomainError> {
         .collect()
 }
 impl ResourceLoader {
+    pub(crate) fn workspace_root(&self) -> &Path {
+        &self.config.cwd
+    }
     /// Resolve explicitly supplied package resources without auto-discovery,
     /// installation, extension execution or publication. Non-local packages must
     /// already have a host-pinned installation record. Callers still capture and

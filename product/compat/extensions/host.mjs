@@ -2,6 +2,7 @@
 import { Console } from "node:console";
 import { ExtensionRuntime, UnsupportedAPI, bounded } from "./runtime.mjs";
 import { Transport } from "./transport.mjs";
+import { SnapshotTransfer } from "./snapshot-transfer.mjs";
 globalThis.console = new Console({
 	stdout: process.stderr,
 	stderr: process.stderr,
@@ -15,6 +16,7 @@ let runtime,
 	closed = false;
 const pending = new Map();
 const invocations = new Map();
+const snapshots = new SnapshotTransfer();
 let invoked = new Set();
 function fatal(error) {
 	if (closed) return;
@@ -231,6 +233,11 @@ async function dispatchRequest(frame) {
 	try {
 		bounded(frame.args);
 		const args = frame.args ?? {};
+		if (args.snapshotRef !== undefined) {
+			if (args.snapshot !== undefined || !["bind", "event", "tool.prepare", "tool.execute", "command", "shortcut", "provider"].includes(frame.method))
+				throw new Error("Invalid native snapshot reference");
+			args.snapshot = snapshots.take(args.snapshotRef);
+		}
 		let result;
 		if (frame.method === "initialize") {
 			if (runtime) throw new Error("Extension host already initialized");
@@ -251,6 +258,12 @@ async function dispatchRequest(frame) {
 		} else {
 			if (!runtime) throw new Error("Extension host not initialized");
 			switch (frame.method) {
+				case "snapshot.begin":
+					result = snapshots.begin(args);
+					break;
+				case "snapshot.append":
+					result = snapshots.append(args);
+					break;
 				case "load":
 					result = await runtime.load(args.entries);
 					break;

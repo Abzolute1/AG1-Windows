@@ -20,7 +20,7 @@ pub struct View {
 }
 /// Reload exposes all groups. Extension refresh exposes only its changed groups;
 /// changes to other fields are rejected so captured context remains stable.
-pub trait Overrides {
+pub trait Overrides: Send + Sync {
     fn apply(
         &self,
         view: &mut View,

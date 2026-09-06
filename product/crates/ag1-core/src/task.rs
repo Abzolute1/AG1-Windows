@@ -462,6 +462,17 @@ pub trait JournalWritePort: StoragePort {
         records: &[Vec<u8>],
     ) -> Result<(u64, u64), DomainError>;
 }
+/// Atomic branch selection retains all original records, including abandoned
+/// failed attempts. The acknowledgement includes a new CAS revision.
+pub trait JournalBranchPort: JournalWritePort {
+    fn select_leaf(
+        &self,
+        session: &SessionId,
+        command: &str,
+        expected: u64,
+        leaf: Option<&str>,
+    ) -> Result<(u64, u64), DomainError>;
+}
 pub struct PreparedStateCommit {
     pub session: SessionId,
     pub command: String,

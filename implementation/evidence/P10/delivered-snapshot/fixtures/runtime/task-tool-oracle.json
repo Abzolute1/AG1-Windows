@@ -1,0 +1,604 @@
+{
+  "version": 1,
+  "source_commit": "e30f0b4b238ee5618928bcd17b4571eb046e7038",
+  "source_files": [
+    {
+      "path": "packages/coding-agent/src/core/tools/task.ts",
+      "sha256": "7d756d3d6918e71c478304a2246596f15798f8157d702b3b20c2217dabfefffb"
+    }
+  ],
+  "metadata": {
+    "name": "task",
+    "label": "task",
+    "description": "Delegate a self-contained subtask to an isolated subagent with its own context and tools; receive only its final result.\n\nUse when a subtask would flood your context (multi-file exploration, log-heavy test runs) or benefits from isolation. Do not delegate a single path lookup, one file read, or one grep; use find/read/grep directly. The subagent sees ONLY your prompt — include everything it needs; it cannot ask questions or spawn subagents. Runs in the foreground; the result is the final summary plus capped evidence, never the transcript.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "description",
+        "type",
+        "prompt"
+      ],
+      "properties": {
+        "description": {
+          "description": "3-5 word task label shown in the UI",
+          "type": "string"
+        },
+        "type": {
+          "description": "Subagent profile: explore (read-only inspection, file:line evidence), research (explore + web, source URLs), implement (full tools, makes and verifies changes), verify (read-only + bash checks, reports commands + exit codes), plan (read-only, step-by-step plan)",
+          "anyOf": [
+            {
+              "const": "explore",
+              "type": "string"
+            },
+            {
+              "const": "research",
+              "type": "string"
+            },
+            {
+              "const": "implement",
+              "type": "string"
+            },
+            {
+              "const": "verify",
+              "type": "string"
+            },
+            {
+              "const": "plan",
+              "type": "string"
+            }
+          ]
+        },
+        "prompt": {
+          "description": "Self-contained task brief. The subagent sees NOTHING else — no conversation, no context. Include file paths, goals, and constraints.",
+          "type": "string"
+        },
+        "model": {
+          "description": "Optional model override as provider/id. Default: routed by type (implement/plan use the current model; explore/research/verify may use a cheaper eligible model).",
+          "type": "string"
+        },
+        "maxTurns": {
+          "description": "Max assistant turns (default 12, hard cap 25)",
+          "type": "number"
+        },
+        "timeout": {
+          "description": "Wall-clock timeout in seconds (default 300)",
+          "type": "number"
+        },
+        "resumeFrom": {
+          "description": "Checkpoint ID from a previous failed run. The subagent resumes from where it left off, with prior findings injected as context.",
+          "type": "string"
+        }
+      }
+    },
+    "promptSnippet": "Delegate a self-contained subtask to an isolated subagent (result-only return)",
+    "promptGuidelines": [
+      "Do not use task for a single path lookup, one file read, or one grep; use find/read/grep directly."
+    ]
+  },
+  "rows": [
+    {
+      "input": {
+        "state": "completed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "",
+        "partial": false,
+        "evidence": [],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500
+      },
+      "output": "Task completed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nSummary:\n(no output)"
+    },
+    {
+      "input": {
+        "state": "completed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": false,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500
+      },
+      "output": "Task completed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nSummary:\nCollected findings\nEvidence (1):\n- bash: `node --test` → exit 0"
+    },
+    {
+      "input": {
+        "state": "completed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": false,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500
+      },
+      "output": "Task completed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nSummary:\nCollected findings\nEvidence (11):\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- … 1 more"
+    },
+    {
+      "input": {
+        "state": "failed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "",
+        "partial": false,
+        "evidence": [],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task failed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nSummary:\n(no output)"
+    },
+    {
+      "input": {
+        "state": "failed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task failed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (1):\n- bash: `node --test` → exit 0"
+    },
+    {
+      "input": {
+        "state": "failed",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task failed: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (11):\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- … 1 more"
+    },
+    {
+      "input": {
+        "state": "timeout",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "",
+        "partial": false,
+        "evidence": [],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task timeout: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nSummary:\n(no output)"
+    },
+    {
+      "input": {
+        "state": "timeout",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task timeout: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (1):\n- bash: `node --test` → exit 0"
+    },
+    {
+      "input": {
+        "state": "timeout",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task timeout: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (11):\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- … 1 more"
+    },
+    {
+      "input": {
+        "state": "budget",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "",
+        "partial": false,
+        "evidence": [],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task budget: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nSummary:\n(no output)"
+    },
+    {
+      "input": {
+        "state": "budget",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task budget: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (1):\n- bash: `node --test` → exit 0"
+    },
+    {
+      "input": {
+        "state": "budget",
+        "type": "explore",
+        "description": "Inspect the fixture",
+        "model": "owned-fixture/initial",
+        "summary": "Collected findings",
+        "partial": true,
+        "evidence": [
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": 0
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          },
+          {
+            "kind": "web",
+            "url": "https://example.test/owned"
+          },
+          {
+            "kind": "bash",
+            "command": "node --test",
+            "exitCode": null
+          },
+          {
+            "kind": "file",
+            "action": "write",
+            "path": "main.rs"
+          },
+          {
+            "kind": "inspect",
+            "tool": "read",
+            "detail": "main.rs"
+          }
+        ],
+        "usage": {
+          "input": 12000,
+          "output": 345,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 12345,
+          "cost": 0
+        },
+        "turns": 3,
+        "durationMs": 1500,
+        "error": "Bounded fixture stopped",
+        "checkpointId": "ckpt_fixture"
+      },
+      "output": "Task budget: Inspect the fixture [explore · owned-fixture/initial · 3 turns · 2s · 12,345 tok]\nNote: Bounded fixture stopped\nCheckpoint: ckpt_fixture (use resumeFrom to retry from this point)\nPartial result — the task ended before completing.\nSummary:\nCollected findings\nEvidence (11):\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- fetch: https://example.test/owned\n- bash: `node --test` → exit killed\n- write: main.rs\n- inspect\n- … 1 more"
+    }
+  ],
+  "model_actions": 0,
+  "network_actions": 0
+}

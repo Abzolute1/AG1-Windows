@@ -932,3 +932,584 @@ fn export_never_replaces_a_destination_created_during_publication() {
     assert!(store.export(&destination, true).is_err());
     assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
 }
+
+#[test]
+fn native_artifact_catalog_pages_are_complete_ordered_and_requester_scoped() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("store")).unwrap();
+    seed(&store);
+    for index in 0..150 {
+        store.put_artifact(&artifact(index, "utf8")).unwrap();
+    }
+    store.put_artifact(&artifact(200, "binary")).unwrap();
+    store
+        .create_session("stranger", &header("stranger"))
+        .unwrap();
+    assert!(
+        store
+            .artifact_catalog("stranger", None, 128, None)
+            .unwrap()
+            .is_empty()
+    );
+    let mut before = None;
+    let mut records = vec![];
+    loop {
+        let page = store
+            .artifact_catalog("parent", before.as_ref(), 17, Some("text"))
+            .unwrap();
+        assert!(page.len() <= 17);
+        if page.is_empty() {
+            break;
+        }
+        before = Some(page.last().unwrap().position.clone());
+        records.extend(page);
+    }
+    assert_eq!(records.len(), 150);
+    for (record, index) in records.iter().zip((0..150).rev()) {
+        assert_eq!(record.position.id, format!("art_{index:032x}"));
+        assert_eq!(record.position.origin, "origin");
+        assert_eq!(record.record["unknown"]["preserved"], true);
+    }
+    assert!(store.artifact_catalog("parent", None, 129, None).is_err());
+    assert_eq!(
+        store.artifact_catalog("parent", None, 1, None).unwrap()[0]
+            .position
+            .id,
+        format!("art_{:032x}", 200)
+    );
+    store.fork("parent", "child", None).unwrap();
+    store.put_artifact(&artifact(300, "utf8")).unwrap();
+    assert!(
+        store
+            .artifact_catalog("child", None, 128, None)
+            .unwrap()
+            .iter()
+            .all(|record| record.position.id != format!("art_{:032x}", 300))
+    );
+    store.archive_session("parent").unwrap();
+    assert!(store.artifact_catalog("parent", None, 1, None).is_err());
+    assert_eq!(
+        store
+            .artifact_catalog("child", None, 1, None)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+#[test]
+fn native_context_cursors_match_sdk_bytes_and_keep_authorized_fork_access() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store");
+    let store = Store::open(&path).unwrap();
+    seed(&store);
+    let id = store.put_artifact(&artifact(1, "utf8")).unwrap();
+    let oracle: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/runtime/artifact-cursor-oracle.json"
+    ))
+    .unwrap();
+    let rows = oracle["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let cursor = store
+            .context_cursor(
+                "parent",
+                "origin",
+                &id,
+                row["start"].as_u64().unwrap()..row["end"].as_u64().unwrap(),
+                row["anchor"].as_u64().unwrap() as u32,
+            )
+            .unwrap();
+        assert_eq!(cursor, row["cursor"]);
+        let decoded = store.decode_cursor("parent", &cursor).unwrap();
+        assert!(decoded.context);
+        assert_eq!(
+            decoded.anchor_line,
+            Some(row["anchor"].as_u64().unwrap() as u32)
+        );
+    }
+    let cursor = store
+        .context_cursor(
+            "parent",
+            "origin",
+            &id,
+            0..artifact(1, "utf8").bytes.len() as u64,
+            2,
+        )
+        .unwrap();
+    store
+        .create_session("stranger", &header("stranger"))
+        .unwrap();
+    assert!(store.read_cursor("stranger", &cursor).is_err());
+    assert!(
+        store
+            .context_cursor("stranger", "origin", &id, 0..20, 2)
+            .is_err()
+    );
+    store.fork("parent", "child", None).unwrap();
+    store.archive_session("parent").unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    let page = store.read_cursor("child", &cursor).unwrap();
+    assert_eq!(page.bytes, artifact(1, "utf8").bytes);
+    assert_eq!(page.next_offset, None);
+    let mut forged = cursor.into_bytes();
+    forged[9] = if forged[9] == b'A' { b'B' } else { b'A' };
+    assert!(
+        store
+            .read_cursor("child", &String::from_utf8(forged).unwrap())
+            .is_err()
+    );
+}
+#[test]
+fn native_manual_lease_release_accepts_lease_or_artifact_id_and_preserves_foreign_leases() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open_with(
+        &directory.path().join("store"),
+        Arc::new(TestClock(AtomicU64::new(1000))),
+        Arc::new(Fault {
+            point: Boundary::BeforeAck,
+            armed: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
+    seed(&store);
+    let id = store.put_artifact(&artifact(1, "utf8")).unwrap();
+    assert!(
+        store
+            .lease_record("parent", "origin", &id, &"🦙".repeat(121), 120000, true)
+            .is_err()
+    );
+    let record = store
+        .lease_record(
+            "parent",
+            "origin",
+            &id,
+            " retain decisive evidence ",
+            120000,
+            true,
+        )
+        .unwrap();
+    assert_eq!(record["reason"], "retain decisive evidence");
+    assert_eq!(record["expiresAt"], "1970-01-01T00:02:01.000Z");
+    assert_eq!(
+        store.evidence_lease_records("parent").unwrap(),
+        vec![record.clone()]
+    );
+    store
+        .create_session("stranger", &header("stranger"))
+        .unwrap();
+    assert_eq!(
+        store
+            .release_evidence_lease("stranger", record["id"].as_str().unwrap())
+            .unwrap(),
+        0
+    );
+    assert!(store.evidence_lease_records("stranger").unwrap().is_empty());
+    assert_eq!(store.evidence_lease_records("parent").unwrap().len(), 1);
+    assert_eq!(
+        store
+            .release_evidence_lease("parent", record["id"].as_str().unwrap())
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .release_evidence_lease("parent", record["id"].as_str().unwrap())
+            .unwrap(),
+        0
+    );
+    store
+        .lease_record("parent", "origin", &id, "renewed", 120000, false)
+        .unwrap();
+    assert_eq!(store.release_evidence_lease("parent", &id).unwrap(), 1);
+    assert!(store.evidence_lease_records("parent").unwrap().is_empty());
+    assert_eq!(
+        store.page("parent", "origin", &id, 0, 32768).unwrap().bytes,
+        artifact(1, "utf8").bytes
+    );
+}
+#[test]
+fn native_lease_creation_and_release_preserve_committed_state_when_ack_is_lost() {
+    for point in [Boundary::BeforeCommit, Boundary::BeforeAck] {
+        let directory = tempfile::tempdir().unwrap();
+        let fault = Arc::new(Fault {
+            point,
+            armed: AtomicBool::new(false),
+        });
+        let store = Store::open_with(
+            &directory.path().join("store"),
+            Arc::new(TestClock(AtomicU64::new(1000))),
+            fault.clone(),
+        )
+        .unwrap();
+        seed(&store);
+        let id = store.put_artifact(&artifact(1, "utf8")).unwrap();
+        fault.armed.store(true, Ordering::SeqCst);
+        assert!(
+            store
+                .lease_record("parent", "origin", &id, "faulted creation", 60000, true)
+                .is_err()
+        );
+        assert_eq!(
+            store.evidence_lease_records("parent").unwrap().len(),
+            usize::from(point == Boundary::BeforeAck)
+        );
+        store
+            .lease_record("parent", "origin", &id, "ready for release", 60000, true)
+            .unwrap();
+        fault.armed.store(true, Ordering::SeqCst);
+        assert!(store.release_evidence_lease("parent", &id).is_err());
+        assert_eq!(
+            store.evidence_lease_records("parent").unwrap().len(),
+            usize::from(point == Boundary::BeforeCommit)
+        );
+    }
+}
+
+#[test]
+fn native_artifact_scan_authorizes_and_hashes_the_same_bytes_before_returning_matches() {
+    use ag1_core::{SessionId, evidence::EvidenceRequest};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("store")).unwrap();
+    seed(&store);
+    let input = artifact(1, "utf8");
+    let id = store.put_artifact(&input).unwrap();
+    let request = EvidenceRequest {
+        requester: SessionId::new("parent").unwrap(),
+        origin: "origin".into(),
+        artifact: id.clone(),
+    };
+    let result = store
+        .scan_artifact(&request, "needle", true, 10, || Ok(()))
+        .unwrap();
+    assert_eq!(result.total_matches, 1);
+    assert_eq!(result.hits[0].line, 2);
+    assert_eq!(result.hits[0].text, "needle β 🦙 final");
+    assert_eq!(result.sha256, digest(&input.bytes));
+    let hit = &result.hits[0];
+    let cursor = store
+        .context_cursor(
+            "parent",
+            "origin",
+            &id,
+            hit.context_start..hit.context_end,
+            hit.line as u32,
+        )
+        .unwrap();
+    assert_eq!(
+        store.read_cursor("parent", &cursor).unwrap().bytes,
+        input.bytes
+    );
+    store
+        .create_session("stranger", &header("stranger"))
+        .unwrap();
+    let foreign = EvidenceRequest {
+        requester: SessionId::new("stranger").unwrap(),
+        ..request.clone()
+    };
+    assert!(
+        store
+            .scan_artifact(&foreign, "needle", true, 10, || Ok(()))
+            .is_err()
+    );
+    let binary = store.put_artifact(&artifact(2, "binary")).unwrap();
+    assert!(
+        store
+            .scan_artifact(
+                &EvidenceRequest {
+                    artifact: binary,
+                    ..request.clone()
+                },
+                "needle",
+                true,
+                10,
+                || Ok(())
+            )
+            .is_err()
+    );
+    // Corrupt bytes still contain a match. No match may escape the final hash
+    // check, even when the caller already knows an authorized artifact id.
+    fs::write(
+        store.blob_path(&digest(&input.bytes)).unwrap(),
+        b"tampered needle\n",
+    )
+    .unwrap();
+    assert!(
+        store
+            .scan_artifact(&request, "needle", true, 10, || Ok(()))
+            .is_err()
+    );
+    assert!(store.artifact_record("parent", "origin", &id).is_ok());
+}
+#[test]
+fn native_artifact_scan_cancels_between_reads_and_rechecks_access_before_publication() {
+    use ag1_core::{DomainError, SessionId, evidence::EvidenceRequest};
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("store")).unwrap();
+    seed(&store);
+    let mut input = artifact(1, "utf8");
+    input.bytes = format!("{} needle\n", "x".repeat(2100000)).into_bytes();
+    let mut record: Value = serde_json::from_slice(&input.record).unwrap();
+    record["bytes"] = json!(input.bytes.len());
+    record["sha256"] = json!(digest(&input.bytes));
+    input.record = serde_json::to_vec(&record).unwrap();
+    let id = store.put_artifact(&input).unwrap();
+    let request = EvidenceRequest {
+        requester: SessionId::new("parent").unwrap(),
+        origin: "origin".into(),
+        artifact: id,
+    };
+    let mut checks = 0;
+    let cancelled = store.scan_artifact(&request, "needle", true, 1, || {
+        checks += 1;
+        if checks == 3 {
+            Err(DomainError::Cancelled)
+        } else {
+            Ok(())
+        }
+    });
+    assert!(matches!(cancelled, Err(DomainError::Cancelled)));
+    assert_eq!(checks, 3);
+    let full = store
+        .scan_artifact(&request, "needle", true, 1, || Ok(()))
+        .unwrap();
+    assert_eq!(full.total_matches, 1);
+    assert_eq!(full.hits[0].text.len(), 4000);
+    assert_eq!(full.bytes, input.bytes.len() as u64);
+    let mut checks = 0;
+    let revoked = store.scan_artifact(&request, "needle", true, 1, || {
+        checks += 1;
+        if checks == 2 {
+            store.archive_session("parent").unwrap();
+        }
+        Ok(())
+    });
+    assert!(revoked.is_err());
+}
+
+#[test]
+fn native_catalog_search_matches_sdk_deduplication_salience_counts_and_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
+    seed(&store);
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../fixtures/runtime/artifact-search-oracle.json"
+    ))
+    .unwrap();
+    for input in fixture["inputs"].as_array().unwrap() {
+        store
+            .put_artifact(&ArtifactInput {
+                origin: "origin".into(),
+                session: "parent".into(),
+                record: serde_json::to_vec(&input["record"]).unwrap(),
+                bytes: input["text"].as_str().unwrap().as_bytes().to_vec(),
+            })
+            .unwrap();
+    }
+    let rows = fixture["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    for row in rows {
+        let snapshot = store
+            .capture_artifact_search("parent", row["kind"].as_str())
+            .unwrap();
+        let result = snapshot
+            .search(
+                row["query"].as_str().unwrap(),
+                row["ignoreCase"].as_bool().unwrap_or(true),
+                row["maxArtifacts"].as_u64().unwrap_or(12) as usize,
+                row["maxMatchesPerArtifact"].as_u64().unwrap_or(3) as usize,
+                || Ok(()),
+            )
+            .unwrap();
+        let matches=result.matches.iter().map(|matched|json!({"id":matched.record.position.id,"occurrenceCount":matched.occurrence_count,"totalMatches":matched.total_matches,"hits":matched.hits.iter().map(|hit|json!({"line":hit.line,"text":hit.text,"byteOffset":hit.byte_offset})).collect::<Vec<_>>()})).collect::<Vec<_>>();
+        assert_eq!(json!(matches), row["matches"], "{}", row["id"]);
+        assert_eq!(json!(result.scanned_artifacts), row["scannedArtifacts"]);
+        assert_eq!(json!(result.truncated), row["truncated"]);
+        // The current native scanner reports actual full scans. An optional
+        // lexical skip index is not being fabricated in these metrics.
+        assert_eq!(result.candidate_artifacts, result.scanned_artifacts);
+        assert!(result.scanned_blobs < result.scanned_artifacts);
+    }
+}
+#[test]
+fn native_catalog_search_snapshot_excludes_later_inserts_and_releases_its_scratch_table() {
+    use ag1_core::DomainError;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
+    seed(&store);
+    store.put_artifact(&artifact(1, "utf8")).unwrap();
+    let snapshots = (0..8)
+        .map(|_| store.capture_artifact_search("parent", None).unwrap())
+        .collect::<Vec<_>>();
+    assert!(store.capture_artifact_search("parent", None).is_err());
+    store.put_artifact(&artifact(2, "utf8")).unwrap();
+    let result = snapshots[0]
+        .search("needle", true, 12, 3, || Ok(()))
+        .unwrap();
+    assert_eq!(result.scanned_artifacts, 1);
+    assert_eq!(result.matches.len(), 1);
+    assert_eq!(
+        result.matches[0].record.position.id,
+        format!("art_{:032x}", 1)
+    );
+    assert_eq!(result.matches[0].occurrence_count, 1);
+    assert!(matches!(
+        snapshots[0].search("needle", true, 12, 3, || Err(DomainError::Cancelled)),
+        Err(DomainError::Cancelled)
+    ));
+    drop(snapshots);
+    for _ in 0..12 {
+        let snapshot = store.capture_artifact_search("parent", None).unwrap();
+        let result = snapshot.search("needle", true, 12, 3, || Ok(())).unwrap();
+        assert_eq!(result.scanned_artifacts, 2);
+        assert_eq!(result.scanned_blobs, 1);
+        assert_eq!(
+            result.matches[0].record.position.id,
+            format!("art_{:032x}", 2)
+        );
+        assert_eq!(result.matches[0].occurrence_count, 2);
+    }
+    let snapshot = store.capture_artifact_search("parent", None).unwrap();
+    store.archive_session("parent").unwrap();
+    assert!(snapshot.search("needle", true, 12, 3, || Ok(())).is_err());
+}
+
+#[test]
+fn native_catalog_search_ranks_across_all_pages_without_exposing_foreign_artifacts() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
+    seed(&store);
+    store
+        .create_session("stranger", &header("stranger"))
+        .unwrap();
+    store
+        .register_origin("foreign", "stranger", &[9; 32])
+        .unwrap();
+    let mut expected_bytes = 0;
+    for id in 1..=65 {
+        let mut input = artifact(id, "utf8");
+        // The best match has the oldest catalog position and is reached only
+        // after four complete candidate pages. Each blob has distinct content.
+        input.bytes = format!(
+            "record {id}\n{}",
+            "needle\n".repeat(if id == 1 { 7 } else { 1 })
+        )
+        .into_bytes();
+        let mut record: Value = serde_json::from_slice(&input.record).unwrap();
+        record["sha256"] = json!(digest(&input.bytes));
+        record["bytes"] = json!(input.bytes.len());
+        if id == 65 {
+            input.origin = "foreign".into();
+            input.session = "stranger".into();
+            record["sessionId"] = json!("stranger");
+            record["salientLines"] = json!(["needle"]);
+        } else {
+            expected_bytes += input.bytes.len() as u64;
+        }
+        input.record = serde_json::to_vec(&record).unwrap();
+        store.put_artifact(&input).unwrap();
+    }
+    let snapshot = store.capture_artifact_search("parent", None).unwrap();
+    let result = snapshot.search("needle", true, 2, 3, || Ok(())).unwrap();
+    assert_eq!(result.scanned_artifacts, 64);
+    assert_eq!(result.scanned_blobs, 64);
+    assert_eq!(result.bytes_scanned, expected_bytes);
+    assert!(result.truncated);
+    assert_eq!(result.matches.len(), 2);
+    assert_eq!(
+        result.matches[0].record.position.id,
+        format!("art_{:032x}", 1)
+    );
+    assert_eq!(result.matches[0].total_matches, 7);
+    assert_eq!(result.matches[0].hits.len(), 3);
+    assert_eq!(
+        result.matches[1].record.position.id,
+        format!("art_{:032x}", 64)
+    );
+}
+
+#[test]
+fn evidence_catalog_filters_only_native_custody_and_keeps_direct_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("store")).unwrap());
+    seed(&store);
+    let kinds = [
+        "tool-arguments",
+        "tool-rejected-arguments",
+        "tool-original-result",
+        "tool-post-hook-result",
+        "tool-native-result",
+        "tool-request-result",
+        "runtime-provider-output",
+        "runtime-request-input",
+        "context-original-journal",
+        "context-original-request",
+        "text",
+        "compaction-trajectory",
+        "future-evidence-kind",
+    ];
+    for (index, kind) in kinds.iter().enumerate() {
+        let mut input = artifact(index + 1, "utf8");
+        let mut record: Value = serde_json::from_slice(&input.record).unwrap();
+        record["kind"] = json!(kind);
+        input.record = serde_json::to_vec(&record).unwrap();
+        let id = store.put_artifact(&input).unwrap();
+        assert_eq!(store.artifact_origin("parent", &id).unwrap(), "origin");
+        assert!(store.page("parent", "origin", &id, 0, 32768).is_ok());
+    }
+    assert_eq!(
+        store
+            .artifact_catalog("parent", None, 100, None)
+            .unwrap()
+            .len(),
+        kinds.len()
+    );
+    let visible = store.evidence_catalog("parent", 100).unwrap();
+    assert_eq!(visible.len(), 3);
+    assert_eq!(visible[0].record["kind"], "future-evidence-kind");
+    let result = store
+        .capture_evidence_search("parent", None)
+        .unwrap()
+        .search("needle", true, 12, 3, || Ok(()))
+        .unwrap();
+    assert_eq!(result.scanned_artifacts, 3);
+    assert_eq!(result.matches[0].occurrence_count, 3);
+    // Raw custody remains searchable explicitly by the host storage API.
+    let all = store
+        .capture_artifact_search("parent", None)
+        .unwrap()
+        .search("needle", true, 12, 3, || Ok(()))
+        .unwrap();
+    assert_eq!(all.scanned_artifacts, kinds.len() as u64);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn writer_release_is_explicit_even_if_a_spawn_inherits_the_open_description() {
+    use std::os::fd::BorrowedFd;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store");
+    let store = Store::open(&path).unwrap();
+    let lock = path.join("writer.lock");
+    let descriptor = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == lock))
+        .unwrap();
+    let raw: i32 = descriptor.file_name().to_str().unwrap().parse().unwrap();
+    // The store remains alive, so this FD cannot be closed/reused while borrowed.
+    // dup retains the same open description, as an unrelated fork does until exec.
+    let inherited = rustix::io::dup(unsafe { BorrowedFd::borrow_raw(raw) }).unwrap();
+    assert!(Store::open(&path).is_err());
+    drop(store);
+    let reopened =
+        Store::open(&path).expect("owner teardown must release its lock before unrelated exec");
+    assert!(Store::open(&path).is_err());
+    drop(inherited);
+    assert!(
+        Store::open(&path).is_err(),
+        "closing an old description must not unlock the new owner"
+    );
+    drop(reopened);
+    assert!(Store::open(&path).is_ok());
+}

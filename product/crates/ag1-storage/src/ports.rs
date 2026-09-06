@@ -28,7 +28,11 @@ impl Store {
         valid_id(id)?;
         if matches!(
             kind,
-            "historical" | "extra" | "metadata-history" | "memory-history"
+            "historical"
+                | "extra"
+                | "metadata-history"
+                | "memory-history"
+                | "native-runtime-selection"
         ) {
             return Err(StorageError::Denied);
         }
@@ -185,6 +189,20 @@ impl ag1_core::task::JournalWritePort for Store {
         records: &[Vec<u8>],
     ) -> Result<(u64, u64), DomainError> {
         self.append_batch(session.as_str(), command, expected, records)
+            .map(|ack| (ack.revision, ack.sequence))
+            .map_err(domain_error)
+    }
+}
+
+impl ag1_core::task::JournalBranchPort for Store {
+    fn select_leaf(
+        &self,
+        session: &SessionId,
+        command: &str,
+        expected: u64,
+        leaf: Option<&str>,
+    ) -> Result<(u64, u64), DomainError> {
+        Store::select_leaf(self, session.as_str(), command, expected, leaf)
             .map(|ack| (ack.revision, ack.sequence))
             .map_err(domain_error)
     }

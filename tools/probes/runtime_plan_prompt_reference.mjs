@@ -1,0 +1,21 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
+import {fileURLToPath,pathToFileURL} from 'node:url';
+await import('../offline_guard.mjs');
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),'../..');
+const files=['packages/coding-agent/src/modes/interactive/interactive-plan-artifacts.ts','packages/coding-agent/src/modes/interactive/interactive-planning-guidance.ts'];
+const ref=await import(pathToFileURL(path.join(root,'reference/ag1-executable/packages/coding-agent/dist/modes/interactive/interactive-plan-artifacts.js')));
+const guidance=await import(pathToFileURL(path.join(root,'reference/ag1-executable/packages/coding-agent/dist/modes/interactive/interactive-planning-guidance.js')));
+const states=JSON.parse(fs.readFileSync(path.join(root,'fixtures/runtime/plan-state-oracle.json'),'utf8'));
+const workflow=JSON.parse(fs.readFileSync(path.join(root,'fixtures/runtime/plan-workflow-oracle.json'),'utf8'));
+const plans=[states.draft,states.clarifying,states.answered,states.executing,workflow.marked,workflow.completed,workflow.reopened];
+const rows=plans.map(plan=>({plan,formatted:ref.formatInteractivePlanArtifact(plan),revision:ref.buildPlanRevisionPrompt(plan,'  Keep it local  '),clarification:ref.buildPlanClarificationPrompt(plan,' Native '),execution:ref.buildPlanExecutionPrompt(plan),step:plan.steps.length?ref.buildPlanStepExecutionPrompt(plan,0):null}));
+const text=guidance.buildPlanningGuidanceMessage({level:'none',reasons:[],forceBehavioralPrompt:false,forceNudges:false});
+assert.equal(text,fs.readFileSync(path.join(root,'product/crates/ag1-core/resources/runtime-planning-guidance.txt'),'utf8').trim());
+const result={version:1,source_commit:'e30f0b4b238ee5618928bcd17b4571eb046e7038',source_files:files.map(file=>({path:file,sha256:createHash('sha256').update(fs.readFileSync(path.join(root,'reference/ag1-executable',file))).digest('hex')})),rows,guidance:text,model_actions:0,network_actions:0};
+const target=path.join(root,'fixtures/runtime/plan-prompt-oracle.json');
+if(process.argv.includes('--capture')){assert(!fs.existsSync(target));fs.writeFileSync(target,JSON.stringify(result,null,2)+'\n');}
+else assert.deepEqual(result,JSON.parse(fs.readFileSync(target,'utf8')));
+console.log(JSON.stringify({status:'passed',plans:rows.length,guidance:true,model_actions:0,network_actions:0}));

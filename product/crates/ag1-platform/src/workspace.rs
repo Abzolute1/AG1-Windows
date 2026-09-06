@@ -212,6 +212,19 @@ impl Workspace {
             Err(e) => Err(errno(e)),
         }
     }
+    /// Inspect file kind without opening content or following symlink targets.
+    pub(crate) fn regular_file(&self, name: &str) -> Result<bool, DomainError> {
+        self.verify_root()?;
+        let file = beneath(
+            &self.directory,
+            relative(name)?,
+            OFlags::PATH,
+            Mode::empty(),
+        )?;
+        let regular = file.metadata().map_err(io_error)?.is_file();
+        self.verify_root()?;
+        Ok(regular)
+    }
     /// One bounded descriptor-relative directory observation. Symlink targets are not followed.
     pub fn directory_entries(
         &self,

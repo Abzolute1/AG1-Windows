@@ -269,6 +269,23 @@ impl Scheduler {
                 .count(),
         })
     }
+    /// Settlement of this exact host-owned generation, independent of other
+    /// sessions at the same endpoint. Quarantine remains unsettled.
+    pub fn ticket_settled(&self, ticket: &Ticket) -> Result<bool, DomainError> {
+        self.check_owner(ticket)?;
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| DomainError::Unavailable("scheduler poisoned".into()))?;
+        let pool = inner
+            .pools
+            .get(&ticket.endpoint)
+            .ok_or(DomainError::NotFound)?;
+        Ok(!pool
+            .entries
+            .iter()
+            .any(|entry| entry.generation == ticket.generation))
+    }
 }
 /// A host-held capability, deliberately not Clone/Serialize. Drop quarantines instead of
 /// releasing a possibly still-running generation. Terminal acknowledgement consumes it.

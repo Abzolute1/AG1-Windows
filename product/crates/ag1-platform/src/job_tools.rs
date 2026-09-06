@@ -61,6 +61,17 @@ impl<S: StoragePort> JobService<S> {
     pub fn target_revision(&self) -> &str {
         self.shell.target_revision()
     }
+    /// Reuse host shell configuration with fresh session/process ownership.
+    /// No live handle, notice acknowledgement or historical PID is inherited.
+    pub(crate) fn isolated(&self, scope: Scope, incarnation: &str) -> Result<Self, DomainError> {
+        Self::new(
+            self.store.clone(),
+            self.shell.clone(),
+            self.clock.clone(),
+            scope,
+            incarnation,
+        )
+    }
     fn load(&self) -> Result<(Option<String>, Book), DomainError> {
         if let Some(document) = self.store.load_metadata("background-jobs", &self.key)? {
             if document.bytes.len() > 2 * 1024 * 1024 {
@@ -98,10 +109,10 @@ impl<S: StoragePort> JobService<S> {
             .commit_metadata("background-jobs", &self.key, expected, &bytes)
     }
     fn validate_scope(&self, scope: &Scope) -> Result<(), DomainError> {
-        if scope.workspace != self.scope.workspace
-            || scope.session != self.scope.session
-            || scope.epoch != self.scope.epoch
-        {
+        // Context compaction changes the request epoch, not process ownership.
+        // execute() still consumes approval against the host's entire current
+        // Scope (including epoch/revision); live handles require this incarnation.
+        if scope.workspace != self.scope.workspace || scope.session != self.scope.session {
             Err(DomainError::PermissionDenied)
         } else {
             Ok(())
@@ -130,6 +141,80 @@ impl<S: StoragePort> JobService<S> {
         let mut live = self.live.lock().unwrap();
         self.refresh_locked(&mut live, artifacts)
     }
+    /// Stop only this incarnation's owned children. Preserve their full output
+    /// and terminal records before releasing live handles; never acknowledge a
+    /// parent notice here. A failed write leaves the handles available to retry.
+    pub fn quiesce(
+        &self,
+        scope: &Scope,
+        artifacts: &mut impl ExecutionArtifacts,
+    ) -> Result<(), DomainError> {
+        if scope.workspace != self.scope.workspace || scope.session != self.scope.session {
+            return Err(DomainError::PermissionDenied);
+        }
+        let mut live = self.live.lock().map_err(|_| DomainError::Conflict)?;
+        let (revision, mut book) = self.load()?;
+        for id in live.keys() {
+            if !book
+                .jobs
+                .iter()
+                .any(|job| job.id == *id && job.owner == self.incarnation)
+            {
+                return Err(DomainError::Conflict);
+            }
+        }
+        if book.jobs.iter().any(|job| {
+            matches!(job.status, Status::Intent | Status::Running) && !live.contains_key(&job.id)
+        }) {
+            return Err(DomainError::Unavailable(
+                "background job requires ownership recovery".into(),
+            ));
+        }
+        if live.is_empty() {
+            return Ok(());
+        }
+        for job in &mut book.jobs {
+            let Some(process) = live.get_mut(&job.id) else {
+                continue;
+            };
+            // A previous ambiguous metadata acknowledgement can already contain
+            // the durable result. Verify custody before releasing that handle.
+            if job.status == Status::Exited {
+                let result = job.result.as_ref().ok_or(DomainError::DurabilityUnknown)?;
+                let raw: ag1_core::context::ContextArtifact = serde_json::from_value(
+                    artifacts.read_json(result)?["details"]["rawOutputArtifact"].clone(),
+                )
+                .map_err(|_| DomainError::DurabilityUnknown)?;
+                artifacts.get(&raw.id)?;
+                continue;
+            }
+            let exit = match process.poll(&AtomicBool::new(false))? {
+                Some(exit) => exit,
+                None => process
+                    .poll(&AtomicBool::new(true))?
+                    .ok_or(DomainError::DurabilityUnknown)?,
+            };
+            let outcome = process.capture(exit, &job.call_id, "job", artifacts)?;
+            let result = artifacts.put_evidence(
+                &outcome.result.to_string(),
+                "job-result",
+                &json!({"type":"tool","name":"job","callId":job.call_id}),
+                &[],
+                None,
+            )?;
+            job.result = Some(result);
+            job.status = Status::Exited;
+            job.exit_code = match exit {
+                Exit::Code(code) => Some(code),
+                _ => None,
+            };
+            job.finished_at = Some(self.clock.now_ms());
+            job.pid = None;
+        }
+        self.save(revision.as_deref(), &book)?;
+        live.clear();
+        Ok(())
+    }
     fn refresh_locked(
         &self,
         live: &mut BTreeMap<String, RunningShell>,
@@ -146,7 +231,7 @@ impl<S: StoragePort> JobService<S> {
             let Some(process) = live.get_mut(&job.id) else {
                 continue;
             };
-            if job.owner != self.incarnation || job.epoch != self.scope.epoch {
+            if job.owner != self.incarnation {
                 return Err(DomainError::Conflict);
             }
             if let Some(exit) = process.poll(&AtomicBool::new(false))? {
@@ -195,6 +280,28 @@ impl<S: StoragePort> JobService<S> {
                 ),
             })
             .collect())
+    }
+    /// A request's context epoch can advance while this same service still owns
+    /// its children. Notice custody is scoped to workspace/session and service
+    /// incarnation, independently from the request's context revision.
+    pub fn refresh_notices(
+        &self,
+        scope: &Scope,
+        artifacts: &mut impl ExecutionArtifacts,
+    ) -> Result<Vec<Notice>, DomainError> {
+        self.validate_notice_scope(scope)?;
+        self.refresh(artifacts)?;
+        self.notices()
+    }
+    fn validate_notice_scope(&self, scope: &Scope) -> Result<(), DomainError> {
+        if scope.workspace != self.scope.workspace || scope.session != self.scope.session {
+            return Err(DomainError::PermissionDenied);
+        }
+        Ok(())
+    }
+    pub fn acknowledge_scoped_notice(&self, scope: &Scope, id: &str) -> Result<(), DomainError> {
+        self.validate_notice_scope(scope)?;
+        self.acknowledge_notice(id)
     }
     /// Called after P10 has durably appended this stable notice ID, never on mere delivery.
     pub fn acknowledge_notice(&self, id: &str) -> Result<(), DomainError> {
@@ -310,7 +417,7 @@ impl<S: StoragePort> JobService<S> {
                     call_id: call.call_id().into(),
                     command: plan.command.clone(),
                     owner: self.incarnation.clone(),
-                    epoch: scope.epoch,
+                    epoch: scope.epoch, // Historical creation context, not an ownership lease.
                     started_at: now,
                     status: Status::Intent,
                     pid: None,
@@ -381,10 +488,7 @@ impl<S: StoragePort> JobService<S> {
                     .find(|j| j.id == id)
                     .ok_or_else(|| DomainError::InvalidInput(format!("No job {id}.")))?;
                 if action == "kill" {
-                    if job.status != Status::Running
-                        || job.owner != self.incarnation
-                        || job.epoch != scope.epoch
-                    {
+                    if job.status != Status::Running || job.owner != self.incarnation {
                         return Err(DomainError::InvalidInput(format!(
                             "Job {id} is not running."
                         )));

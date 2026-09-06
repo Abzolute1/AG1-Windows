@@ -18,18 +18,18 @@ export class UnsupportedAPI extends Error {
 		this.code = "unsupported_api";
 	}
 }
-export function bounded(value, limit = 1024 * 1024) {
+export function bounded(value, limit = 1024 * 1024, maxNodes = 100000) {
 	const pending = [[value, 0]];
 	let count = 0;
 	while (pending.length) {
 		const [v, depth] = pending.pop();
-		if (++count > 100000 || depth > 48)
+		if (++count > maxNodes || depth > 48)
 			throw new Error("Extension value exceeds structural bounds");
 		if (typeof v === "number" && !Number.isFinite(v))
 			throw new Error("Extension protocol rejects non-finite numbers");
 		if (v && typeof v === "object") {
 			const entries = Object.values(v);
-			if (pending.length + entries.length + count > 100000)
+			if (pending.length + entries.length + count > maxNodes)
 				throw new Error("Extension value exceeds structural bounds");
 			for (const child of entries) pending.push([child, depth + 1]);
 		} else if (
@@ -47,6 +47,10 @@ export function bounded(value, limit = 1024 * 1024) {
 }
 const clone = (v) =>
 	v === undefined ? undefined : structuredClone(bounded(v));
+// Native inspection snapshots have a separate bound; callback results and
+// native action arguments retain the ordinary one-frame limit.
+const cloneSnapshot = (v) => v === undefined ? undefined :
+	structuredClone(bounded(v, 8 * 1024 * 1024, 250000));
 function name(value) {
 	if (
 		typeof value !== "string" ||
@@ -292,7 +296,7 @@ export class ExtensionRuntime {
 	}
 	async bind(snapshot, operation = "bind") {
 		if (this.bound) throw new Error("Extension runtime already bound");
-		this.snapshot = immutable(clone(snapshot));
+		this.snapshot = immutable(cloneSnapshot(snapshot));
 		this.bound = true;
 		return this.invoke(operation, async () => {
 			const registrations = this.pendingProviders;
@@ -311,7 +315,7 @@ export class ExtensionRuntime {
 		if (this.current)
 			throw new Error("Extension host operation already active");
 		name(id);
-		if (snapshot !== undefined) this.snapshot = immutable(clone(snapshot));
+		if (snapshot !== undefined) this.snapshot = immutable(cloneSnapshot(snapshot));
 		const controller = new AbortController();
 		this.current = { id, controller, signal: controller.signal };
 		try {
@@ -551,8 +555,33 @@ export class ExtensionRuntime {
 							const s = this.snapshot.session ?? {};
 							const entries = s.entries ?? [];
 							if (method === "getEntry")
-								return clone(entries.find((e) => e.id === args[0]));
+								return cloneSnapshot(entries.find((e) => e.id === args[0]));
 							if (method === "getLabel") return s.labels?.[args[0]];
+							if (method === "getBranch" && args[0]) {
+								const byId = new Map(entries.map((entry) => [entry.id, entry]));
+								const branch = [], seen = new Set();
+								let entry = byId.get(args[0]);
+								while (entry) {
+									if (seen.has(entry.id)) throw new Error("Cyclic session branch");
+									seen.add(entry.id);
+									branch.push(entry);
+									entry = byId.get(entry.parentId);
+								}
+								return cloneSnapshot(branch.reverse());
+							}
+							if (method === "getTree" && s.tree === undefined) {
+								const nodes = new Map(cloneSnapshot(entries).map((entry) => [entry.id, {
+									entry, children: [], label: s.labels?.[entry.id], labelTimestamp: s.labelTimestamps?.[entry.id],
+								}]));
+								const roots = [];
+								for (const node of nodes.values()) {
+									const parent = nodes.get(node.entry.parentId);
+									if (parent && parent !== node) parent.children.push(node);
+									else roots.push(node);
+								}
+								for (const node of nodes.values()) node.children.sort((a,b) => new Date(a.entry.timestamp) - new Date(b.entry.timestamp));
+								return roots;
+							}
 							const field = {
 								getSessionId: "id",
 								getSessionFile: "file",
@@ -564,7 +593,7 @@ export class ExtensionRuntime {
 								getSessionName: "name",
 								getCwd: "cwd",
 							}[method];
-							return clone(s[field]);
+							return cloneSnapshot(s[field]);
 						};
 					return unsupported(`ReadonlySessionManager.${String(method)}`);
 				},
@@ -898,7 +927,9 @@ export class ExtensionRuntime {
 		for (const ext of this.extensions)
 			for (const handler of ext.handlers.get(event.type) ?? []) {
 				try {
-					const result = await handler({ ...current }, this.context(ext));
+					const handlerEvent = { ...current };
+					if (["session_before_compact", "session_before_tree"].includes(event.type)) handlerEvent.signal = this.current.signal;
+					const result = await handler(handlerEvent, this.context(ext));
 					if (result === undefined) continue;
 					bounded(result);
 					if (!result && event.type !== "before_provider_request") continue;
