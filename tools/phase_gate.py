@@ -182,6 +182,9 @@ def main():
     elif args.phase=='P10':
         from runtime_gate import execute_p10
         execute_p10()
+    elif args.phase=='P11':
+        from project_gate import execute_p11
+        execute_p11()
     else:raise GateError(f'{args.phase} has no implemented gate yet; refusing a placeholder pass')
 
 

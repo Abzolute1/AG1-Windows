@@ -6969,3 +6969,120 @@ async fn silent_usage_overflow_preserves_prior_tool_effects_without_reexecution(
     assert_eq!(results.len(), 1);
     assert_ne!(results[0]["message"]["isError"], true);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_project_check_uses_native_session_approval_and_durable_result() {
+    use ag1_platform::{
+        projects::{CheckPort, ProjectPort, Runtime, Toolchains},
+        session::adapters::NativeAdapters,
+    };
+    let (origin, server) = server(vec![
+        calls(vec![("compile-project", "check", json!({}))]),
+        stop(),
+    ]);
+    let fixture = fixture(&origin, "disabled");
+    std::fs::write(
+        fixture.root.join("Cargo.toml"),
+        "[package]\nname='session-check-fixture'\nversion='0.1.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.root.join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = \"session-check-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir(fixture.root.join("src")).unwrap();
+    std::fs::write(
+        fixture.root.join("src/main.rs"),
+        "fn main() { println!(\"native check\"); }",
+    )
+    .unwrap();
+    let state = fixture._directory.path().join("project-state");
+    std::fs::create_dir(&state).unwrap();
+    let cargo = std::path::PathBuf::from(env!("CARGO"))
+        .canonicalize()
+        .unwrap();
+    let root = cargo.parent().unwrap().parent().unwrap().to_path_buf();
+    let runtime = Runtime::load(
+        fixture.workspace.clone(),
+        WorkspaceService::new().unwrap().register(&state).unwrap(),
+        env!("CARGO_BIN_EXE_ag1-process-host").as_ref(),
+        Toolchains {
+            node: None,
+            npm: None,
+            cargo: Some(cargo),
+            rustc: Some(root.join("bin/rustc")),
+            godot: None,
+            mounts: vec![root],
+        },
+    )
+    .unwrap();
+    let project = Arc::new(Mutex::new(ProjectPort::Check(Box::new(CheckPort {
+        runtime,
+        kind: ag1_core::projects::Kind::Rust,
+    }))));
+    let adapters = NativeAdapters {
+        project: Some(project.clone()),
+        ..Default::default()
+    };
+    let mut registry = Registry::builtins().unwrap();
+    registry
+        .activate(
+            &["check".into()],
+            &adapters.available_names().into_iter().collect(),
+        )
+        .unwrap();
+    let tools = registry
+        .public_tools()
+        .into_iter()
+        .filter(|t| t["name"] == "check")
+        .collect();
+    fixture
+        .host
+        .select_tools("project-target", "project-target", NOW, tools, &ignore)
+        .await
+        .unwrap();
+    let runner = Arc::new(FileRunner {
+        files: fixture.files.files.clone(),
+        adapters,
+        registry: Arc::new(registry),
+        policy: fixture.files.policy.clone(),
+        policy_revision: 1,
+        approvals: Arc::new(RejectApproval),
+        store: fixture.store.clone(),
+        origin: "session".into(),
+        timestamp: NOW.into(),
+        clock: Arc::new(FixedClock),
+        tool_timeout: Duration::from_secs(60),
+    });
+    let result = fixture
+        .host
+        .run(input(), &Resolver::new(false), runner, &ignore)
+        .await
+        .unwrap();
+    assert_eq!(result.generations, 2);
+    let requests = server.join().unwrap();
+    let tool = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(
+        tool["content"].as_str().unwrap().contains("exited"),
+        "{tool}"
+    );
+    let port = project.lock().unwrap();
+    let ProjectPort::Check(port) = &*port else {
+        panic!()
+    };
+    let history = port.runtime.history().unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].exits, vec![Some(0)]);
+    let branch = fixture.store.branch("session", None).unwrap();
+    assert!(
+        branch
+            .iter()
+            .any(|e| String::from_utf8_lossy(&e.raw).contains("compile-project"))
+    );
+}

@@ -1,5 +1,6 @@
 //! Concrete P09 adapters available to the native tool loop. These are host
 //! capabilities; public model tool names alone cannot construct any service.
+use crate::target_tools::Port;
 use crate::{
     artifact_tools::{ArtifactTools, PreparedArtifact},
     episode_tools::{EpisodeTools, PreparedEpisode},
@@ -33,6 +34,7 @@ use std::{
 
 #[derive(Clone, Default)]
 pub struct NativeAdapters {
+    pub project: Option<Arc<std::sync::Mutex<crate::projects::ProjectPort>>>,
     /// Host-selected planning capability. Ordinary sessions do not expose it.
     pub planning: bool,
     pub delegation: Option<Arc<super::subagent_tool::DelegationService>>,
@@ -118,6 +120,26 @@ impl NativeAdapters {
             }
         }
         let mut names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+        if let Some(project) = &self.project {
+            match &*project.lock().unwrap() {
+                crate::projects::ProjectPort::Check(p)
+                    if p.runtime.command(p.kind, "check").is_ok() =>
+                {
+                    names.push("check".into())
+                }
+                crate::projects::ProjectPort::Visual(p)
+                    if p.vision.caller
+                        && p.browser.available().available
+                        && p.runtime.verify_preview(&p.grant).is_ok() =>
+                {
+                    names.extend(
+                        ["screenshot_url", "interact_then_screenshot", "verify_ui"]
+                            .map(str::to_string),
+                    )
+                }
+                _ => {}
+            }
+        }
         if let Some(extensions) = &self.extensions {
             names.extend(extensions.tool_names());
         }
@@ -138,6 +160,34 @@ impl NativeAdapters {
             return Ok(PreparedAdapter::Extension(service));
         }
         Ok(match call.name() {
+            "check" | "screenshot_url" | "interact_then_screenshot" | "verify_ui" => {
+                let service = self.project.clone().ok_or_else(missing)?;
+                let request = ag1_core::tools::targets::Request::from_call(call)?;
+                let mut port = service.lock().map_err(|_| DomainError::Conflict)?;
+                let control = crate::resource_fs::ScanControl {
+                    cancel: context.cancel,
+                    deadline: context.deadline,
+                };
+                let plan = port.prepare(&request, &control)?;
+                let binding = port.binding(&plan);
+                binding.admits(&request)?;
+                if binding.workspace != context.scope.workspace {
+                    return Err(DomainError::PermissionDenied);
+                }
+                port.revalidate(&plan, &control)?;
+                use sha2::{Digest, Sha256};
+                let revision = format!(
+                    "project-{:x}",
+                    Sha256::digest(serde_json::json!([binding, port.display(&plan)]).to_string())
+                );
+                drop(port);
+                PreparedAdapter::Project {
+                    service,
+                    plan,
+                    request,
+                    revision,
+                }
+            }
             "submit_plan" if self.planning => PreparedAdapter::SubmitPlan,
             "task" => {
                 let service = self.delegation.clone().ok_or_else(missing)?;
@@ -267,6 +317,12 @@ impl<'a> AdapterContext<'a> {
 }
 pub(super) enum PreparedAdapter {
     Extension(Arc<super::extensions::NativeExtensions>),
+    Project {
+        service: Arc<std::sync::Mutex<crate::projects::ProjectPort>>,
+        plan: crate::projects::ProjectPlan,
+        request: ag1_core::tools::targets::Request,
+        revision: String,
+    },
     SubmitPlan,
     Delegation {
         service: Arc<super::subagent_tool::DelegationService>,
@@ -325,6 +381,7 @@ pub(super) enum PreparedAdapter {
 impl PreparedAdapter {
     pub fn target_revision(&self) -> String {
         match self {
+            Self::Project { revision, .. } => revision.clone(),
             Self::Extension(service) => service.target_revision(),
             Self::SubmitPlan => "submit-plan-v1".into(),
             Self::Delegation { plan, .. } => plan.target_revision().into(),
@@ -367,6 +424,7 @@ impl PreparedAdapter {
     }
     pub fn may_mutate(&self) -> bool {
         match self {
+            Self::Project { .. } => true,
             Self::Extension(_) => true,
             Self::Delegation { .. } => true,
             Self::Memory { plan, .. } => plan.may_mutate(),
@@ -398,6 +456,30 @@ impl PreparedAdapter {
             artifact_page: false,
         };
         match self {
+            Self::Project {
+                service,
+                plan,
+                request,
+                revision,
+            } => {
+                authorization.consume(
+                    context.registry,
+                    ag1_core::tools::approval::ExecutionFence {
+                        scope: context.scope,
+                        policy_revision: context.policy_revision,
+                        target_revision: &revision,
+                        now: context.clock.now_ms(),
+                    },
+                )?;
+                let control = crate::resource_fs::ScanControl {
+                    cancel: context.cancel,
+                    deadline: context.deadline,
+                };
+                let mut port = service.lock().map_err(|_| DomainError::Conflict)?;
+                port.revalidate(&plan, &control)?;
+                port.binding(&plan).admits(&request)?;
+                port.execute(plan, &request, &control, artifacts)
+            }
             Self::Extension(service) => {
                 let call = authorization.consume(
                     context.registry,

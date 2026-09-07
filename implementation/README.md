@@ -2,6 +2,8 @@
 
 P10 delivers the native session/runtime facade in isolated workspaces. Its authoritative status, exact commands, hashes, trace coverage and later gates are in [completion evidence](evidence/P10/completion.json), with the [report](evidence/P10/REPORT.md) and [session guide](../product/crates/ag1-platform/SESSION.md). The normal desktop remains TypeScript authority and all tuned llama.cpp runtimes/settings remain preserved. Earlier P10 checkpoints are archived in [history](evidence/P10/HISTORY.md).
 
+P11 delivers concrete web/native/Rust/Tauri/Godot project targets, owned lifecycle/logs, constrained previews, native tool integration and guarded Git recovery. Its [completion evidence](evidence/P11/completion.json), [report](evidence/P11/REPORT.md) and [project API guide](../product/crates/ag1-platform/PROJECTS.md) record acceptance and limitations. The next thread starts with [P12-HANDOFF.md](P12-HANDOFF.md). The original [P11 entry handoff](P11-HANDOFF.md) remains a historical checkpoint.
+
 Implementation began with P01 on 2026-09-05 (Europe/Oslo). Follow `ROADMAP.md` and `phases/README.md`; the machine authority for completion is each phase's `completion.json`, including its tests, artifact hashes and pending gates.
 
 P01 implements the isolated reference/bootstrap, runtime fingerprinting, executable scenario catalog, launch/request/session captures, frontend provenance inputs and fail-closed validation tools. Python and JavaScript here are development/reference harnesses. The final product core remains Rust with Tauri and React.

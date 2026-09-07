@@ -422,3 +422,5 @@ impl Desktop {
             .map_err(err)
     }
 }
+
+pub mod project_preview;

@@ -116,6 +116,13 @@ impl GitService {
         expected_head: Option<&str>,
     ) -> Result<GitView, DomainError> {
         let _claim = workspace.claim()?;
+        self.status_diff_unlocked(workspace, expected_head)
+    }
+    fn status_diff_unlocked(
+        &self,
+        workspace: &Workspace,
+        expected_head: Option<&str>,
+    ) -> Result<GitView, DomainError> {
         let head = self.head_unlocked(workspace)?;
         if expected_head.is_some_and(|expected| expected != head) {
             return Err(DomainError::Conflict);
@@ -360,5 +367,96 @@ impl GitService {
                 false,
             ))
         }
+    }
+}
+
+/// A reviewed file-version preview. This cannot reset HEAD, session state or a
+/// database. Source bytes and expected Git/file identities are bound together.
+pub struct VersionPreview {
+    pub path: String,
+    pub head: String,
+    pub source: String,
+    pub before: Vec<u8>,
+    pub candidate: Vec<u8>,
+    expected: FileRevision,
+}
+impl GitService {
+    pub fn history(
+        &self,
+        workspace: &Workspace,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, DomainError> {
+        if limit == 0 || limit > 100 {
+            return Err(DomainError::LimitExceeded("Git history".into()));
+        }
+        let _claim = workspace.claim()?;
+        let bytes = self.run(
+            workspace,
+            &[
+                "log".into(),
+                format!("-{limit}"),
+                "--format=%H%x00%s".into(),
+            ],
+        )?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| DomainError::InvalidInput("Git history UTF-8".into()))?;
+        text.lines()
+            .map(|l| {
+                let (id, title) = l
+                    .split_once('\0')
+                    .ok_or_else(|| DomainError::InvalidInput("Git history record".into()))?;
+                validate_oid(id)?;
+                Ok((id.into(), title.chars().take(512).collect()))
+            })
+            .collect()
+    }
+    pub fn preview_version(
+        &self,
+        workspace: &Workspace,
+        path: &str,
+        head: &str,
+        source: &str,
+    ) -> Result<VersionPreview, DomainError> {
+        let before = workspace.snapshot(path, MAX_READ)?;
+        let candidate = self.restore_candidate(workspace, path, head, &before.revision, source)?;
+        Ok(VersionPreview {
+            path: path.into(),
+            head: head.into(),
+            source: source.into(),
+            before: before.bytes,
+            candidate,
+            expected: before.revision,
+        })
+    }
+    /// Explicit host-approved publication, with a durable caller-owned recovery
+    /// record required before entry. All AG1 writers share Workspace's claim.
+    pub fn apply_version(
+        &self,
+        workspace: &Workspace,
+        preview: &VersionPreview,
+    ) -> Result<FileRevision, DomainError> {
+        let check = |temporary: Option<&str>| {
+            let view = self.status_diff_unlocked(workspace, Some(&preview.head))?;
+            // The atomic writer's own temporary file is not user dirt.
+            let dirty = view
+                .status
+                .split(|b| *b == 0)
+                .filter(|l| !l.is_empty())
+                .any(|l| temporary.is_none_or(|path| l != format!("?? {path}").as_bytes()));
+            if view.conflicted || dirty {
+                return Err(DomainError::Conflict);
+            }
+            Ok(())
+        };
+        let result = workspace.replace_guarded(
+            &preview.path,
+            &preview.expected,
+            &preview.candidate,
+            check,
+        )?;
+        if self.head_unlocked(workspace)? != preview.head {
+            return Err(DomainError::DurabilityUnknown);
+        }
+        Ok(result)
     }
 }

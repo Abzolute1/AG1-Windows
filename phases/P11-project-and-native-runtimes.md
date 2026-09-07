@@ -8,6 +8,8 @@ Deliver project create/load/files/install/build/run/preview/log/stop/history wor
 
 Require P10 runtime and P04 early preview/platform evidence. P03 process/PTY and P09 policy remain the only OS/tool ownership primitives. Implement platform target adapters, core target/diagnostic DTOs and desktop preview boundary in fixture projects. No Pro implementation, user repo rollback, model backend changes or embedded Chromium requirement.
 
+For a new thread, first read the [P11 handoff](../implementation/P11-HANDOFF.md): it records the verified P10 checkpoint, dependency check, concrete integration APIs, unfinished target/gate work and L01–L08 preservation requirements. Reverify its observations against the current checkout.
+
 ## Work and authority
 
 Implement stable project/target IDs with kind, workspace, toolchain, capabilities and lifecycle. Provide web dev-server, generic native command, Rust/Tauri and existing Godot host adapters. Creation/import initializes only the requested new destination and cleans up failed creation; loading preserves project/session identity. Dependency install/build/run are auditable operations with stdout/stderr, readiness, cancellation and resource-group shutdown.
@@ -38,3 +40,5 @@ Measure run-ready/log-display/stop timings separately from dependency download a
 ## Rollback and handoff
 
 Stop only owned fixture groups, retain user-generated state and record failed teardown. TS desktop stays available; no live authority transfer. P12 receives real runtime targets/capabilities to render, including truthful native preview limitations.
+
+Write `implementation/P12-HANDOFF.md` before finishing so the next thread has entry checks, completion evidence, delivered APIs, residual gaps and all L01–L08 constraints without relying on this conversation.

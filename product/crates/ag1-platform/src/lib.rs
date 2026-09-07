@@ -113,3 +113,6 @@ pub mod todo_tools;
 pub mod observation_tools;
 
 pub mod episode_tools;
+
+#[cfg(target_os = "linux")]
+pub mod projects;

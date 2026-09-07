@@ -347,6 +347,26 @@ impl ProcessSupervisor {
     ) -> Result<OwnedProcess, DomainError> {
         self.spawn_tool_bound(spec, spool_path, disk_bytes, address_space, true, false)
     }
+    /// Project protocol stdout is drained separately from stderr; the pinned
+    /// workspace descriptor and owned helper lifetime remain identical to tools.
+    pub fn spawn_project_with_cwd(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+    ) -> Result<OwnedProcess, DomainError> {
+        self.spawn_configured(
+            spec,
+            spool_path,
+            None,
+            SpawnLimits {
+                capture_stdout: false,
+                address_space: None,
+                disk_bytes: 8 * 1024 * 1024,
+                inherit_cwd: true,
+                readonly_filter: false,
+            },
+        )
+    }
     pub(crate) fn spawn_readonly_tool(
         &self,
         spec: ProcessSpec,

@@ -81,8 +81,10 @@ pub(crate) fn validate_metadata(raw: &[u8]) -> StorageResult<Value> {
     }
     if v["encoding"] == "binary" {
         let m = &v["binaryMetadata"];
-        if v["kind"] != "godot-visual"
-            || !matches!(v["mimeType"].as_str(), Some("image/png" | "image/jpeg"))
+        if !matches!(
+            v["kind"].as_str(),
+            Some("godot-visual" | "web-visual" | "native-visual")
+        ) || !matches!(v["mimeType"].as_str(), Some("image/png" | "image/jpeg"))
             || v["bytes"]
                 .as_u64()
                 .is_none_or(|n| n == 0 || n > 8 * 1024 * 1024)

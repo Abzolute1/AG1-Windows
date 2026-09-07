@@ -364,8 +364,26 @@ impl Workspace {
         mut consume: impl FnMut(&[u8]) -> Result<(), DomainError>,
         after_read: impl FnOnce(),
     ) -> Result<FileRevision, DomainError> {
+        self.stream_bounded(name, limit, MAX_STREAM_READ, &mut consume, after_read)
+    }
+    pub(crate) fn stream_runtime_material(
+        &self,
+        name: &str,
+        limit: u64,
+        consume: impl FnMut(&[u8]) -> Result<(), DomainError>,
+    ) -> Result<FileRevision, DomainError> {
+        self.stream_bounded(name, limit, 2 * 1024 * 1024 * 1024, consume, || {})
+    }
+    fn stream_bounded(
+        &self,
+        name: &str,
+        limit: u64,
+        maximum: u64,
+        mut consume: impl FnMut(&[u8]) -> Result<(), DomainError>,
+        after_read: impl FnOnce(),
+    ) -> Result<FileRevision, DomainError> {
         self.verify_root()?;
-        if limit == 0 || limit > MAX_STREAM_READ {
+        if limit == 0 || limit > maximum {
             return Err(DomainError::LimitExceeded("streamed file bytes".into()));
         }
         let path = relative(name)?;
@@ -448,7 +466,18 @@ impl Workspace {
         bytes: &[u8],
         check: impl Fn() -> Result<(), DomainError>,
     ) -> Result<FileRevision, DomainError> {
-        check()?;
+        self.replace_guarded(name, expected, bytes, |_| check())
+    }
+    /// The guard may ignore only this operation's exact temporary path when
+    /// checking Git dirt; all other files remain part of the conflict fence.
+    pub(crate) fn replace_guarded(
+        &self,
+        name: &str,
+        expected: &FileRevision,
+        bytes: &[u8],
+        check: impl Fn(Option<&str>) -> Result<(), DomainError>,
+    ) -> Result<FileRevision, DomainError> {
+        check(None)?;
         if bytes.len() > MAX_READ {
             return Err(DomainError::LimitExceeded("mutation bytes".into()));
         }
@@ -471,6 +500,12 @@ impl Workspace {
             std::process::id(),
             TEMP_SERIAL.fetch_add(1, Ordering::Relaxed)
         );
+        let temporary_relative = path
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join(&temporary)
+            .to_string_lossy()
+            .into_owned();
         let mut file = beneath(
             &parent,
             Path::new(&temporary),
@@ -479,14 +514,14 @@ impl Workspace {
         )?;
         let result = (|| {
             file.write_all(bytes).map_err(io_error)?;
-            check()?;
+            check(Some(&temporary_relative))?;
             // Preserve executable/read/write bits. Set-ID/sticky are never silently copied to new bytes.
             if expected.mode & 0o7000 != 0 {
                 return Err(DomainError::PermissionDenied);
             }
             rfs::fchmod(&file, Mode::from_raw_mode(expected.mode)).map_err(errno)?;
             file.sync_all().map_err(io_error)?;
-            check()?;
+            check(Some(&temporary_relative))?;
             if self.snapshot(name, MAX_READ)?.revision != *expected {
                 return Err(DomainError::Conflict);
             }
@@ -1390,5 +1425,117 @@ impl WatchHints {
             return Ok(true);
         }
         Ok(false)
+    }
+}
+
+impl Workspace {
+    /// Snapshot a link itself, never its target. Used by the preserved Godot
+    /// staging manifest; ancestors retain the normal no-symlink workspace fence.
+    pub fn link_snapshot(&self, name: &str) -> Result<(String, FileRevision), DomainError> {
+        self.verify_root()?;
+        let path = relative(name)?;
+        let file = beneath(&self.directory, path, OFlags::PATH, Mode::empty())?;
+        let before = file.metadata().map_err(io_error)?;
+        if !before.file_type().is_symlink() {
+            return Err(DomainError::InvalidInput("symbolic link required".into()));
+        }
+        let target = rfs::readlinkat(&file, "", Vec::new())
+            .map_err(errno)?
+            .into_string()
+            .map_err(|_| DomainError::InvalidInput("UTF-8 link target".into()))?;
+        let hash = format!("{:x}", Sha256::digest(target.as_bytes()));
+        let current = beneath(&self.directory, path, OFlags::PATH, Mode::empty())?
+            .metadata()
+            .map_err(io_error)?;
+        if revision(&before, &hash) != revision(&current, &hash) {
+            return Err(DomainError::Conflict);
+        }
+        self.verify_root()?;
+        Ok((target, revision(&before, &hash)))
+    }
+    pub fn create_local_link(&self, name: &str, target: &str) -> Result<(), DomainError> {
+        let _claim = self.claim()?;
+        let path = relative(name)?;
+        // Pinned backend library links are adjacent. Escaping links are not part
+        // of a contained runtime package even if a permissive old stager copied them.
+        if relative(target)?.components().count() != 1 {
+            return Err(DomainError::PermissionDenied);
+        }
+        let parent = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(p) => beneath(
+                &self.directory,
+                p,
+                OFlags::RDONLY | OFlags::DIRECTORY,
+                Mode::empty(),
+            )?,
+            None => self.directory.try_clone().map_err(io_error)?,
+        };
+        rfs::symlinkat(target, &parent, path.file_name().unwrap()).map_err(errno)?;
+        parent
+            .sync_all()
+            .map_err(|_| DomainError::DurabilityUnknown)
+    }
+    pub fn set_mode_checked(
+        &self,
+        name: &str,
+        expected: &FileRevision,
+        mode: u32,
+    ) -> Result<(), DomainError> {
+        if mode & !0o777 != 0 {
+            return Err(DomainError::PermissionDenied);
+        }
+        let _claim = self.claim()?;
+        let file = beneath(
+            &self.directory,
+            relative(name)?,
+            OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        if revision(&file.metadata().map_err(io_error)?, &expected.sha256) != *expected {
+            return Err(DomainError::Conflict);
+        }
+        rfs::fchmod(&file, Mode::from_raw_mode(mode)).map_err(errno)?;
+        file.sync_all().map_err(|_| DomainError::DurabilityUnknown)
+    }
+}
+
+impl Workspace {
+    /// Copy bounded runtime material from an explicit read-only source into an
+    /// absent file. Used only in a newly owned staging tree, never a user restore.
+    pub(crate) fn copy_runtime_material(
+        &self,
+        source: &Workspace,
+        name: &str,
+        control: &crate::resource_fs::ScanControl<'_>,
+    ) -> Result<(), DomainError> {
+        let path = relative(name)?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            self.create_directories_checked(
+                parent.to_str().ok_or(DomainError::PermissionDenied)?,
+                || control.check(),
+            )?;
+        }
+        let _claim = self.claim()?;
+        control.check()?;
+        let mut output = beneath(
+            &self.directory,
+            path,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        )?;
+        let revision = source.stream_runtime_material(name, 2 * 1024 * 1024 * 1024, |bytes| {
+            control.check()?;
+            output.write_all(bytes).map_err(io_error)
+        })?;
+        if revision.mode & !0o777 != 0 {
+            return Err(DomainError::PermissionDenied);
+        }
+        rfs::fchmod(&output, Mode::from_raw_mode(revision.mode)).map_err(errno)?;
+        output
+            .sync_all()
+            .map_err(|_| DomainError::DurabilityUnknown)?;
+        self.directory
+            .sync_all()
+            .map_err(|_| DomainError::DurabilityUnknown)
     }
 }
