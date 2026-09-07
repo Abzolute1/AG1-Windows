@@ -180,3 +180,19 @@ test("native polling keeps one shortcut subscription and leaves the command queu
   await waitFor(() => expect(polls).toBeGreaterThan(8));
   expect(invoke.mock.calls.filter(([name, args]) => name === "bridge_command" && args.envelope.command.action === "extension_settings")).toHaveLength(1);
 });
+
+test("a fenced project shows recovery archives without dispatching or switching authority", async () => {
+  invoke.mockImplementation(async (name: string) => {
+    if (name === "catalog") return { projects: ["/fixture-migration"], theme: "light" };
+    if (name === "open_project") throw new Error("Workspace is migrating; retry after recovery/resnapshot");
+    if (name === "cutover_status") return { owner: "native", stage: "rollback_prepared", epoch: 3, state: "/private/native", transfer: { archive: "/private/original-archive", original_state: "/private/original" }, rollback: { archive: "/private/native-archive", destination: "/private/new-ts" } };
+    return { snapshot: null, error: null, progress: "" };
+  });
+  render(<App />);
+  fireEvent.click(await screen.findByText("/fixture-migration"));
+  expect(await screen.findByRole("region", { name: "Workspace recovery" })).toBeTruthy();
+  expect(screen.getByText("/private/native-archive")).toBeTruthy();
+  expect(screen.getByText("/private/new-ts")).toBeTruthy();
+  expect(screen.getByText("rollback_prepared")).toBeTruthy();
+  expect(invoke.mock.calls.some(([name]) => name === "bridge_command")).toBe(false);
+});

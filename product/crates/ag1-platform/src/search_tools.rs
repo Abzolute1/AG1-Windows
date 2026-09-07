@@ -315,7 +315,7 @@ impl SearchService {
                     closed = true;
                 }
             }
-            let bytes = child.read_stdout(32768)?;
+            let (bytes, complete) = child.poll_stdout(32768)?;
             let empty = bytes.is_empty();
             total += bytes.len();
             if total > 32 * 1024 * 1024 {
@@ -387,7 +387,7 @@ impl SearchService {
                 status = None;
                 break;
             }
-            if empty && let Some(exit) = child.try_wait()? {
+            if let Some(exit) = complete {
                 status = Some(exit);
                 break;
             }

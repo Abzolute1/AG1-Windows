@@ -13,14 +13,47 @@ fn local(window: &tauri::Window) -> Result<(), String> {
     }
 }
 #[tauri::command]
+async fn cutover_status(window: tauri::Window, path: String) -> Result<Value, String> {
+    local(&window)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let record = ag1_platform::cutover::Registry::for_user()
+            .and_then(|registry| registry.inspect(std::path::Path::new(&path)))
+            .map_err(|e| format!("{e:?}"))?;
+        serde_json::to_value(record).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
 async fn open_project(
     window: tauri::Window,
     state: tauri::State<'_, Arc<Desktop>>,
     path: String,
 ) -> Result<Value, String> {
     local(&window)?;
+    #[cfg(feature = "visual-test")]
+    if let Some(selected) = std::env::var_os("AG1_CUTOVER_WORKSPACE")
+        && std::fs::canonicalize(&path).map_err(|e| e.to_string())?
+            != std::fs::canonicalize(selected).map_err(|e| e.to_string())?
+    {
+        return Err("Cutover measurement is bound to its selected workspace".into());
+    }
     let state = state.inner().clone();
-    if state.native.enabled() {
+    let _transition = state.transition.lock().await;
+    if state.native.selects(std::path::Path::new(&path))? {
+        {
+            let mut slot = state.worker.lock().map_err(|_| "Worker lock")?;
+            if let Some(worker) = slot.as_ref()
+                && worker.view()["snapshot"]["status"] != "idle"
+                && worker.view()["error"].is_null()
+            {
+                return Err("Cancel and drain active work before switching projects".into());
+            }
+            if let Some(worker) = slot.as_mut() {
+                worker.stop();
+            }
+            *slot = None;
+        }
         let result = state
             .native
             .open(std::path::Path::new(&path), &state.state)
@@ -28,7 +61,15 @@ async fn open_project(
         state.add_project(std::path::Path::new(&path))?;
         return Ok(result);
     }
-    tauri::async_runtime::spawn_blocking(move || state.open(&path))
+    if state.native.enabled() {
+        let view = state.native.view().await?;
+        if !view["snapshot"].is_null() && view["snapshot"]["status"] != "idle" {
+            return Err("Cancel and drain active work before switching projects".into());
+        }
+        state.native.shutdown().await?;
+    }
+    let worker_state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || worker_state.open(&path))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -173,6 +214,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             open_project,
+            cutover_status,
             bridge_command,
             bridge_view,
             catalog,

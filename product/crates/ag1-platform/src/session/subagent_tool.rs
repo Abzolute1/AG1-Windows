@@ -22,6 +22,8 @@ use std::{
     sync::{Arc, Weak, atomic::Ordering},
     time::{Duration, Instant},
 };
+mod explore;
+pub use explore::PreparedExplore;
 
 pub struct DelegationService {
     parent: Weak<NativeSession>,

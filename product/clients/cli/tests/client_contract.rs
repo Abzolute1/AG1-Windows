@@ -7,6 +7,117 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+
+#[test]
+fn measured_cutover_commands_keep_results_private_and_never_retry_an_existing_receipt() {
+    use ag1_platform::cutover::{Registry, Stage};
+    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("workspace");
+    let state = temp.path().join("state");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&state).unwrap();
+    let registry = Registry::for_user().unwrap();
+    let mut owner = registry.open_typescript(&workspace, &state).unwrap();
+    owner.quiesced().unwrap();
+    drop(owner);
+    let receipt = temp.path().join("measurement");
+    let output = Command::new(env!("CARGO_BIN_EXE_ag1-cutover"))
+        .arg("measure")
+        .arg(&receipt)
+        .arg("begin-transfer")
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        registry.inspect(&workspace).unwrap().unwrap().stage,
+        Stage::Draining
+    );
+    let start = fs::read(receipt.join("started.json")).unwrap();
+    let result = fs::read(receipt.join("result.json")).unwrap();
+    let record: Value = serde_json::from_slice(&result).unwrap();
+    assert_eq!(record["started_sha256"], ag1_storage::digest(&start));
+    assert_eq!(record["status"], "command_succeeded");
+    assert_eq!(
+        record["result"],
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    );
+    assert!(record["elapsed_ms"].is_u64());
+    assert_eq!(record["phase_acceptance"], false);
+    assert_eq!(
+        fs::metadata(&receipt).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    for name in ["started.json", "result.json"] {
+        assert_eq!(
+            fs::metadata(receipt.join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_ag1-cutover"))
+        .arg("measure")
+        .arg(&receipt)
+        .arg("cancel-unaccepted")
+        .arg(&workspace)
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("no command executed"));
+    assert_eq!(fs::read(receipt.join("started.json")).unwrap(), start);
+    assert_eq!(fs::read(receipt.join("result.json")).unwrap(), result);
+    assert_eq!(
+        registry.inspect(&workspace).unwrap().unwrap().stage,
+        Stage::Draining
+    );
+    registry
+        .resume_transfer(&workspace)
+        .unwrap()
+        .cancel_transfer()
+        .unwrap();
+    let failed = temp.path().join("failed");
+    let output = Command::new(env!("CARGO_BIN_EXE_ag1-cutover"))
+        .arg("measure")
+        .arg(&failed)
+        .arg("unsupported-action")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let record: Value =
+        serde_json::from_slice(&fs::read(failed.join("result.json")).unwrap()).unwrap();
+    assert_eq!(record["status"], "command_failed");
+    assert_eq!(record["automatic_retry_allowed"], false);
+}
+
+#[test]
+fn interrupted_measurement_retains_intent_without_claiming_a_command_result() {
+    use ag1_platform::cutover::measurement::Measurement;
+    let temp = tempfile::tempdir().unwrap();
+    let receipt = temp.path().join("interrupted");
+    let measurement =
+        Measurement::begin(&receipt, &["import".into(), "fixture-workspace".into()]).unwrap();
+    drop(measurement); // Crash boundary before durable result publication.
+    assert!(receipt.join("started.json").exists());
+    assert!(!receipt.join("result.json").exists());
+    assert!(Measurement::begin(&receipt, &["import".into()]).is_err());
+    let receipt = temp.path().join("publication-conflict");
+    let measurement =
+        Measurement::begin(&receipt, &["inspect".into(), "fixture-workspace".into()]).unwrap();
+    std::fs::write(receipt.join("result.json"), "retained conflicting evidence").unwrap();
+    assert!(measurement.finish(&Ok(json!({"observed":true}))).is_err());
+    assert_eq!(
+        std::fs::read_to_string(receipt.join("result.json")).unwrap(),
+        "retained conflicting evidence"
+    );
+}
 fn provider() -> (String, std::thread::JoinHandle<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
@@ -50,6 +161,16 @@ fn provider() -> (String, std::thread::JoinHandle<Value>) {
     (origin, thread)
 }
 fn config(origin: &str) -> Config {
+    // Tests that never generate still own distinct loopback endpoints. Sharing
+    // the old discard port would violate P13's cross-host endpoint lease.
+    thread_local! {
+        static UNUSED_PROVIDER: TcpListener = TcpListener::bind("127.0.0.1:0").unwrap();
+    }
+    let origin = if origin == "http://127.0.0.1:9" {
+        UNUSED_PROVIDER.with(|socket| format!("http://{}", socket.local_addr().unwrap()))
+    } else {
+        origin.to_owned()
+    };
     Config {
         policy_mode: "interactive".into(),
         max_generations: None,
@@ -61,6 +182,8 @@ fn config(origin: &str) -> Config {
         ],
         selected: "initial".into(),
         credential_env: None,
+        imported: None,
+        runtime: None,
         credentials: Default::default(),
         system_prompt: "Isolated fixture".into(),
         fixture: true,
@@ -761,11 +884,19 @@ fn packaged_jsonl_stdout_is_framed_correlated_and_eof_drains_native_work() {
             _ => {}
         }
     }
-    let status = child
-        .0
-        .try_wait()
-        .unwrap()
-        .expect("EOF completed within the deadline");
+    // Pipe EOF may arrive before the OS publishes the child's exit status.
+    // Wait for that distinct event, retaining a bound on shutdown itself.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "EOF completed within the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert!(status.success());
     assert!(framing_error && acknowledgement && completed);
     assert!(
@@ -1414,4 +1545,61 @@ async fn native_client_runs_and_stops_a_real_web_target_with_scoped_preview() {
             .is_err()
     );
     host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn configured_browser_host_registers_visual_schemas_without_starting_a_preview() {
+    for browser_available in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("workspace");
+        Host::init(&root).unwrap();
+        let mut tools = tooling();
+        // Admission only: these fixture paths satisfy discovery, and are never
+        // executed. Existing target tests cover actual browser execution.
+        if browser_available {
+            let module = dir.path().join("unused-browser-module.js");
+            std::fs::write(&module, "throw new Error('must not execute');").unwrap();
+            tools.browser = Some(ag1_platform::client::tooling::Browser {
+                node: "/usr/bin/true".into(),
+                driver: module.clone(),
+                playwright: module,
+                executable: "/usr/bin/true".into(),
+            });
+        }
+        let mut cfg = config("http://127.0.0.1:9");
+        cfg.tooling = Some(tools);
+        let state = dir.path().join("private");
+        for _ in 0..2 {
+            let host = Host::open(&root, &state, cfg.clone()).await.unwrap();
+            let selected = host.registry.selected().unwrap();
+            let catalog = selected.services.tools().client_catalog();
+            let active = selected.services.runtime().configuration().unwrap().tools;
+            for name in ["screenshot_url", "interact_then_screenshot", "verify_ui"] {
+                assert_eq!(
+                    catalog.iter().any(|tool| tool["name"] == name),
+                    browser_available
+                );
+                assert_eq!(
+                    active.iter().any(|tool| tool["name"] == name),
+                    browser_available
+                );
+            }
+            assert!(
+                selected
+                    .services
+                    .runtime()
+                    .pending_transport()
+                    .unwrap()
+                    .is_none()
+            );
+            host.shutdown().await.unwrap();
+            drop(host);
+            let record = ag1_platform::cutover::Registry::for_user()
+                .unwrap()
+                .inspect(&root)
+                .unwrap()
+                .unwrap();
+            assert!(record.quiescent);
+        }
+    }
 }

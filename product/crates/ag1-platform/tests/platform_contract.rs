@@ -78,6 +78,38 @@ fn resident_process_lifetime_ends_with_its_owner_control_connection() {
 fn supervisor() -> ProcessSupervisor {
     ProcessSupervisor::new(Path::new(HELPER)).unwrap()
 }
+
+#[test]
+fn extended_owned_stop_waits_for_verified_exit_and_retains_ownership_after_short_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let supervisor = ProcessSupervisor::new(Path::new(FIXTURE)).unwrap();
+    for short_timeout in [true, false] {
+        let mut child = supervisor
+            .spawn(
+                spec(dir.path(), &["settlement-delay"]),
+                &dir.path().join(format!("delayed-{short_timeout}.log")),
+            )
+            .unwrap();
+        let identity = child.identity().clone();
+        for invalid in [Duration::ZERO, Duration::from_secs(31)] {
+            assert!(matches!(
+                child.stop_with_timeout(invalid),
+                Err(DomainError::InvalidInput(_))
+            ));
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        let began = Instant::now();
+        if short_timeout {
+            assert_eq!(child.stop(), Err(DomainError::TimedOut));
+            assert_eq!(observe(identity.pid).unwrap(), identity);
+            assert!(child.try_wait().unwrap().is_none());
+        }
+        child.stop_with_timeout(Duration::from_secs(8)).unwrap();
+        assert!(began.elapsed() >= Duration::from_secs(4));
+        assert!(child.try_wait().unwrap().is_some());
+        gone(identity.pid);
+    }
+}
 fn pid_file(path: &Path) -> u32 {
     let start = Instant::now();
     loop {
@@ -670,6 +702,37 @@ fn compiler_diagnostics_and_target_discovery_are_bounded() {
         .unwrap(),
         [TargetKind::Web, TargetKind::Tauri, TargetKind::Godot]
     );
+}
+
+#[test]
+fn protocol_completion_waits_for_final_stdout_even_after_process_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut child = supervisor()
+        .spawn_protocol(
+            spec(dir.path(), &["input"]),
+            &dir.path().join("final-output.log"),
+        )
+        .unwrap();
+    // The live child has no output yet. This empty read must not terminate it.
+    let (bytes, complete) = child.poll_stdout(4).unwrap();
+    assert!(bytes.is_empty());
+    assert!(complete.is_none());
+    let expected = b"last bytes before exit";
+    assert_eq!(child.write_input(expected).unwrap(), expected.len());
+    child.close_input();
+    assert!(child.wait(Duration::from_secs(3)).unwrap().success());
+    let mut output = vec![];
+    loop {
+        let (bytes, complete) = child.poll_stdout(4).unwrap();
+        if let Some(status) = complete {
+            assert!(status.success());
+            assert!(bytes.is_empty());
+            break;
+        }
+        assert!(!bytes.is_empty());
+        output.extend(bytes);
+    }
+    assert_eq!(output, expected);
 }
 
 #[test]

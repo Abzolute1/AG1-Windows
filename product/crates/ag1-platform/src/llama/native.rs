@@ -115,8 +115,14 @@ pub struct NativeRuntimeHost<O> {
     private_dir: PathBuf,
     verifier: MaterialVerifier,
     serial: u64,
+    exclusive_gpu: bool,
+    owned_pid: Option<u32>,
 }
 impl<O> NativeRuntimeHost<O> {
+    pub fn require_exclusive_gpu(mut self) -> Self {
+        self.exclusive_gpu = true;
+        self
+    }
     pub fn new(helper: &Path, private_dir: &Path, observer: O) -> Result<Self, DomainError> {
         let directory = private_dir.canonicalize().map_err(io_error)?;
         let meta = fs::metadata(&directory).map_err(io_error)?;
@@ -129,6 +135,8 @@ impl<O> NativeRuntimeHost<O> {
             private_dir: directory,
             verifier: MaterialVerifier::default(),
             serial: 0,
+            exclusive_gpu: false,
+            owned_pid: None,
         })
     }
 }
@@ -140,9 +148,15 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
         self.verifier.verify(materials)
     }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError> {
+        if self.exclusive_gpu && self.owned_pid.is_none() {
+            super::window::verify(None)?;
+        }
         (self.observer)(plan)
     }
     fn spawn(&mut self, plan: &LaunchPlan) -> Result<Self::Handle, DomainError> {
+        if self.exclusive_gpu {
+            super::window::verify(None)?;
+        }
         // Reverify after health observation, immediately before creating the child.
         self.verifier.verify(&plan.materials)?;
         self.serial = self.serial.checked_add(1).ok_or(DomainError::QueueFull)?;
@@ -191,10 +205,13 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             Ok(candidates.remove(0))
         })();
         match result {
-            Ok(target) => Ok(NativeOwnedRuntime {
-                process: Mutex::new(process),
-                target,
-            }),
+            Ok(target) => {
+                self.owned_pid = Some(target.pid);
+                Ok(NativeOwnedRuntime {
+                    process: Mutex::new(process),
+                    target,
+                })
+            }
             Err(error) => {
                 process.stop()?;
                 Err(error)
@@ -207,11 +224,20 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             .lock()
             .map_err(|_| DomainError::Unavailable("runtime handle poisoned".into()))?;
         if process.try_wait()?.is_some() {
+            self.owned_pid = None;
             return Ok(false);
         }
         match observe(handle.target.pid) {
-            Ok(current) if current == handle.target => Ok(true),
-            Err(DomainError::NotFound) => Ok(false),
+            Ok(current) if current == handle.target => {
+                if self.exclusive_gpu {
+                    super::window::verify(Some(handle.target.pid))?;
+                }
+                Ok(true)
+            }
+            Err(DomainError::NotFound) => {
+                self.owned_pid = None;
+                Ok(false)
+            }
             _ => Err(DomainError::Conflict),
         }
     }
@@ -222,6 +248,31 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             .process
             .lock()
             .map_err(|_| DomainError::Unavailable("runtime handle poisoned".into()))?
-            .stop()
+            .stop_with_timeout(std::time::Duration::from_secs(30))?;
+        self.owned_pid = None;
+        Ok(())
+    }
+    fn resources(
+        &mut self,
+        handle: &Self::Handle,
+    ) -> Result<Option<serde_json::Value>, DomainError> {
+        if observe(handle.target.pid)? != handle.target {
+            return Err(DomainError::Conflict);
+        }
+        let status =
+            fs::read_to_string(format!("/proc/{}/status", handle.target.pid)).map_err(io_error)?;
+        let rss = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .and_then(|line| line.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or(DomainError::Conflict)?;
+        let gpu = super::window::gpu_memory()?;
+        if observe(handle.target.pid)? != handle.target {
+            return Err(DomainError::Conflict);
+        }
+        Ok(Some(
+            serde_json::json!({"owned_pid":handle.target.pid,"resident_kib":rss,"gpu":gpu}),
+        ))
     }
 }

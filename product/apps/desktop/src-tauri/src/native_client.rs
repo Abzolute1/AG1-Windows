@@ -1,8 +1,10 @@
-//! One explicit P12 isolated authority switch, fixed for the host lifetime.
+//! Native startup binds to durable workspace authority. The P12 environment
+//! configuration still explicitly selects isolated native clients.
 use ag1_platform::client::{Config, Host};
 use serde_json::Value;
 use std::{path::Path, sync::Arc};
 pub struct NativeClient {
+    active: std::sync::atomic::AtomicBool,
     preview: std::sync::Mutex<Option<crate::project_preview::ProjectPreview>>,
     config: Option<Config>,
     owner: tokio::sync::Mutex<Option<Arc<Host>>>,
@@ -19,14 +21,29 @@ impl NativeClient {
                 serde_json::from_slice(&bytes).map_err(|_| "Invalid native host config".into())
             })
             .transpose()?;
+        let selected = config.is_some();
         Ok(Self {
+            active: std::sync::atomic::AtomicBool::new(selected),
             config,
             preview: std::sync::Mutex::new(None),
             owner: tokio::sync::Mutex::new(None),
         })
     }
     pub fn enabled(&self) -> bool {
-        self.config.is_some()
+        self.active.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn selects(&self, path: &Path) -> Result<bool, String> {
+        let registry = ag1_platform::cutover::Registry::for_user().map_err(|e| format!("{e:?}"))?;
+        let recorded = registry.inspect(path).map_err(|e| format!("{e:?}"))?;
+        if recorded.as_ref().is_some_and(|r| {
+            r.owner == ag1_platform::cutover::Owner::TypeScript && r.rollback.is_some()
+        }) {
+            return Ok(false);
+        }
+        Ok(self.config.is_some()
+            || recorded.is_some_and(|r| {
+                r.owner == ag1_platform::cutover::Owner::Native && r.transfer.is_some()
+            }))
     }
     pub async fn open(&self, path: &Path, state: &Path) -> Result<Value, String> {
         let mut slot = self.owner.lock().await;
@@ -41,30 +58,48 @@ impl NativeClient {
             }
         }
         use sha2::{Digest, Sha256};
-        let private = state.join("native").join(format!(
+        let fallback = state.join("native").join(format!(
             "{:x}",
             Sha256::digest(canonical.as_os_str().as_encoded_bytes())
         ));
-        let host = Host::open(
-            &canonical,
-            &private,
-            self.config.clone().ok_or("Native mode is disabled")?,
-        )
-        .await
-        .map_err(|e| format!("{e:?}"))?;
+        let record = ag1_platform::cutover::Registry::for_user()
+            .map_err(|e| format!("{e:?}"))?
+            .inspect(&canonical)
+            .map_err(|e| format!("{e:?}"))?;
+        let private = record
+            .as_ref()
+            .and_then(|r| r.state.clone())
+            .unwrap_or(fallback);
+        let config = match self.config.clone() {
+            Some(config) => config,
+            None if record.as_ref().is_some_and(|r| r.transfer.is_some()) => {
+                let bytes = std::fs::read(private.join("host.json")).map_err(|e| e.to_string())?;
+                if bytes.len() > 1024 * 1024 {
+                    return Err("Native config too large".into());
+                }
+                serde_json::from_slice(&bytes).map_err(|_| "Invalid migrated host configuration")?
+            }
+            None => return Err("Native mode needs explicit configuration".into()),
+        };
+        if let Some(owner) = slot.as_ref() {
+            owner.shutdown().await.map_err(|e| format!("{e:?}"))?;
+        }
+        self.close_preview()?;
+        *slot = None;
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        let host = Host::open(&canonical, &private, config)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
         let value = serde_json::to_value(host.view().map_err(|e| format!("{e:?}"))?)
             .map_err(|e| e.to_string())?;
-        if let Some(owner) = slot.as_ref()
-            && let Err(error) = owner.shutdown().await
-        {
-            let _ = host.shutdown().await;
-            return Err(format!("{error:?}"));
-        }
         if let Err(error) = self.close_preview() {
             let _ = host.shutdown().await;
             return Err(error);
         }
         *slot = Some(host);
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(value)
     }
     pub fn close_preview(&self) -> Result<(), String> {
@@ -164,6 +199,8 @@ impl NativeClient {
         }
         self.close_preview()?;
         *slot = None;
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 export function runtimeGuard(config: any, profilePath: string, buildArgs: (args: any) => string[]) {
@@ -33,6 +34,21 @@ export function runtimeGuard(config: any, profilePath: string, buildArgs: (args:
         hash(profilePath) !== config.profile_sha256
       )
         throw new Error("Runtime profile drift; review required");
+      // Observe resources only. A PID found here never becomes a stop handle.
+      for (const name of fs.readdirSync("/proc")) {
+        if (!/^\d+$/.test(name)) continue;
+        try {
+          if (fs.readFileSync(`/proc/${name}/comm`, "utf8").trim() === "llama-server" && !this.owns(Number(name)))
+            throw new Error("External model process owns the runtime window; its owner must release it");
+        } catch (error: any) { if (error?.code !== "ENOENT" && error?.code !== "ESRCH") throw error; }
+      }
+      const gpu = spawnSync("/usr/bin/nvidia-smi", ["--query-compute-apps=pid", "--format=csv,noheader,nounits"],
+        { encoding: "utf8", timeout: 5000, maxBuffer: 65536, stdio: ["ignore", "pipe", "ignore"] });
+      if (gpu.error || gpu.status !== 0) throw new Error("Cannot verify GPU runtime ownership");
+      for (const line of gpu.stdout.trim().split("\n").filter(Boolean)) {
+        if (!/^\d+$/.test(line.trim()) || !this.owns(Number(line)))
+          throw new Error("External GPU process owns the runtime window; its owner must release it");
+      }
       const env = options.env ?? process.env;
       const permitted = new Set([
         "AG1_LLAMA_CPP",
@@ -56,12 +72,14 @@ export function runtimeGuard(config: any, profilePath: string, buildArgs: (args:
       if (plan.binary.command !== p.serverPath || plan.binary.libPath !== p.libPath)
         throw new Error("Tuned binary/library selection drift");
       const tier = p.contextBatchTiers?.find((t: any) => p.contextWindow <= t.maxContextWindow);
+      const rawPort = plan.env.LLAMA_CPP_PORT ?? plan.env.AG1_LLAMA_CPP_PORT;
+      const port = Number(rawPort);
       const expected = buildArgs({
         ...p,
         modelPath: entry.path,
         alias: plan.model.id,
-        host: plan.env.AG1_LLAMA_CPP_HOST ?? "127.0.0.1",
-        port: Number(plan.env.AG1_LLAMA_CPP_PORT ?? 8080),
+        host: plan.env.LLAMA_CPP_HOST ?? plan.env.AG1_LLAMA_CPP_HOST ?? "127.0.0.1",
+        port: Number.isInteger(port) && port > 0 ? port : 18080,
         contextWindow: p.contextWindow,
         batchSize: tier?.batchSize ?? p.batchSize,
         ubatchSize: tier?.ubatchSize ?? p.ubatchSize,

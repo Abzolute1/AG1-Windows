@@ -85,7 +85,7 @@ def verify_original() -> dict:
     head = subprocess.check_output(['git', '-C', str(ORIGINAL), 'rev-parse', 'HEAD'], text=True).strip()
     if head != PIN:
         raise GateError('AG1 HEAD differs from research pin; explicit delta review required')
-    status = subprocess.check_output(['git', '-C', str(ORIGINAL), 'status', '--short'], text=True)
+    status = subprocess.check_output(['git', '--no-optional-locks', '-C', str(ORIGINAL), 'status', '--short'], text=True)
     if status != (ROOT / 'research/evidence/ag1-original-status.txt').read_text():
         raise GateError('Original status changed; preserve and review the delta')
     inventory = read_json(ROOT / 'research/evidence/ag1-source-inventory.json')
@@ -95,7 +95,7 @@ def verify_original() -> dict:
     dyad_head = subprocess.check_output(['git', '-C', str(ROOT / 'vendor/dyad'), 'rev-parse', 'HEAD'], text=True).strip()
     if dyad_head != DYAD_PIN:
         raise GateError('Dyad HEAD differs from research pin')
-    if subprocess.check_output(['git', '-C', str(ROOT / 'vendor/dyad'), 'status', '--porcelain'], text=True):
+    if subprocess.check_output(['git', '--no-optional-locks', '-C', str(ROOT / 'vendor/dyad'), 'status', '--porcelain'], text=True):
         raise GateError('Dyad inspection checkout is no longer clean')
     return {'ag1_commit': head, 'dyad_commit': dyad_head,
             'source_modules_verified': len(inventory), 'original_status_unchanged': True}

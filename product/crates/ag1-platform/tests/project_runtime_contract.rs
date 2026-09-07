@@ -181,6 +181,72 @@ fn create_failure_cleans_only_owned_destination() {
     assert!(dir.path().join("existing").is_dir());
 }
 #[test]
+fn target_discovery_does_not_scan_unrelated_archived_environments() {
+    let mut f = Fixture::new();
+    let root = f.runtime.workspace.root();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"scripts":{"build":"build"}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir(root.join("archive")).unwrap();
+    for n in 0..1001 {
+        std::fs::write(root.join(format!("archive/{n}")), "retained").unwrap();
+    }
+    assert!(f.runtime.workspace.scan(1000).is_err());
+    f.runtime.discover().unwrap();
+    assert!(
+        f.runtime
+            .project
+            .targets
+            .iter()
+            .any(|t| t.kind == Kind::Web)
+    );
+    // Discovery does not weaken the existing execution revision boundary.
+    assert!(f.runtime.revision().is_err());
+    let root = f.runtime.workspace.root().to_path_buf();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(root.join(".gitignore"), "archive/\n").unwrap();
+    std::fs::write(root.join("main.rs"), "original source").unwrap();
+    std::fs::create_dir(root.join("source")).unwrap();
+    for n in 0..1001 {
+        std::fs::write(root.join(format!("source/{n}")), "source").unwrap();
+    }
+    std::fs::write(root.join("large-source"), vec![7; 17 * 1024 * 1024]).unwrap();
+    std::fs::write(root.join("deleted-source"), "tracked").unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["add", "deleted-source"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::remove_file(root.join("deleted-source")).unwrap();
+    f.runtime
+        .bind_git_source(
+            std::path::Path::new(env!("CARGO_BIN_EXE_ag1-process-host")),
+            std::path::Path::new("/usr/bin/git"),
+        )
+        .unwrap();
+    let before = f.runtime.revision().unwrap();
+    std::fs::write(root.join("archive/0"), "ignored cache change").unwrap();
+    assert_eq!(f.runtime.revision().unwrap(), before);
+    std::fs::write(root.join("main.rs"), "changed source").unwrap();
+    assert_ne!(f.runtime.revision().unwrap(), before);
+    let before = f.runtime.revision().unwrap();
+    std::fs::write(root.join("deleted-source"), "restored").unwrap();
+    assert_ne!(f.runtime.revision().unwrap(), before);
+}
+
+#[test]
 fn unavailable_toolchain_and_preview_policy_are_actionable() {
     let mut f = Fixture::new();
     f.runtime
@@ -344,6 +410,51 @@ fn load_preserves_identity_and_reports_uncertain_history() {
             .iter()
             .any(|t| t.lifecycle == Lifecycle::RecoveryRequired)
     );
+}
+
+#[test]
+fn project_writer_release_is_not_delayed_by_inherited_file_descriptions() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let f = Fixture::new();
+    let state = WorkspaceService::new()
+        .unwrap()
+        .register(&f._dir.path().join("state"))
+        .unwrap();
+    let lock_path = state.root().join("project-writer.lock");
+    let descriptor = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| std::fs::read_link(entry.path()).ok().as_ref() == Some(&lock_path))
+        .unwrap();
+    let descriptor: i32 = descriptor.file_name().to_str().unwrap().parse().unwrap();
+    // dup and fork retain the same open-file description. Keep a duplicate to
+    // model another thread's pre-exec child without timing-dependent sleeps.
+    let duplicate = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 3) };
+    assert!(duplicate >= 0);
+    let inherited = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    let workspace = f.runtime.workspace.clone();
+    let tools = f.runtime.toolchains.clone();
+    assert!(matches!(
+        Runtime::load(
+            workspace.clone(),
+            state.clone(),
+            std::path::Path::new(env!("CARGO_BIN_EXE_ag1-process-host")),
+            tools.clone()
+        ),
+        Err(DomainError::Conflict)
+    ));
+    drop(f.runtime);
+    let resumed = Runtime::load(
+        workspace,
+        state,
+        std::path::Path::new(env!("CARGO_BIN_EXE_ag1-process-host")),
+        tools,
+    );
+    assert!(
+        resumed.is_ok(),
+        "A dropped writer must release its flock even while an inherited descriptor remains open"
+    );
+    drop(inherited);
 }
 
 fn repo() -> PathBuf {

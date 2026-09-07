@@ -163,14 +163,14 @@ impl Browser {
         let mut rss = 0;
         let exit = loop {
             control.check()?;
-            let bytes = process.read_stdout(32768)?;
+            let (bytes, complete) = process.poll_stdout(32768)?;
             let empty = bytes.is_empty();
             output.extend(bytes);
             if output.len() > 12 * 1024 * 1024 {
                 return Err(DomainError::LimitExceeded("browser response".into()));
             }
             rss = rss.max(super::runtime::owned_rss(process.identity().pid));
-            if empty && let Some(exit) = process.try_wait()? {
+            if let Some(exit) = complete {
                 break exit;
             }
             if empty {

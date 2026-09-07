@@ -243,7 +243,8 @@ impl<C: Credentials> ConfiguredModels<C> {
                 model: &config.model,
                 context: input.context,
                 options: &merged,
-                anthropic_oauth: false,
+                anthropic_oauth: config.model["provider"] == "anthropic"
+                    && matches!(&credential, HttpCredential::Bearer(_)),
                 google_project: None,
                 request_id: input.operation,
             },

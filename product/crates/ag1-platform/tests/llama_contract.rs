@@ -139,6 +139,7 @@ struct FakeHost {
     alive: bool,
     same_process: bool,
     spawn_fails: bool,
+    observation_timeout: bool,
     spawns: usize,
     stops: usize,
 }
@@ -150,6 +151,7 @@ impl Default for FakeHost {
             alive: true,
             same_process: true,
             spawn_fails: false,
+            observation_timeout: false,
             spawns: 0,
             stops: 0,
         }
@@ -166,6 +168,9 @@ impl RuntimeHost for FakeHost {
         }
     }
     fn observe(&mut self, _: &LaunchPlan) -> Result<Observation, DomainError> {
+        if self.observation_timeout {
+            return Err(DomainError::TimedOut);
+        }
         Ok(self.observation.clone())
     }
     fn spawn(&mut self, _: &LaunchPlan) -> Result<FakeOwned, DomainError> {
@@ -504,4 +509,32 @@ fn authenticated_runtime_handoff_rechecks_identity_and_preserves_cleanup_on_fail
     let mut c = RuntimeController::new(FakeHost::default());
     c.observe_external_runtime(&p).unwrap();
     assert!(c.handoff().restore(&p).is_err());
+}
+
+#[test]
+fn health_timeout_keeps_only_a_verified_owned_child_loading_until_the_load_deadline() {
+    let plan = locked_plan();
+    let mut controller = RuntimeController::new(FakeHost::default());
+    controller.host_mut().observation_timeout = true;
+    assert_eq!(
+        controller.start_owned_runtime(&plan),
+        Err(DomainError::TimedOut)
+    );
+    assert_eq!(controller.host().spawns, 0);
+    controller.host_mut().observation_timeout = false;
+    controller.start_owned_runtime(&plan).unwrap();
+    controller.host_mut().observation_timeout = true;
+    assert!(!controller.poll_ready(&plan).unwrap());
+    assert!(controller.owns_process());
+    assert_eq!(controller.host().stops, 0);
+    controller.host_mut().same_process = false;
+    assert_eq!(controller.poll_ready(&plan), Err(DomainError::Conflict));
+    controller.host_mut().same_process = true;
+    controller.host_mut().observation_timeout = false;
+    controller.host_mut().observation = healthy(&plan);
+    assert!(controller.poll_ready(&plan).unwrap());
+    controller.host_mut().observation_timeout = true;
+    assert!(!controller.poll_ready(&plan).unwrap());
+    assert_eq!(controller.timeout_loading(), Err(DomainError::TimedOut));
+    assert_eq!(controller.host().stops, 1);
 }

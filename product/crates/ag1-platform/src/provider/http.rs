@@ -96,6 +96,13 @@ pub enum HttpMethod {
 pub struct ProviderHttp {
     client: Client,
     origins: BTreeSet<String>,
+    runtime: Option<std::sync::Arc<dyn GenerationRuntime>>,
+}
+/// Host custody preparation, called with an already held generation permit.
+/// It may load the pinned model but must not issue a generation itself.
+pub trait GenerationRuntime: Send + Sync {
+    fn prepare<'a>(&'a self, request: &'a HttpRequest) -> ag1_core::PortFuture<'a, ()>;
+    fn shutdown(&self) -> ag1_core::PortFuture<'_, ()>;
 }
 pub fn endpoint_origin(value: &str) -> Result<String, DomainError> {
     let url = Url::parse(value).map_err(|_| DomainError::InvalidInput("provider URL".into()))?;
@@ -134,7 +141,35 @@ impl ProviderHttp {
             .pool_max_idle_per_host(3)
             .build()
             .map_err(|_| DomainError::Unavailable("HTTP/TLS initialization".into()))?;
-        Ok(Self { client, origins })
+        Ok(Self {
+            client,
+            origins,
+            runtime: None,
+        })
+    }
+    pub fn with_runtime(mut self, runtime: std::sync::Arc<dyn GenerationRuntime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+    pub(crate) async fn prepare_generation(
+        &self,
+        request: &HttpRequest,
+        deadline: Option<Instant>,
+        cancel: &mut CancelToken,
+    ) -> Result<(), DomainError> {
+        self.validate_request(request)?;
+        if cancel.cancelled() {
+            return Err(DomainError::Cancelled);
+        }
+        if let Some(runtime) = &self.runtime {
+            tokio::select! {
+                biased;
+                _ = cancel.wait() => return Err(DomainError::Cancelled),
+                _ = deadline_reached(deadline) => return Err(DomainError::TimedOut),
+                result = runtime.prepare(request) => result?,
+            }
+        }
+        Ok(())
     }
     /// Validate without starting a network operation.
     pub fn validate_request(&self, request: &HttpRequest) -> Result<(), DomainError> {

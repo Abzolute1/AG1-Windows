@@ -697,6 +697,19 @@ pub struct OwnedProcess {
     stdout: Option<File>,
 }
 impl OwnedProcess {
+    /// Report completion only after stdout has been drained following an exit
+    /// observation. An empty nonblocking read before that observation is not EOF:
+    /// the child can write its final bytes between the read and `try_wait`.
+    pub fn poll_stdout(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Option<ExitStatus>), DomainError> {
+        let status = self.try_wait()?;
+        let bytes = self.read_stdout(max_bytes)?;
+        let complete = if bytes.is_empty() { status } else { None };
+        Ok((bytes, complete))
+    }
+
     pub fn read_stdout(&mut self, max_bytes: usize) -> Result<Vec<u8>, DomainError> {
         if max_bytes == 0 || max_bytes > 32 * 1024 {
             return Err(DomainError::LimitExceeded("protocol stdout".into()));
@@ -809,6 +822,13 @@ impl OwnedProcess {
         }
     }
     pub fn stop_if_identity(&mut self, expected: &ProcessIdentity) -> Result<(), DomainError> {
+        self.stop_checked(expected, Duration::from_millis(STOP_DEADLINE_MS))
+    }
+    fn stop_checked(
+        &mut self,
+        expected: &ProcessIdentity,
+        timeout: Duration,
+    ) -> Result<(), DomainError> {
         if expected != &self.identity {
             return Err(DomainError::Conflict);
         }
@@ -819,21 +839,32 @@ impl OwnedProcess {
             Ok(current) if current == self.identity => {}
             // /proc/exe can disappear just before waitpid observes exit. The private socket still
             // names our child; closing it cannot signal a replacement PID.
-            Err(DomainError::NotFound) => return self.request_stop(),
+            Err(DomainError::NotFound) => return self.request_stop_for(timeout),
             _ => return Err(DomainError::Conflict),
         }
-        self.request_stop()
+        self.request_stop_for(timeout)
     }
     pub fn stop(&mut self) -> Result<(), DomainError> {
         self.stop_if_identity(&self.identity.clone())
     }
+    /// Retain the authenticated helper and its capacity until settlement. This
+    /// changes only the caller's wait budget, never child signals or launch args.
+    pub fn stop_with_timeout(&mut self, timeout: Duration) -> Result<(), DomainError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err(DomainError::InvalidInput("owned stop wait budget".into()));
+        }
+        self.stop_checked(&self.identity.clone(), timeout)
+    }
     fn request_stop(&mut self) -> Result<(), DomainError> {
+        self.request_stop_for(Duration::from_millis(STOP_DEADLINE_MS))
+    }
+    fn request_stop_for(&mut self, timeout: Duration) -> Result<(), DomainError> {
         if let Some(control) = self.control.take() {
             let _ = control.shutdown(std::net::Shutdown::Both);
         }
         let start = Instant::now();
         while self.try_wait()?.is_none() {
-            if start.elapsed() >= Duration::from_millis(STOP_DEADLINE_MS) {
+            if start.elapsed() >= timeout {
                 return Err(DomainError::TimedOut);
             }
             thread::sleep(Duration::from_millis(5));

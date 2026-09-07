@@ -839,6 +839,9 @@ impl SessionRuntime {
             return Err(DomainError::Conflict);
         }
         match (pending.name.as_str(), custom_type) {
+            ("explore", "ag1.explore_tasks") => {
+                super::subagent::explore::validate_rollup(&data, &pending.block["arguments"])?;
+            }
             ("task", "ag1.subagent_task") => {
                 super::subagent::tool::validate_rollup(&data, &pending.block["arguments"])?;
             }

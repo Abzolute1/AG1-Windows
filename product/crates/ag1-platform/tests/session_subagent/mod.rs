@@ -52,6 +52,210 @@ async fn enable_task(f: &mut Fixture, provider: Arc<dyn ProviderResolver>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explore_runs_native_readonly_children_and_imports_board_without_original_writes() {
+    let (endpoint, server) = server(vec![
+        calls(vec![(
+            "explore-pair",
+            "explore",
+            json!({"questions":["First question","Second question"]}),
+        )]),
+        stop(),
+        stop(),
+        stop(),
+    ]);
+    let mut f = fixture_configured(&endpoint, "disabled", vec![], None, None, 1);
+    let original=json!({"version":1,"updatedAt":1,"findings":[{"question":"Prior question","summary":"Preserved finding","state":"completed","evidence":[],"at":1}]}).to_string();
+    std::fs::create_dir_all(f.root.join(".ag1")).unwrap();
+    std::fs::write(f.root.join(".ag1/explore-board.json"), &original).unwrap();
+    let child_resolver = Arc::new(Resolver::new(false));
+    enable_task(&mut f, child_resolver.clone()).await;
+    let definition = Registry::builtins()
+        .unwrap()
+        .public_tools()
+        .into_iter()
+        .find(|v| v["name"] == "explore")
+        .unwrap();
+    f.host
+        .select_tools(
+            "explore-tools",
+            "explore-tools",
+            NOW,
+            vec![definition],
+            &ignore,
+        )
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(12),
+        f.host
+            .run(input(), &Resolver::new(false), f.files.clone(), &ignore),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(result.generations, 2);
+    assert!(f.host.settled().unwrap());
+    assert_eq!(child_resolver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join(".ag1/explore-board.json")).unwrap(),
+        original
+    );
+    let saved = f
+        .store
+        .load_metadata("explore-board", f.workspace.id().as_str())
+        .unwrap()
+        .unwrap();
+    let board: Value = serde_json::from_slice(&saved.bytes).unwrap();
+    assert_eq!(board["findings"].as_array().unwrap().len(), 3);
+    assert_eq!(board["findings"][0]["summary"], "Preserved finding");
+    assert_eq!(board["findings"][1]["question"], "First question");
+    assert_eq!(board["findings"][2]["question"], "Second question");
+    let branch = ag1_core::task::branch_values(
+        &f.store
+            .journal_snapshot(&SessionId::new("session").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        branch
+            .iter()
+            .filter(|e| e["customType"] == "ag1.explore_tasks")
+            .count(),
+        1
+    );
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[1..3] {
+        assert!(request.to_string().contains("Preserved finding"));
+        assert!(!request["tools"].as_array().unwrap().iter().any(|t| {
+            ["write", "edit", "bash", "task", "explore"]
+                .contains(&t["function"]["name"].as_str().unwrap())
+        }));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explore_cancellation_settles_all_admitted_children_before_parent_completion() {
+    struct PausedExploreResolver {
+        calls: AtomicUsize,
+    }
+    impl ProviderResolver for PausedExploreResolver {
+        fn resolve<'a>(
+            &'a self,
+            _: ProviderInput<'a>,
+            _: &'a AtomicBool,
+        ) -> PortFuture<'a, ResolvedRequest> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending().await
+            })
+        }
+    }
+    let (endpoint, server) = server(vec![calls(vec![(
+        "explore-cancel",
+        "explore",
+        json!({"questions":["One","Two"]}),
+    )])]);
+    let mut f = fixture_configured(&endpoint, "disabled", vec![], None, None, 1);
+    let resolver = Arc::new(PausedExploreResolver {
+        calls: AtomicUsize::new(0),
+    });
+    enable_task(&mut f, resolver.clone()).await;
+    let definition = Registry::builtins()
+        .unwrap()
+        .public_tools()
+        .into_iter()
+        .find(|v| v["name"] == "explore")
+        .unwrap();
+    f.host
+        .select_tools(
+            "explore-tools",
+            "explore-tools",
+            NOW,
+            vec![definition],
+            &ignore,
+        )
+        .await
+        .unwrap();
+    let host = f.host.clone();
+    let files = f.files.clone();
+    let run = tokio::spawn(async move {
+        host.run(input(), &Resolver::new(false), files, &ignore)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while resolver.calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host.cancel().unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(outcome, Err(DomainError::Cancelled)),
+        "error: {:?}",
+        outcome.as_ref().err()
+    );
+    assert!(f.host.settled().unwrap());
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    assert!(!f.root.join(".ag1/explore-board.json").exists());
+    assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_explore_board_is_retained_and_blocks_child_admission() {
+    let (endpoint, server) = server(vec![
+        calls(vec![(
+            "explore-corrupt",
+            "explore",
+            json!({"questions":["One"]}),
+        )]),
+        stop(),
+    ]);
+    let mut f = fixture_configured(&endpoint, "disabled", vec![], None, None, 1);
+    std::fs::create_dir_all(f.root.join(".ag1")).unwrap();
+    std::fs::write(f.root.join(".ag1/explore-board.json"), "{corrupt").unwrap();
+    let resolver = Arc::new(Resolver::new(false));
+    enable_task(&mut f, resolver.clone()).await;
+    let definition = Registry::builtins()
+        .unwrap()
+        .public_tools()
+        .into_iter()
+        .find(|v| v["name"] == "explore")
+        .unwrap();
+    f.host
+        .select_tools(
+            "explore-tools",
+            "explore-tools",
+            NOW,
+            vec![definition],
+            &ignore,
+        )
+        .await
+        .unwrap();
+    f.host
+        .run(input(), &Resolver::new(false), f.files.clone(), &ignore)
+        .await
+        .unwrap();
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join(".ag1/explore-board.json")).unwrap(),
+        "{corrupt"
+    );
+    assert!(
+        f.store
+            .load_metadata("explore-board", f.workspace.id().as_str())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn parent_task_executes_child_on_a_single_parent_worker_and_acknowledges_usage() {
     let (endpoint, server) = server(vec![
         calls(vec![(

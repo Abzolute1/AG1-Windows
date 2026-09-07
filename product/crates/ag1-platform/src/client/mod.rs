@@ -48,6 +48,8 @@ mod effects;
 pub mod export;
 pub mod extensions;
 mod factory;
+pub mod imported;
+pub mod local_runtime;
 mod observations;
 pub mod projection;
 mod projects;
@@ -101,6 +103,10 @@ pub struct Config {
     pub credential_env: Option<String>,
     #[serde(default)]
     pub credentials: std::collections::BTreeMap<String, credentials::Auth>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<imported::Inputs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<local_runtime::Runtime>,
     pub system_prompt: String,
     pub fixture: bool,
 }
@@ -134,7 +140,7 @@ impl ProviderResolver for Resolver {
                         .into(),
                 ));
             }
-            let credential = self.credentials.credential(model)?;
+            let credential = self.credentials.resolve_async(model).await?;
             let mut context = json!({"systemPrompt":input.configuration.system_prompt,"messages":input.projection.messages});
             if !input.configuration.tools.is_empty() {
                 context["tools"] = json!(input.configuration.tools);
@@ -148,7 +154,12 @@ impl ProviderResolver for Resolver {
                     model,
                     context: &context,
                     options: &options,
-                    anthropic_oauth: self.credentials.anthropic_oauth(model),
+                    anthropic_oauth: self.credentials.anthropic_oauth(model)
+                        || (model["provider"] == "anthropic"
+                            && matches!(
+                                &credential,
+                                crate::extension_models::Credential::Bearer(_)
+                            )),
                     google_project: None,
                     request_id: input.operation,
                 },
@@ -186,6 +197,7 @@ impl ProviderResolver for Resolver {
     }
 }
 struct Services {
+    imported_settings: imported::Settings,
     workspace: Arc<Workspace>,
     store: Arc<Store>,
     config: Config,
@@ -228,6 +240,14 @@ impl ServiceFactory for Services {
                 })?
                 .clone();
             let mut registry = ag1_core::tools::registry::Registry::builtins()?;
+            // Browser-backed project capabilities need their existing schemas
+            // before capability-filtered activation. Registration grants no
+            // preview, vision or process authority.
+            ag1_core::tools::targets::register_visual_tools(&mut registry)?;
+            self.store.ensure_output_origin(
+                input.target.session.as_str(),
+                input.target.session.as_str(),
+            )?;
             let mut adapters = tooling::adapters(
                 self.workspace.clone(),
                 self.store.clone(),
@@ -280,6 +300,7 @@ impl ServiceFactory for Services {
             let scheduler = self.scheduler.clone();
             let http = self.http.clone();
             let store = self.store.clone();
+            let credentials = self.provider.credentials.clone();
             adapters.extensions = tokio::task::spawn_blocking(move || {
                 extensions::load(
                     ws,
@@ -293,6 +314,7 @@ impl ServiceFactory for Services {
                     scheduler,
                     http,
                     store,
+                    credentials,
                 )
             })
             .await
@@ -302,6 +324,7 @@ impl ServiceFactory for Services {
             }
             let mut names = adapters.available_names();
             names.push("task".into());
+            names.push("explore".into());
             registry.activate(&names, &names.iter().cloned().collect())?;
             let mut tools: Vec<_> = registry
                 .public_tools()
@@ -362,11 +385,18 @@ impl ServiceFactory for Services {
                 origin: input.target.session.as_str().into(),
                 configuration: Configuration {
                     model,
-                    thinking: "off".into(),
+                    thinking: self
+                        .imported_settings
+                        .thinking
+                        .clone()
+                        .unwrap_or_else(|| "off".into()),
                     tools,
                     system_prompt: self.config.system_prompt.clone(),
                     prompt: Some(Arc::new(prompt)),
-                    compiler: CompileOptions::default(),
+                    compiler: CompileOptions {
+                        context_window: self.imported_settings.context.unwrap_or(0),
+                        ..Default::default()
+                    },
                 },
                 provider: self.provider.clone(),
                 tools: runner,
@@ -382,6 +412,9 @@ pub fn timestamp() -> String {
 }
 
 pub struct Host {
+    local_runtime: Option<Arc<dyn crate::provider::http::GenerationRuntime>>,
+    authority: Mutex<crate::cutover::Lease>,
+    endpoint_leases: Mutex<Vec<crate::cutover::EndpointLease>>,
     pub commands: Arc<RuntimeCommands>,
     pub registry: Arc<RuntimeRegistry>,
     pub store: Arc<Store>,
@@ -406,6 +439,7 @@ impl Host {
     /// workspaces cannot be opened through this P12 opt-in boundary.
     pub fn init(path: &Path) -> Result<()> {
         fs::create_dir(path).map_err(crate::io_error)?;
+        crate::cutover::Registry::for_user()?.initialize_isolated(path)?;
         fs::write(
             path.join(".ag1-native-isolated"),
             b"P12 isolated workspace\n",
@@ -413,14 +447,70 @@ impl Host {
         .map_err(crate::io_error)
     }
     pub async fn open(workspace: &Path, state: &Path, config: Config) -> Result<Arc<Self>> {
-        if !workspace.join(".ag1-native-isolated").is_file() {
+        Self::open_with_registry(
+            workspace,
+            state,
+            config,
+            &crate::cutover::Registry::for_user()?,
+        )
+        .await
+    }
+    /// Explicit registry injection supports disposable cutover rehearsals. All
+    /// production clients use the OS-user registry through open.
+    pub async fn open_with_registry(
+        workspace: &Path,
+        state: &Path,
+        config: Config,
+        authority_registry: &crate::cutover::Registry,
+    ) -> Result<Arc<Self>> {
+        Self::open_composed(workspace, state, config, authority_registry, None).await
+    }
+    /// Fixture composition exercises the same generation/drain path with an
+    /// injected runtime controller. Production cannot select this constructor.
+    pub async fn open_rehearsal_with_runtime(
+        workspace: &Path,
+        state: &Path,
+        config: Config,
+        authority_registry: &crate::cutover::Registry,
+        runtime: Arc<dyn crate::provider::http::GenerationRuntime>,
+    ) -> Result<Arc<Self>> {
+        if !config.fixture || config.runtime.is_some() {
             return Err(DomainError::PermissionDenied);
         }
+        Self::open_composed(workspace, state, config, authority_registry, Some(runtime)).await
+    }
+    async fn open_composed(
+        workspace: &Path,
+        state: &Path,
+        config: Config,
+        authority_registry: &crate::cutover::Registry,
+        injected: Option<Arc<dyn crate::provider::http::GenerationRuntime>>,
+    ) -> Result<Arc<Self>> {
         let workspace = WorkspaceService::new()?.register(workspace)?;
         fs::create_dir_all(state).map_err(crate::io_error)?;
         let state = fs::canonicalize(state).map_err(crate::io_error)?;
         if state.starts_with(workspace.root()) || workspace.root().starts_with(&state) {
             return Err(DomainError::PermissionDenied);
+        }
+        let authority = authority_registry.open_native(workspace.root(), &state)?;
+        let imported_session = authority
+            .record()?
+            .transfer
+            .as_ref()
+            .map(|t| t.session.clone());
+        if let Some(transfer) = authority.record()?.transfer.as_ref() {
+            let raw = imported::Input {
+                path: state.join("host.json"),
+                sha256: transfer.config_sha256.clone(),
+            }
+            .read()?;
+            let bound: Config = serde_json::from_slice(&raw).map_err(json_error)?;
+            if ag1_storage::digest(&raw) != transfer.config_sha256
+                || serde_json::to_value(&config).map_err(json_error)?
+                    != serde_json::to_value(bound).map_err(json_error)?
+            {
+                return Err(DomainError::Conflict);
+            }
         }
         if config.models.is_empty() || config.models.len() > 1024 {
             return Err(DomainError::InvalidInput("model catalog".into()));
@@ -454,6 +544,10 @@ impl Host {
             })
             .collect::<Result<Vec<_>>>()?;
         let scheduler = Scheduler::default();
+        let endpoint_leases = authority_registry.endpoint_leases(&origins)?;
+        if !config.fixture && !endpoint_leases.is_empty() && config.runtime.is_none() {
+            return Err(DomainError::Unavailable("Local runtime ownership has not been transferred; an endpoint probe is not an ownership grant".into()));
+        }
         for origin in &origins {
             let url = reqwest::Url::parse(origin)
                 .map_err(|_| DomainError::InvalidInput("endpoint origin".into()))?;
@@ -481,13 +575,18 @@ impl Host {
                 },
             )?;
         }
+        let local_runtime = match &config.runtime {
+            Some(runtime) => Some(runtime.open(&config, &state, authority_registry).await?),
+            None => injected,
+        };
+        let imported_settings = imported::Settings::load(&config, &state)?;
         let store = Arc::new(Store::open(&state.join("store"))?);
         let previous = store.runtime_selection(workspace.id().as_str())?;
         let session = previous
             .as_ref()
             .map(|p| p.selection.session.clone())
-            .unwrap_or_else(|| "initial".into());
-        if previous.is_none() {
+            .unwrap_or_else(|| imported_session.clone().unwrap_or_else(|| "initial".into()));
+        if previous.is_none() && imported_session.is_none() {
             let key = nonce()?;
             store.bootstrap_session(SessionBootstrap {command:"client-bootstrap",session:&session,origin:&session,cursor_key:key.as_bytes(),seed:SessionSeed::Fresh {header:&serde_json::to_vec(&json!({"type":"session","version":3,"id":session,"cwd":workspace.root(),"timestamp":timestamp()})).map_err(json_error)?,records:&[]}})?;
         }
@@ -497,6 +596,7 @@ impl Host {
             credentials: credentials::HostCredentials {
                 providers: config.credentials.clone(),
                 fallback: config.credential_env.clone(),
+                vault: imported::Vault::load(&config, &state).await?,
             },
         });
         let ui = Arc::new(extensions::Ui::default());
@@ -505,8 +605,12 @@ impl Host {
             &state,
             config.tooling.as_ref(),
         )?));
-        let http = ProviderHttp::new(&origins, Duration::from_secs(10))?;
+        let mut http = ProviderHttp::new(&origins, Duration::from_secs(10))?;
+        if let Some(runtime) = &local_runtime {
+            http = http.with_runtime(runtime.clone());
+        }
         let services = Arc::new(Services {
+            imported_settings: imported_settings.clone(),
             scheduler: scheduler.clone(),
             http: http.clone(),
             ui: ui.clone(),
@@ -553,12 +657,19 @@ impl Host {
             RunSettings {
                 max_generations: config.max_generations,
                 models: config.models.clone(),
+                compaction: imported_settings.compaction,
+                retry: imported_settings.retry,
+                steering_mode: imported_settings.steering,
+                follow_up_mode: imported_settings.follow_up,
                 ..Default::default()
             },
             tokio::runtime::Handle::current(),
         )?;
         commands.initialize().await?;
         let host = Arc::new(Self {
+            local_runtime,
+            endpoint_leases: Mutex::new(endpoint_leases),
+            authority: Mutex::new(authority),
             ui,
             uploads: Mutex::new(Default::default()),
             project,
@@ -671,6 +782,10 @@ impl Host {
         self: &Arc<Self>,
         mut envelope: w::CommandEnvelope,
     ) -> Result<w::BridgeFrame> {
+        self.authority
+            .lock()
+            .map_err(|_| DomainError::DurabilityUnknown)?
+            .admit()?;
         envelope
             .version
             .negotiate()
@@ -692,6 +807,10 @@ impl Host {
             envelope.command = self.workflow(args)?;
         }
         let _guard = self.controls.lock().await;
+        self.authority
+            .lock()
+            .map_err(|_| DomainError::DurabilityUnknown)?
+            .admit()?;
         if self.stopping.load(Ordering::Acquire) {
             return Err(DomainError::Unavailable("Client host is stopping".into()));
         }
@@ -835,6 +954,22 @@ impl Host {
             },
         }
     }
+    pub fn check_authority(&self) -> Result<()> {
+        self.authority
+            .lock()
+            .map_err(|_| DomainError::DurabilityUnknown)?
+            .admit()
+    }
+    pub async fn drain_for_cutover(&self) -> Result<()> {
+        {
+            let _guard = self.controls.lock().await;
+            self.authority
+                .lock()
+                .map_err(|_| DomainError::DurabilityUnknown)?
+                .begin_drain()?;
+        }
+        self.shutdown().await
+    }
     pub async fn shutdown(&self) -> Result<()> {
         let _guard = self.controls.lock().await;
         self.terminal_command("stop", &json!({}))?;
@@ -886,6 +1021,17 @@ impl Host {
         if let Some(driver) = self.driver.lock().await.take() {
             driver.await.map_err(|_| DomainError::DurabilityUnknown)?;
         }
+        if let Some(runtime) = &self.local_runtime {
+            runtime.shutdown().await?;
+        }
+        self.authority
+            .lock()
+            .map_err(|_| DomainError::DurabilityUnknown)?
+            .quiesced()?;
+        self.endpoint_leases
+            .lock()
+            .map_err(|_| DomainError::DurabilityUnknown)?
+            .clear();
         Ok(())
     }
 }

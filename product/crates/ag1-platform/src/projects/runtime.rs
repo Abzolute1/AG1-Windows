@@ -58,6 +58,14 @@ struct Running {
     launch: Launch,
     record: Operation,
 }
+struct WriterLease(fs::File);
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // Another thread can fork while this descriptor is open. Closing only
+        // our copy leaves flock held until that child's pre-exec copy closes.
+        let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
 /// The caller serializes this owner with its existing session/command actor.
 /// Dropping it disconnects P03 groups; history never grants process control.
 pub struct Runtime {
@@ -68,8 +76,10 @@ pub struct Runtime {
     state: Arc<Workspace>,
     running: Option<Running>,
     serial: u64,
-    _writer: fs::File,
     display: Option<super::display::NativeDisplay>,
+    git_source: Option<crate::git::GitService>,
+    // Release only after owned project processes and display have dropped.
+    _writer: WriterLease,
 }
 fn invalid(s: &str) -> DomainError {
     DomainError::InvalidInput(s.into())
@@ -111,6 +121,7 @@ impl Runtime {
         if unsafe { libc::flock(writer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(DomainError::Conflict);
         }
+        let writer = WriterLease(writer);
         let identity = if state.exists("project.json")? {
             serde_json::from_slice::<Value>(&state.snapshot("project.json", 65536)?.bytes)
                 .map_err(|_| invalid("retained corrupt project catalog"))?
@@ -162,6 +173,7 @@ impl Runtime {
             serial,
             _writer: writer,
             display: None,
+            git_source: None,
         };
         runtime.discover()?;
         Ok(runtime)
@@ -203,7 +215,49 @@ impl Runtime {
     }
     pub fn discover(&mut self) -> Result<(), DomainError> {
         self.workspace.verify_root()?;
-        let paths = self.workspace.scan(1000)?;
+        // Target discovery concerns root manifests and Tauri configuration.
+        // Unrelated source, caches and archived environments must not prevent
+        // opening a project. Execution still binds its full source revision.
+        let roots = self.workspace.directory_entries("")?;
+        let mut paths: Vec<String> = roots
+            .iter()
+            .filter(|e| !e.directory && !e.symlink)
+            .map(|e| e.name.clone())
+            .collect();
+        if roots
+            .iter()
+            .any(|e| e.name == "src-tauri" && e.directory && !e.symlink)
+        {
+            let mut pending = vec!["src-tauri".to_owned()];
+            let mut visited = 0;
+            while let Some(directory) = pending.pop() {
+                visited += 1;
+                if visited > 1000 || directory.split('/').count() > 32 {
+                    return Err(DomainError::LimitExceeded(
+                        "Tauri configuration traversal".into(),
+                    ));
+                }
+                for entry in self.workspace.directory_entries(&directory)? {
+                    if entry.symlink
+                        || [".git", "node_modules", "target", ".ag1"].contains(&entry.name.as_str())
+                    {
+                        continue;
+                    }
+                    let path = format!("{directory}/{}", entry.name);
+                    if entry.directory {
+                        pending.push(path);
+                    } else if path.ends_with(".json") || path.ends_with(".toml") {
+                        if paths.len() >= 10000 {
+                            return Err(DomainError::LimitExceeded(
+                                "Tauri configuration files".into(),
+                            ));
+                        }
+                        paths.push(path);
+                    }
+                }
+            }
+        }
+        paths.sort();
         let mut targets = vec![];
         for (manifest, kind, tool) in [
             ("package.json", Kind::Web, &self.toolchains.node),
@@ -309,6 +363,42 @@ impl Runtime {
         Ok(())
     }
     pub fn revision(&self) -> Result<String, DomainError> {
+        if let Some(git) = &self.git_source {
+            let files = git.files_bounded(&self.workspace, 10000)?;
+            let mut rows = Vec::new();
+            let mut total = 0u64;
+            for path in &files {
+                let revision =
+                    self.workspace
+                        .stream(path, crate::workspace::MAX_STREAM_READ, |bytes| {
+                            total += bytes.len() as u64;
+                            if total > 1024 * 1024 * 1024 {
+                                return Err(DomainError::LimitExceeded(
+                                    "Project source revision bytes".into(),
+                                ));
+                            }
+                            Ok(())
+                        });
+                match revision {
+                    Ok(r) => rows.push(json!([
+                        path,
+                        r.sha256,
+                        r.size,
+                        r.device,
+                        r.inode,
+                        r.modified_ns.to_string(),
+                        r.changed_ns.to_string()
+                    ])),
+                    Err(DomainError::NotFound) => rows.push(json!([path, "deleted"])),
+                    Err(error) => return Err(error),
+                }
+            }
+            if git.files_bounded(&self.workspace, 10000)? != files {
+                return Err(DomainError::Conflict);
+            }
+            self.workspace.verify_root()?;
+            return Ok(digest(&document(&rows)?));
+        }
         let files = self.workspace.scan(1000)?;
         let index = self.workspace.index_paths(&files, 16 * 1024 * 1024)?;
         let rows: Vec<_> = index
@@ -328,6 +418,23 @@ impl Runtime {
             .collect();
         self.workspace.verify_root()?;
         Ok(digest(&document(&rows)?))
+    }
+    /// Git projects use the existing P03 tracked/untracked source inventory.
+    /// Ignored dependencies and archived environments are not build inputs in
+    /// that inventory. Every included file still participates in the revision.
+    pub fn bind_git_source(&mut self, helper: &Path, git: &Path) -> Result<(), DomainError> {
+        if self.running.is_some() {
+            return Err(DomainError::Conflict);
+        }
+        if self
+            .workspace
+            .directory_entries("")?
+            .iter()
+            .any(|e| e.name == ".git" && !e.symlink)
+        {
+            self.git_source = Some(crate::git::GitService::new(helper, git, self.state.root())?);
+        }
+        Ok(())
     }
     pub fn command(&self, kind: Kind, action: &str) -> Result<Vec<Command>, DomainError> {
         let command = |executable: &Option<PathBuf>,

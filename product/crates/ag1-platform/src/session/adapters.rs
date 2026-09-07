@@ -80,6 +80,7 @@ impl NativeAdapters {
         }
         if self.delegation.is_some() {
             names.push("task");
+            names.push("explore");
         }
         if self.git.is_some() {
             names.push("diff");
@@ -198,6 +199,12 @@ impl NativeAdapters {
                 let service = self.delegation.clone().ok_or_else(missing)?;
                 let plan = Box::new(service.prepare(call, context.scope, context.journal)?);
                 PreparedAdapter::Delegation { service, plan }
+            }
+            "explore" => {
+                let service = self.delegation.clone().ok_or_else(missing)?;
+                let plan =
+                    Box::new(service.prepare_explore(call, context.scope, context.journal)?);
+                PreparedAdapter::Explore { service, plan }
             }
             "read" | "write" | "edit" | "append" | "editPreview" | "editApply" => {
                 PreparedAdapter::File {
@@ -321,6 +328,10 @@ impl<'a> AdapterContext<'a> {
     }
 }
 pub(super) enum PreparedAdapter {
+    Explore {
+        service: Arc<super::subagent_tool::DelegationService>,
+        plan: Box<super::subagent_tool::PreparedExplore>,
+    },
     Extension(Arc<super::extensions::NativeExtensions>),
     Project {
         service: Arc<std::sync::Mutex<crate::projects::ProjectPort>>,
@@ -390,6 +401,7 @@ impl PreparedAdapter {
             Self::Extension(service) => service.target_revision(),
             Self::SubmitPlan => "submit-plan-v1".into(),
             Self::Delegation { plan, .. } => plan.target_revision().into(),
+            Self::Explore { plan, .. } => plan.target_revision().into(),
             Self::Web { service, search } => {
                 if *search {
                     service
@@ -432,6 +444,7 @@ impl PreparedAdapter {
             Self::Project { .. } => true,
             Self::Extension(_) => true,
             Self::Delegation { .. } => true,
+            Self::Explore { .. } => true,
             Self::Memory { plan, .. } => plan.may_mutate(),
             Self::Task { plan, .. } => plan.may_mutate(),
             Self::Todo { plan, .. } => plan.may_mutate(),
@@ -544,6 +557,9 @@ impl PreparedAdapter {
             }
             Self::Delegation { service, plan } => {
                 service.execute(*plan, authorization, context.file(), artifacts)
+            }
+            Self::Explore { service, plan } => {
+                service.execute_explore(*plan, authorization, context.file(), artifacts)
             }
             Self::Memory { service, plan } => {
                 service.execute(*plan, authorization, context.file(), context.loaded_memory)

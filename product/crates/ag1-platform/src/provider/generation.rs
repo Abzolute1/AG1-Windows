@@ -146,9 +146,6 @@ async fn generation_with_admission(
             None,
         ));
     }
-    let started = Instant::now();
-    let hard_deadline =
-        (limits.overall_ms != 0).then(|| started + Duration::from_millis(limits.overall_ms));
     let prepared = (|| {
         http.validate_request(&generation.request)?;
         if cancel.cancelled() {
@@ -175,6 +172,18 @@ async fn generation_with_admission(
         permit.terminal().map_err(|e| failure(e, None))?;
         return Err(failure(error, None));
     }
+    if let Err(error) = http
+        .prepare_generation(&generation.request, None, cancel)
+        .await
+    {
+        // No provider request was dispatched. Custody cancellation drains its
+        // owned load separately; this generation has no uncertain HTTP outcome.
+        permit.terminal().map_err(|e| failure(e, None))?;
+        return Err(failure(error, None));
+    }
+    let started = Instant::now();
+    let hard_deadline =
+        (limits.overall_ms != 0).then(|| started + Duration::from_millis(limits.overall_ms));
     let deadline = |reducer: &StreamReducer| {
         reducer
             .watchdog_deadline_ms(limits.prefill_ms, limits.idle_ms)
@@ -383,6 +392,13 @@ pub async fn nvidia_preflight(
         return Err(error);
     }
     let deadline = Instant::now() + Duration::from_secs(30);
+    if let Err(error) = http
+        .prepare_generation(&request, Some(deadline), cancel)
+        .await
+    {
+        permit.terminal()?;
+        return Err(error);
+    }
     let mut response = http.send(request, deadline, cancel).await?;
     let status = response.status();
     while response.chunk(deadline, cancel).await?.is_some() {}

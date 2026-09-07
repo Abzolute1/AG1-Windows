@@ -727,12 +727,9 @@ impl Store {
             |r| r.get(0),
         )?;
         let evicted: u64 = db.query_row("SELECT count(*) FROM evictions", [], |r| r.get(0))?;
-        let safe = corrupt == 0
-            && foreign_roots == 0
-            && unknown == 0
-            && ambiguous == 0
-            && uncertain == 0
-            && evicted == 0;
+        let structural =
+            corrupt == 0 && foreign_roots == 0 && unknown == 0 && ambiguous == 0 && evicted == 0;
+        let safe = structural && uncertain == 0;
         if require_compatible && !safe {
             return Err(StorageError::Unsupported("Unsafe original-runtime resume: corrupt memory, unknown entry type or inherited origin keys; use lossless archive".into()));
         }
@@ -762,10 +759,12 @@ impl Store {
                 let (path, hash) = row?;
                 write(&format!("original/{path}"), &self.blob_bytes(&hash)?)?;
             }
-            let mut q = db.prepare("SELECT id FROM sessions ORDER BY id")?;
-            for row in q.query_map([], |r| r.get::<_, String>(0))? {
-                let session = row?;
+            let mut session_index = Vec::new();
+            let mut q = db.prepare("SELECT id,archived FROM sessions ORDER BY id")?;
+            for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))? {
+                let (session, archived) = row?;
                 let snap = Self::snapshot_db(&db, &session)?;
+                session_index.push(json!({"id":session,"archived":archived,"leaf":snap.leaf}));
                 let mut bytes = snap.header;
                 bytes.push(b'\n');
                 for e in snap.entries {
@@ -774,6 +773,7 @@ impl Store {
                 }
                 write(&format!("compatible/sessions/{session}.jsonl"), &bytes)?;
             }
+            write("bridge/sessions.json", &serde_json::to_vec(&session_index)?)?;
             let mut q =
                 db.prepare("SELECT id,normalized FROM memory WHERE status='valid' ORDER BY id")?;
             for row in q.query_map([], |r| {
@@ -803,7 +803,7 @@ impl Store {
                     params![origin, id],
                     |r| r.get(0),
                 )?;
-                let origin: String = if safe {
+                let origin: String = if structural {
                     db.query_row("SELECT session FROM origins WHERE id=?1", [&origin], |r| {
                         r.get(0)
                     })?
@@ -827,7 +827,7 @@ impl Store {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
             })? {
                 let (id, key) = row?;
-                let id: String = if safe {
+                let id: String = if structural {
                     db.query_row("SELECT session FROM origins WHERE id=?1", [&id], |r| {
                         r.get(0)
                     })?
@@ -836,7 +836,7 @@ impl Store {
                 };
                 write(&format!("compatible/artifacts/{id}/cursor-key-v1"), &key)?;
             }
-            if safe {
+            if structural {
                 let mut sessions = db.prepare("SELECT id FROM sessions ORDER BY id")?;
                 for session in sessions.query_map([], |r| r.get::<_, String>(0))? {
                     let session = session?;
@@ -854,11 +854,72 @@ impl Store {
                     )?;
                 }
             }
+            // The P13 bridge can inspect interrupted receipts without treating
+            // them as executable commands. Original-runtime compatibility above
+            // remains stricter; the new projection never changes native records.
+            let mut index = Vec::new();
+            let mut query = db.prepare(
+                "SELECT id,fingerprint,state,intent,result,sequence FROM commands ORDER BY id",
+            )?;
+            for row in query.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, Option<Vec<u8>>>(4)?,
+                    r.get::<_, u64>(5)?,
+                ))
+            })? {
+                let (id, fingerprint, state, intent, result, sequence) = row?;
+                if digest(&intent) != fingerprint {
+                    return Err(StorageError::Corrupt("Command intent digest".into()));
+                }
+                let path = format!("bridge/receipts/{}.json", digest(id.as_bytes()));
+                write(
+                    &path,
+                    &serde_json::to_vec(
+                        &json!({"version":1,"id":id,"fingerprint":fingerprint,"state":state,"intent":intent,"result":result,"sequence":sequence.to_string(),"replay_allowed":false}),
+                    )?,
+                )?;
+                index.push(json!({"id":id,"path":path}));
+            }
+            write("bridge/receipts.json", &serde_json::to_vec(&index)?)?;
+            let mut index = Vec::new();
+            let mut query = db.prepare("SELECT id FROM memory ORDER BY id")?;
+            for id in query.query_map([], |r| r.get::<_, String>(0))? {
+                let id = id?;
+                index.push(json!({"id":id,"path":format!("compatible/memory/{}.json", digest(id.as_bytes()))}));
+            }
+            write("bridge/memory.json", &serde_json::to_vec(&index)?)?;
+            let mut index = Vec::new();
+            let mut query =
+                db.prepare("SELECT kind,id,digest,raw FROM metadata ORDER BY kind,id")?;
+            for row in query.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            })? {
+                let (kind, id, hash, raw) = row?;
+                if digest(&raw) != hash {
+                    return Err(StorageError::Corrupt("Metadata digest".into()));
+                }
+                let path = format!(
+                    "bridge/metadata/{}.json",
+                    digest(&serde_json::to_vec(&(&kind, &id))?)
+                );
+                write(&path, &raw)?;
+                index.push(json!({"kind":kind,"id":id,"path":path}));
+            }
+            write("bridge/metadata.json", &serde_json::to_vec(&index)?)?;
         }
         let sqlite = fs::read(temp.path().join("storage.sqlite"))?;
         File::open(temp.path().join("storage.sqlite"))?.sync_all()?;
         files.push(json!({"path":"storage.sqlite","sha256":digest(&sqlite),"bytes":sqlite.len()}));
-        let manifest = json!({"version":1,"kind":"ag1-shadow-lossless-export","schema":1,"compatible_resume":safe,"runtime_authority":"historical-only","files":files});
+        let manifest = json!({"version":1,"kind":"ag1-shadow-lossless-export","schema":1,"compatible_resume":safe,"bridge_compatible_resume":structural,"runtime_authority":"historical-only","files":files});
         let mut f = File::create(temp.path().join("export.json"))?;
         f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
         f.sync_all()?;

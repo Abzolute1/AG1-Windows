@@ -33,6 +33,7 @@ import { navigateSession } from "./sessionNavigation";
 import { ExtensionUI } from "./ExtensionUI";
 import { NativeConversation } from "./NativeConversation";
 import { NativeDetails, Blocks } from "./NativeDetails";
+import { RecoveryPanel, type Recovery } from "./RecoveryPanel";
 import { previewDocument } from "./preview";
 const Editor = lazy(() => import("./Editor"));
 type Page = "home" | "chat" | "files" | "diff" | "settings";
@@ -48,6 +49,7 @@ export default function App() {
     [projectDialog, setProjectDialog] = useState(false),
     [quitDialog, setQuitDialog] = useState(false),
     [answer, setAnswer] = useState("");
+  const [recovery, setRecovery] = useState<Recovery | null>(null);
   const [editorReset, setEditorReset] = useState(0);
   const [attachments, setAttachments] = useState<File[]>([]);
   const [requestPage, setRequestPage] = useState<{
@@ -157,7 +159,15 @@ export default function App() {
 
   async function openProject(project: string) {
     if (dirty) throw new Error("Save or discard your file changes before switching projects");
-    const next = await api.open(project);
+    let next: View;
+    try {
+      next = await api.open(project);
+      setRecovery(null);
+    } catch (error) {
+      setRecovery(await api.recovery(project).catch(() => null));
+      setProjectDialog(false);
+      throw error;
+    }
     setView(next);
     setViewer(null);
     setPage("chat");
@@ -314,6 +324,7 @@ export default function App() {
             </button>
           </div>
         )}
+        {recovery && <RecoveryPanel record={recovery} onClose={() => setRecovery(null)} />}
         {view.details && <ExtensionShortcuts key={`shortcuts/${active?.scope.session}`} run={run} />}
         {view.details && <ExtensionUI activity={view.details.activity} run={run} key={`extension-ui/${active?.scope.session}`} onEditor={(text, paste) => setDraft(current => paste ? current + text : text)} />}
         {view.details && active && <NativeDetails details={view.details} status={active.status} model={active.model} run={run} onEditor={text => setDraft(current => current === draft ? text : current)} />}

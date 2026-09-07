@@ -12,6 +12,10 @@ use std::{
 };
 use tokio::time::Instant;
 
+// These independent cases share the production process-wide fetch semaphore.
+// Serialize case setup; concurrency exercised inside a case remains unchanged.
+static WEB_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn request(stream: &mut TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -77,6 +81,7 @@ impl WebResolver for Resolver {
 }
 #[test]
 fn addresses_urls_and_credentials_are_checked_before_network_access() {
+    let _case = WEB_CASE.blocking_lock();
     let denied = [
         "0.1.2.3",
         "10.1.1.1",
@@ -215,6 +220,7 @@ fn addresses_urls_and_credentials_are_checked_before_network_access() {
 }
 #[tokio::test]
 async fn pinned_dns_relative_redirect_and_provenance_use_only_checked_destinations() {
+    let _case = WEB_CASE.lock().await;
     let (port, task) = server(2, |index, input| {
         if index == 0 {
             assert!(input.starts_with("GET /start "));
@@ -271,6 +277,7 @@ async fn pinned_dns_relative_redirect_and_provenance_use_only_checked_destinatio
 }
 #[tokio::test]
 async fn redirect_cannot_expand_private_origin_exception_or_embed_credentials() {
+    let _case = WEB_CASE.lock().await;
     for destination in [
         "http://127.0.0.1:1/private",
         "http://secret@fixture.invalid/",
@@ -300,6 +307,7 @@ async fn redirect_cannot_expand_private_origin_exception_or_embed_credentials() 
 }
 #[tokio::test]
 async fn body_length_stream_limit_partial_eof_redirect_loop_and_http_errors_settle() {
+    let _case = WEB_CASE.lock().await;
     let cases = [
         (
             format!(
@@ -380,6 +388,7 @@ async fn body_length_stream_limit_partial_eof_redirect_loop_and_http_errors_sett
 }
 #[tokio::test]
 async fn cancellation_and_deadline_cover_dns_headers_and_body() {
+    let _case = WEB_CASE.lock().await;
     struct SlowDns;
     impl WebResolver for SlowDns {
         fn resolve<'a>(&'a self, _: &'a str, _: u16) -> PortFuture<'a, Vec<IpAddr>> {
@@ -472,6 +481,7 @@ async fn cancellation_and_deadline_cover_dns_headers_and_body() {
 
 #[test]
 fn reference_url_policy_cases_preserve_rules_and_name_security_corrections() {
+    let _case = WEB_CASE.blocking_lock();
     let oracle: serde_json::Value = serde_json::from_str(include_str!(
         "../../../../fixtures/tools/webfetch-oracle.json"
     ))
@@ -522,6 +532,7 @@ fn reference_url_policy_cases_preserve_rules_and_name_security_corrections() {
 
 #[test]
 fn approved_fetch_persists_full_untrusted_evidence_and_replays_without_network() {
+    let _case = WEB_CASE.blocking_lock();
     use ag1_core::{
         Clock, SessionId,
         context::{ContextArtifactPort, features::Features},
@@ -743,6 +754,7 @@ fn approved_fetch_persists_full_untrusted_evidence_and_replays_without_network()
 
 #[tokio::test]
 async fn compressed_entities_are_bounded_after_decoding_and_match_reference_projections() {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use base64::{Engine, engine::general_purpose::STANDARD};
     use sha2::{Digest, Sha256};
@@ -903,6 +915,7 @@ fn fixed_resolver() -> Resolver {
 }
 #[tokio::test]
 async fn real_tls_checks_hostname_and_chain_and_strips_credentials_on_cross_host_redirect() {
+    let _case = WEB_CASE.lock().await;
     let (port, certificate, task) = tls_server(2, |index, input, port| {
         if index == 0 {
             assert!(
@@ -1074,6 +1087,7 @@ impl ToolFixture {
 #[tokio::test]
 async fn selected_fetch_content_types_docs_hints_and_complete_event_coverage_reach_native_results()
 {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use ag1_platform::web_tools::{WebExecution, WebService};
     use serde_json::json;
@@ -1171,6 +1185,7 @@ async fn selected_fetch_content_types_docs_hints_and_complete_event_coverage_rea
 #[tokio::test]
 async fn selected_search_default_missing_brave_key_and_positive_lite_fallback_execute_native_http()
 {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use ag1_platform::web_tools::{
         SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
@@ -1273,6 +1288,7 @@ async fn selected_search_default_missing_brave_key_and_positive_lite_fallback_ex
 
 #[tokio::test]
 async fn native_brave_search_sends_only_host_supplied_https_key_and_retains_provider_body() {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::{
         context::ContextArtifactPort,
         tools::{executor::ExecutionArtifacts, research},
@@ -1368,6 +1384,7 @@ async fn native_brave_search_sends_only_host_supplied_https_key_and_retains_prov
 }
 #[tokio::test]
 async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executable() {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use ag1_platform::web_tools::{
         SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
@@ -1476,6 +1493,7 @@ async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executa
 
 #[tokio::test]
 async fn stale_approval_foreign_epoch_and_precancelled_search_never_resolve_or_connect() {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
     use serde_json::json;
@@ -1548,6 +1566,7 @@ async fn stale_approval_foreign_epoch_and_precancelled_search_never_resolve_or_c
 
 #[test]
 fn active_search_cancellation_commits_one_no_effect_outcome_without_late_hints_or_retry() {
+    let _case = WEB_CASE.blocking_lock();
     use ag1_core::{
         Clock,
         tools::{
@@ -1665,6 +1684,7 @@ fn active_search_cancellation_commits_one_no_effect_outcome_without_late_hints_o
 #[tokio::test]
 async fn named_web_credentials_reject_unknown_and_foreign_hosts_before_dns_without_secret_disclosure()
  {
+    let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use ag1_platform::web_tools::{WebExecution, WebService};
     use serde_json::json;

@@ -83,12 +83,34 @@ struct View {
     progress: String,
 }
 pub struct Worker {
+    runtime_lease: Option<ag1_platform::cutover::EndpointLease>,
+    authority: Option<ag1_platform::cutover::Lease>,
     tx: mpsc::SyncSender<Control>,
     view: Arc<Mutex<View>>,
-    thread: Option<thread::JoinHandle<()>>,
+    thread: Option<thread::JoinHandle<bool>>,
 }
 impl Worker {
     pub fn spawn(spec: ProcessSpec, helper: &Path, spool: &Path) -> Result<Self> {
+        Self::spawn_guarded(spec, helper, spool, None)
+    }
+    pub fn spawn_authorized(
+        spec: ProcessSpec,
+        helper: &Path,
+        spool: &Path,
+        authority: ag1_platform::cutover::Lease,
+    ) -> Result<Self> {
+        authority.admit().map_err(err)?;
+        if authority.record().map_err(err)?.owner != ag1_platform::cutover::Owner::TypeScript {
+            return Err("TS worker requires TS execution authority".into());
+        }
+        Self::spawn_guarded(spec, helper, spool, Some(authority))
+    }
+    fn spawn_guarded(
+        spec: ProcessSpec,
+        helper: &Path,
+        spool: &Path,
+        authority: Option<ag1_platform::cutover::Lease>,
+    ) -> Result<Self> {
         let process = ProcessSupervisor::new(helper)
             .map_err(err)?
             .spawn_protocol(spec, spool)
@@ -98,12 +120,17 @@ impl Worker {
         let actor_view = view.clone();
         let thread = thread::spawn(move || actor(process, rx, actor_view));
         Ok(Self {
+            runtime_lease: None,
+            authority,
             tx,
             view,
             thread: Some(thread),
         })
     }
     pub fn command(&self, envelope: CommandEnvelope) -> Result<BridgeFrame> {
+        if let Some(lease) = &self.authority {
+            lease.admit().map_err(err)?;
+        }
         envelope.version.negotiate().map_err(err)?;
         if serde_json::to_vec(&WireMessage::Command(envelope.clone()))
             .map_err(err)?
@@ -132,8 +159,34 @@ impl Worker {
             let (tx, rx) = mpsc::sync_channel(1);
             let _ = self.tx.send(Control::Stop(tx));
             let _ = rx.recv_timeout(Duration::from_secs(8));
-            let _ = thread.join();
+            let quiescent = thread.join().unwrap_or(false);
+            if quiescent {
+                self.runtime_lease.take();
+            }
+            if quiescent && let Some(lease) = self.authority.as_mut() {
+                // Failure leaves the marker non-quiescent and blocks transfer.
+                let _ = lease.quiesced();
+            }
         }
+    }
+    pub fn drain_for_cutover(&mut self) -> Result<()> {
+        self.authority
+            .as_mut()
+            .ok_or("Worker has no workspace authority lease")?
+            .begin_drain()
+            .map_err(err)?;
+        self.stop();
+        if !self
+            .authority
+            .as_ref()
+            .unwrap()
+            .record()
+            .map_err(err)?
+            .quiescent
+        {
+            return Err("Worker drain requires recovery".into());
+        }
+        Ok(())
     }
 }
 impl Drop for Worker {
@@ -141,7 +194,7 @@ impl Drop for Worker {
         self.stop();
     }
 }
-fn actor(mut process: OwnedProcess, rx: mpsc::Receiver<Control>, view: Arc<Mutex<View>>) {
+fn actor(mut process: OwnedProcess, rx: mpsc::Receiver<Control>, view: Arc<Mutex<View>>) -> bool {
     let mut pending: HashMap<String, mpsc::SyncSender<Result<BridgeFrame>>> = HashMap::new();
     let mut incoming = Vec::new();
     let mut outgoing = Vec::new();
@@ -244,13 +297,15 @@ fn actor(mut process: OwnedProcess, rx: mpsc::Receiver<Control>, view: Arc<Mutex
     for (_, answer) in pending {
         let _ = answer.send(Err(detail.clone()));
     }
-    let _ = process.stop();
+    let quiescent = process.stop().is_ok();
     if let Some((_, answer)) = stop {
         let _ = answer.send(());
     }
+    quiescent
 }
 
 pub struct Desktop {
+    pub transition: tokio::sync::Mutex<()>,
     pub native: native_client::NativeClient,
     pub worker: Mutex<Option<Worker>>,
     pub root: PathBuf,
@@ -274,6 +329,7 @@ impl Desktop {
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| "Desktop state already has a writer")?;
         Ok(Self {
+            transition: tokio::sync::Mutex::new(()),
             native: native_client::NativeClient::from_environment()?,
             worker: Mutex::new(None),
             root,
@@ -314,8 +370,29 @@ impl Desktop {
             "{:x}",
             Sha256::digest(workspace.to_string_lossy().as_bytes())
         );
-        let private = self.state.join("workspaces").join(id);
+        let registry = ag1_platform::cutover::Registry::for_user().map_err(err)?;
+        let recorded = registry.inspect(&workspace).map_err(err)?;
+        let private = match recorded.as_ref() {
+            Some(record)
+                if record.owner == ag1_platform::cutover::Owner::TypeScript
+                    && record.rollback.is_some() =>
+            {
+                record
+                    .state
+                    .clone()
+                    .ok_or("Rollback destination is unavailable")?
+            }
+            _ => self.state.join("workspaces").join(id),
+        };
         fs::create_dir_all(&private).map_err(err)?;
+        let runtime_lease = if self.fixture {
+            None
+        } else {
+            Some(registry.runtime_lease().map_err(err)?)
+        };
+        let authority = registry
+            .open_typescript(&workspace, &private)
+            .map_err(err)?;
         let executable = self
             .root
             .join(".local/toolchains/node-v24.14.0-linux-x64/bin/node");
@@ -351,7 +428,7 @@ impl Desktop {
             .tempdir_in(logs)
             .map_err(err)?
             .keep();
-        let worker = Worker::spawn(
+        let mut worker = Worker::spawn_authorized(
             ProcessSpec {
                 resident: false,
                 executable,
@@ -363,7 +440,9 @@ impl Desktop {
             },
             &helper,
             &launch.join("worker.log"),
+            authority,
         )?;
+        worker.runtime_lease = runtime_lease;
         let deadline = Instant::now() + Duration::from_secs(20);
         while worker.view()["snapshot"].is_null() {
             if !worker.view()["error"].is_null() {

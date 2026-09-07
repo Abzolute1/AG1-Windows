@@ -149,6 +149,7 @@ pub(super) fn load(
     scheduler: Scheduler,
     http: ProviderHttp,
     store: Arc<Store>,
+    credentials: credentials::HostCredentials,
 ) -> Result<Option<Arc<NativeExtensions>>> {
     let Some(options) = &config.extensions else {
         return Ok(None);
@@ -201,10 +202,6 @@ pub(super) fn load(
     )?;
     let allow_inference = options.allow_inference;
     let models = config.models.clone();
-    let credentials = credentials::HostCredentials {
-        providers: config.credentials.clone(),
-        fallback: config.credential_env.clone(),
-    };
     let owners = resources
         .iter()
         .map(|e| e.path.clone())

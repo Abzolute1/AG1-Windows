@@ -31,6 +31,7 @@ pub enum Auth {
 pub struct HostCredentials {
     pub providers: BTreeMap<String, Auth>,
     pub fallback: Option<String>,
+    pub(super) vault: Option<super::imported::Vault>,
 }
 fn secret(name: &str) -> Result<SecretBytes> {
     if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
@@ -47,7 +48,29 @@ fn secret(name: &str) -> Result<SecretBytes> {
     ))
 }
 impl HostCredentials {
+    pub(super) async fn resolve_async(&self, model: &Value) -> Result<Credential> {
+        if !self
+            .providers
+            .contains_key(model["provider"].as_str().unwrap_or(""))
+            && let Some(vault) = &self.vault
+            && let Some(value) = vault.resolve(model).await?
+        {
+            return Ok(value);
+        }
+        self.explicit(model)
+    }
     pub fn credential(&self, model: &Value) -> Result<Credential> {
+        if !self
+            .providers
+            .contains_key(model["provider"].as_str().unwrap_or(""))
+            && let Some(vault) = &self.vault
+            && let Some(value) = vault.resolve_blocking(model)?
+        {
+            return Ok(value);
+        }
+        self.explicit(model)
+    }
+    fn explicit(&self, model: &Value) -> Result<Credential> {
         Ok(
             match self
                 .providers

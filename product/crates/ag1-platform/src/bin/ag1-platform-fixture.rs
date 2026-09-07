@@ -7,6 +7,25 @@ use std::{
 #[allow(clippy::zombie_processes)] // The orphan scenario deliberately transfers reaping to the private helper.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(target_os = "linux")]
+    if args.len() == 2 && args[1].parse::<i32>().is_ok() {
+        use std::os::{fd::FromRawFd, unix::net::UnixStream};
+        // Explicit test-only helper: expose a real authenticated process whose
+        // settlement outlasts the generic caller's three-second wait budget.
+        let mut control = unsafe { UnixStream::from_raw_fd(args[1].parse().unwrap()) };
+        let mut length = [0; 4];
+        control.read_exact(&mut length).unwrap();
+        let length = u32::from_le_bytes(length) as usize;
+        assert!(length <= 1024 * 1024);
+        let mut bytes = vec![0; length];
+        control.read_exact(&mut bytes).unwrap();
+        let spec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(spec["argv"], serde_json::json!(["settlement-delay"]));
+        control.write_all(&[1]).unwrap();
+        assert_eq!(control.read(&mut [0]).unwrap(), 0);
+        std::thread::sleep(Duration::from_secs(4));
+        return;
+    }
     match args.get(1).map(String::as_str).unwrap_or("") {
         "package" => package_fixture(&args[2..]),
         "--model" => {

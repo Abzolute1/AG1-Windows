@@ -5,11 +5,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+pub mod custody;
 pub mod discovery;
 pub mod lifecycle;
 #[cfg(target_os = "linux")]
 pub mod native;
 pub mod observation;
+#[cfg(target_os = "linux")]
+pub mod window;
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

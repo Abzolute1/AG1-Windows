@@ -54,6 +54,78 @@ fn seed(store: &Store) {
     store.create_session("parent", &header("parent")).unwrap();
     store.register_origin("origin", "parent", &[7; 32]).unwrap();
 }
+
+#[test]
+fn native_output_origin_creation_preserves_existing_keys_and_rejects_foreign_ownership() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("store");
+    let store = Store::open(&path).unwrap();
+    seed(&store);
+    let id = store.put_artifact(&artifact(1, "utf8")).unwrap();
+    let cursor = store.cursor("parent", "origin", &id, 0, 5).unwrap();
+    let sequence = store.sequence().unwrap();
+    assert!(!store.ensure_output_origin("origin", "parent").unwrap());
+    assert_eq!(store.sequence().unwrap(), sequence);
+    store.create_session("other", &header("other")).unwrap();
+    assert!(store.ensure_output_origin("origin", "other").is_err());
+    assert!(store.ensure_output_origin("missing", "missing").is_err());
+    assert!(store.ensure_output_origin("other", "other").unwrap());
+    let sequence = store.sequence().unwrap();
+    assert!(!store.ensure_output_origin("other", "other").unwrap());
+    assert_eq!(store.sequence().unwrap(), sequence);
+    assert!(store.read_cursor("parent", &cursor).is_ok());
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert!(!store.ensure_output_origin("other", "other").unwrap());
+    assert_eq!(store.cursor("parent", "origin", &id, 0, 5).unwrap(), cursor);
+    assert!(store.read_cursor("other", &cursor).is_err());
+}
+
+#[test]
+fn quiescent_inspection_is_read_only_and_does_not_recover_pending_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("store");
+    assert!(Store::inspect_quiescent(&path, "parent").is_err());
+    assert!(!path.exists());
+    let store = Store::open(&path).unwrap();
+    seed(&store);
+    let expected = store.snapshot("parent").unwrap();
+    assert!(Store::inspect_quiescent(&path, "parent").is_err());
+    drop(store);
+    fs::write(path.join("staging/unpublished"), b"retain staged bytes").unwrap();
+    let before = fs::read(path.join("storage.sqlite")).unwrap();
+    let (health, snapshot) = Store::inspect_quiescent(&path, "parent").unwrap();
+    assert_eq!(snapshot.sequence, expected.sequence);
+    assert_eq!(health.staged_files, 1);
+    assert_eq!(fs::read(path.join("storage.sqlite")).unwrap(), before);
+    assert_eq!(
+        fs::read(path.join("staging/unpublished")).unwrap(),
+        b"retain staged bytes"
+    );
+    assert!(!path.join("quarantine/unpublished").exists());
+    let db = rusqlite::Connection::open(path.join("storage.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO commands(id,fingerprint,state,intent,sequence) VALUES('pending','fixture-fingerprint','intent',?1,1)",
+        [b"pending bytes".as_slice()],
+    )
+    .unwrap();
+    drop(db);
+    let before = fs::read(path.join("storage.sqlite")).unwrap();
+    assert!(Store::inspect_quiescent(&path, "parent").is_err());
+    assert_eq!(fs::read(path.join("storage.sqlite")).unwrap(), before);
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("storage.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row("SELECT state FROM commands WHERE id='pending'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .unwrap(),
+        "intent"
+    );
+}
 fn artifact(id: usize, encoding: &str) -> ArtifactInput {
     let mut bytes = "first\r\nneedle β 🦙 final\n".as_bytes().to_vec();
     if encoding == "binary" {

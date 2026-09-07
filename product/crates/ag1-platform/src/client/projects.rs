@@ -11,12 +11,14 @@ pub(super) fn load(
     };
     let private = state.join("project");
     fs::create_dir_all(&private).map_err(crate::io_error)?;
-    Ok(Some(crate::projects::Runtime::load(
+    let mut runtime = crate::projects::Runtime::load(
         workspace.clone(),
         WorkspaceService::new()?.register(&private)?,
         &tooling.process_host,
         tooling.targets.clone(),
-    )?))
+    )?;
+    runtime.bind_git_source(&tooling.process_host, &tooling.git)?;
+    Ok(Some(runtime))
 }
 pub(super) fn poll(
     runtime: &mut crate::projects::Runtime,
@@ -44,6 +46,7 @@ impl Host {
         scope: &w::Scope,
         f: impl FnOnce(&crate::projects::Runtime) -> Result<T>,
     ) -> Result<T> {
+        self.check_authority()?;
         if self.commands.snapshot()?.scope != *scope || self.commands.client_transition_pending()? {
             return Err(DomainError::Conflict);
         }

@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::time::Instant;
-fn origin(plan: &LaunchPlan) -> Result<String, DomainError> {
+pub fn origin(plan: &LaunchPlan) -> Result<String, DomainError> {
     let arg = |key: &str| {
         plan.args
             .windows(2)

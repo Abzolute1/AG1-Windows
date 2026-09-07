@@ -50,6 +50,13 @@ pub trait RuntimeHost {
     fn owned_alive(&mut self, handle: &Self::Handle) -> Result<bool, DomainError>;
     /// Returns only after verified exit. Never signals a process found just by port.
     fn stop(&mut self, handle: &mut Self::Handle) -> Result<(), DomainError>;
+    /// Optional authenticated runtime observation, never a control capability.
+    fn resources(
+        &mut self,
+        _handle: &Self::Handle,
+    ) -> Result<Option<serde_json::Value>, DomainError> {
+        Ok(None)
+    }
 }
 pub struct RuntimeController<H: RuntimeHost> {
     host: H,
@@ -77,6 +84,13 @@ impl<H: RuntimeHost> RuntimeController<H> {
     }
     pub fn host_mut(&mut self) -> &mut H {
         &mut self.host
+    }
+    pub fn owned_resources(&mut self) -> Result<Option<serde_json::Value>, DomainError> {
+        let handle = self.owned.as_ref().ok_or(DomainError::PermissionDenied)?;
+        if !self.host.owned_alive(handle)? {
+            return Err(DomainError::Unavailable("Owned runtime exited".into()));
+        }
+        self.host.resources(handle)
     }
     /// Readiness permits external HTTP use; it never installs an ownership handle.
     pub fn observe_external_runtime(
@@ -155,7 +169,17 @@ impl<H: RuntimeHost> RuntimeController<H> {
                 return Err(error);
             }
         }
-        match self.host.observe(plan)? {
+        // A health HTTP deadline is not the owned model's load deadline.
+        // Ownership and liveness were verified above; keep polling a slow
+        // loading child while the composition host enforces its overall bound.
+        let observation = match self.host.observe(plan) {
+            Err(DomainError::TimedOut) => {
+                self.state = RuntimeState::Loading;
+                return Ok(false);
+            }
+            other => other?,
+        };
+        match observation {
             Observation::Healthy(id) if id.matches(plan) => {
                 self.state = RuntimeState::Ready;
                 Ok(true)

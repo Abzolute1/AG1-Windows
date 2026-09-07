@@ -205,6 +205,43 @@ fn authorized(
     Ok((hash, encoding, size))
 }
 impl Store {
+    /// Allocate custody for new native output after resuming a journal without
+    /// an artifact store. Existing origins and cursor keys are never replaced.
+    pub fn ensure_output_origin(&self, origin: &str, session: &str) -> StorageResult<bool> {
+        use std::io::Read;
+        valid_id(origin)?;
+        valid_id(session)?;
+        let mut db = self.conn()?;
+        Self::ready(&db)?;
+        active_session(&db, session)?;
+        let tx = db.transaction()?;
+        let existing: Option<(String, u64)> = tx
+            .query_row(
+                "SELECT session,length(key) FROM origins WHERE id=?1",
+                [origin],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((owner, bytes)) = existing {
+            if owner != session {
+                return Err(StorageError::Denied);
+            }
+            if bytes != 32 {
+                return Err(StorageError::Corrupt("Origin cursor key".into()));
+            }
+            return Ok(false);
+        }
+        let mut key = [0; 32];
+        fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+        tx.execute(
+            "INSERT INTO origins VALUES(?1,?2,?3)",
+            params![origin, session, key.as_slice()],
+        )?;
+        Self::next_sequence(&tx)?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     pub fn register_origin(&self, origin: &str, session: &str, key: &[u8]) -> StorageResult<()> {
         valid_id(origin)?;
         valid_id(session)?;

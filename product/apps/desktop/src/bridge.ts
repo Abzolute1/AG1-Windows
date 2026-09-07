@@ -1,9 +1,11 @@
+import type { Recovery } from "./RecoveryPanel";
 import { invoke } from "@tauri-apps/api/core";
 import type { BridgeSnapshot, BridgeFrame, Command, CommandEnvelope, ClientDetails } from "./generated/protocol";
 export type View = { snapshot: BridgeSnapshot | null; error: string | null; progress: string; details?: ClientDetails };
 export type Catalog = { projects: string[]; theme: "light" | "dark" | "system" };
 export const api = {
   catalog: () => invoke<Catalog>("catalog"),
+  recovery: (path: string) => invoke<Recovery | null>("cutover_status", { path }),
   open: (path: string) => invoke<View>("open_project", { path }),
   view: () => invoke<View>("bridge_view"),
   theme: (theme: string) => invoke<void>("save_preferences", { theme }),

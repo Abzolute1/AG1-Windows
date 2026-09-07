@@ -169,6 +169,16 @@ impl GitService {
         })
     }
     pub fn files(&self, workspace: &Workspace) -> Result<Vec<String>, DomainError> {
+        self.files_bounded(workspace, MAX_FILES)
+    }
+    pub(crate) fn files_bounded(
+        &self,
+        workspace: &Workspace,
+        limit: usize,
+    ) -> Result<Vec<String>, DomainError> {
+        if limit == 0 || limit > 10000 {
+            return Err(DomainError::LimitExceeded("Git file inventory".into()));
+        }
         let _claim = workspace.claim()?;
         let bytes = self.run(
             workspace,
@@ -185,7 +195,7 @@ impl GitService {
             .split(|byte| *byte == 0)
             .filter(|bytes| !bytes.is_empty())
         {
-            if paths.len() >= MAX_FILES {
+            if paths.len() >= limit {
                 return Err(DomainError::LimitExceeded("Git file count".into()));
             }
             paths.push(
@@ -337,13 +347,13 @@ impl GitService {
         let status;
         loop {
             check()?;
-            let bytes = child.read_stdout(32768)?;
+            let (bytes, complete) = child.poll_stdout(32768)?;
             let empty = bytes.is_empty();
             output.extend(bytes);
             if output.len() > max_bytes {
                 return Err(DomainError::LimitExceeded("Git command output".into()));
             }
-            if empty && let Some(exit) = child.try_wait()? {
+            if let Some(exit) = complete {
                 status = exit;
                 break;
             }

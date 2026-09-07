@@ -48,7 +48,7 @@ async fn run() -> Result<u8> {
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "ag1-cli --init NEW_WORKSPACE\nag1-cli --workspace ISOLATED_WORKSPACE --state PRIVATE_STATE --config HOST_CONFIG [--mode jsonl|print] [PROMPT]\nJSONL: versioned Command/Cursor frames; stdout contains only protocol frames. EOF drains accepted work; approval waits require a connected client."
+                    "ag1-cli --init NEW_WORKSPACE\nag1-cli --workspace ADMITTED_WORKSPACE --state PRIVATE_STATE --config HOST_CONFIG [--mode jsonl|print] [PROMPT]\nJSONL: versioned Command/Cursor frames; stdout contains only protocol frames. EOF drains accepted work; approval waits require a connected client."
                 );
                 return Ok(0);
             }

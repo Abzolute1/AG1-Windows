@@ -8,6 +8,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 pub mod checkpoint;
+pub mod explore;
 pub mod routing;
 pub mod tool;
 pub mod tracking;

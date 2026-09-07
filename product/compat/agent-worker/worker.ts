@@ -389,6 +389,13 @@ async function create(file?: string) {
   manager = file
     ? SessionManager.open(file, join(state, "sessions"))
     : SessionManager.create(root, join(state, "sessions"));
+  if (file && fs.existsSync(activePath)) {
+    const saved = JSON.parse(fs.readFileSync(activePath, "utf8"));
+    if (saved.file === file && saved.journal_sha256 === digest(fs.readFileSync(file).toString("utf8"))) {
+      if (saved.leaf === null) manager.resetLeaf();
+      else if (typeof saved.leaf === "string") manager.branch(saved.leaf);
+    }
+  }
   scope = { ...scope, session: manager.getSessionId(), epoch: String(BigInt(scope.epoch) + 1n) };
   const auth = AuthStorage.create(join(state, "agent", "auth.json"));
   if (fixture === "true") auth.setRuntimeApiKey("fixture", "fixture");
@@ -549,7 +556,8 @@ async function create(file?: string) {
       }
     } else schedule();
   });
-  atomic(activePath, { file: manager.getSessionFile(), model: modelId });
+  atomic(activePath, { file: manager.getSessionFile(), model: modelId,
+    leaf: manager.getLeafId(), journal_sha256: digest(fs.readFileSync(manager.getSessionFile()).toString("utf8")) });
 }
 const initial = fs.existsSync(activePath)
   ? JSON.parse(fs.readFileSync(activePath, "utf8")).file
@@ -605,12 +613,38 @@ async function execute(envelope: CommandEnvelope) {
   const prior = ledger.get(id);
   const fingerprint = digest(envelope.command);
   if (prior) {
+    if (prior.migration_receipts)
+      throw new Error("Command ID is reserved by native recovery receipts; inspect command_result. No replay is allowed.");
     if (prior.fingerprint !== fingerprint) throw new Error("Command ID conflict");
     reply(envelope, prior.status, prior, true);
     return;
   }
   if (command.kind === "command_result") {
     reply(envelope, "result", ledger.get(command.command) ?? null, true);
+    return;
+  }
+  if (command.kind === "runtime" && command.action === "migration_status") {
+    const status = JSON.parse(fs.readFileSync(join(state, "native-recovery/status.json"), "utf8"));
+    const rows = JSON.parse(fs.readFileSync(join(state, "native-recovery/receipts.json"), "utf8"));
+    const offset = Number(command.args.offset ?? 0), limit = Number(command.args.limit ?? 50);
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset > rows.length || !Number.isInteger(limit) || limit < 1 || limit > 100)
+      throw new Error("Invalid native recovery page");
+    reply(envelope, "query", { ...status, total: rows.length, receipts: rows.slice(offset, offset + limit),
+      next: offset + limit < rows.length ? String(offset + limit) : null }, false);
+    return;
+  }
+  if (command.kind === "runtime" && command.action === "migration_receipt") {
+    const key = command.args.key;
+    if (typeof key !== "string" || !/^[a-zA-Z0-9_.:-]{1,128}$/.test(key)) throw new Error("Invalid native receipt key");
+    const receipt = JSON.parse(fs.readFileSync(join(state, "native-recovery/receipts", digest(key) + ".json"), "utf8"));
+    if (receipt.id !== key || receipt.replay_allowed !== false) throw new Error("Invalid native receipt");
+    const decode = (bytes: number[] | null) => {
+      if (bytes === null) return null;
+      const raw = Buffer.from(bytes);
+      try { return JSON.parse(raw.toString("utf8")); } catch { return { base64: raw.toString("base64") }; }
+    };
+    reply(envelope, "query", { key, state: receipt.state, replay_allowed: false,
+      evidence: evidence({ ...receipt, intent: decode(receipt.intent), result: decode(receipt.result) }) }, false);
     return;
   }
   if (command.kind === "session" && command.action === "snapshot") {

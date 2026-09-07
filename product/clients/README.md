@@ -11,7 +11,9 @@ product/target/debug/ag1-cli --workspace /absolute/new-isolated-project \
   --state /absolute/new-private-state --config /absolute/host.json --print 'Review this project'
 ```
 
-`--init` requires a new directory. Opening requires its `.ag1-native-isolated` marker and a separate private state directory. Do not point these clients at the original AG1, runtime trees, weights or user configuration. The state has its own writer lock, session selection, artifact custody and private resource home. Native desktop mode is fixed at startup with `AG1_NATIVE_CONFIG=/absolute/host.json`; `AG1_DESKTOP_STATE` selects its private catalog and per-project native states. Switching projects drains owned work. No model generation starts on opening settings, mounting React or selecting a model.
+`--init` requires a new directory and registers its canonical identity with the OS user's private authority registry. The `.ag1-native-isolated` marker alone cannot grant admission. Native opening also requires a separate private state directory; the first open binds that state to the workspace, and another state directory cannot bypass its writer lease. Do not point these clients at the original AG1, runtime trees, weights or user configuration. The state retains its writer lock, session selection, artifact custody and private resource home. `AG1_NATIVE_CONFIG=/absolute/host.json` still selects isolated native desktop mode; a fixture-migrated workspace instead resolves its native destination through the durable authority record. `AG1_DESKTOP_STATE` selects the desktop's private catalog. Switching projects drains owned work. No model generation starts on opening settings, mounting React or selecting a model.
+
+P13 is in progress, with production cutover still disabled. Existing P12 markers without a matching authority registration remain read-only; copying a marker or editing authority JSON is not a migration procedure. See [cutover status and recovery boundaries](CUTOVER.md).
 
 A minimal fixture configuration is:
 
@@ -27,7 +29,7 @@ A minimal fixture configuration is:
 }
 ```
 
-The fixture endpoint must be a fake server owned by the caller. The acceptance harness creates its own server on an ephemeral port; it never contacts a live model. `fixture` labels evidence and is not an endpoint-ownership grant. A production host supplies its admitted model catalog and credential environment bindings. P13 owns transfer from the existing TS/live runtime owner. Never run these isolated clients concurrently with another owner of a local inference endpoint.
+The fixture endpoint must be a fake server owned by the caller. The acceptance harness creates its own server on an ephemeral port; it never contacts a live model. `fixture` labels evidence and is not an endpoint-ownership grant. Local endpoints now have a shared host lease, including across loopback hostname aliases. Production local inference is refused until runtime-control transfer is implemented and accepted; a successful endpoint probe cannot enable it. Remote hosts retain their admitted catalog and credential environment bindings. P13 owns transfer from the existing TS/live runtime owner.
 
 Model metadata uses the P06 API families and request adapters. `credentials` maps provider IDs to environment-only host bindings: `api_key`, `bearer`, `gemini_cli` and `aws` (see `ag1-platform/src/client/credentials.rs`). Credentials are resolved in Rust. They are absent from client projections and HTML exports. OAuth exchange, refresh and custom-provider broker APIs remain the P06/P09 host APIs; this CLI does not substitute a browser login or read the user's credential vault. Runtime metadata and `runtimeConflict` are displayed; selecting a conflicting model fails. Working context limits are durable core configuration, not llama tuning. No client command rebuilds an engine, chooses a stock fallback or rewrites a tuned profile.
 

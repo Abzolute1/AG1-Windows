@@ -188,6 +188,9 @@ def main():
     elif args.phase=='P12':
         from client_gate import execute_p12
         execute_p12()
+    elif args.phase=='P13':
+        from cutover_gate import execute_p13
+        execute_p13()
     else:raise GateError(f'{args.phase} has no implemented gate yet; refusing a placeholder pass')
 
 

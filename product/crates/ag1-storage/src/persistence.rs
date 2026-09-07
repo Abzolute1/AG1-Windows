@@ -253,6 +253,74 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> StorageResult<Vec<u8>> {
 }
 
 impl Store {
+    /// Inspect an existing, quiescent store under its writer lock using a
+    /// read-only SQLite connection. Never initialize, reconcile or recover it.
+    pub fn inspect_quiescent(
+        path: &Path,
+        session: &str,
+    ) -> StorageResult<(Health, crate::JournalSnapshot)> {
+        if !cfg!(target_os = "linux") {
+            return Err(StorageError::Unsupported(
+                "Storage inspection platform not validated".into(),
+            ));
+        }
+        no_symlink(path)?;
+        let root = path.canonicalize()?;
+        for name in [
+            "writer.lock",
+            "storage.sqlite",
+            "blobs",
+            "staging",
+            "quarantine",
+        ] {
+            no_symlink(&root.join(name))?;
+        }
+        for name in ["storage.sqlite-wal", "storage.sqlite-shm"] {
+            if root.join(name).exists() {
+                no_symlink(&root.join(name))?;
+            }
+        }
+        let writer = File::open(root.join("writer.lock"))?;
+        #[cfg(target_os = "linux")]
+        rustix::fs::flock(
+            &writer,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|_| StorageError::Conflict("Destination already has a writer".into()))?;
+        let writer = WriterLease(writer);
+        let db = Connection::open_with_flags(
+            root.join("storage.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        db.execute_batch(
+            "PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000;",
+        )?;
+        let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
+        let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if app != 1095184723 || version != 1 {
+            return Err(StorageError::Unsupported(
+                "Unrecognized inspection database".into(),
+            ));
+        }
+        let pending: u64 = db.query_row(
+            "SELECT count(*) FROM commands WHERE state='intent'",
+            [],
+            |r| r.get(0),
+        )?;
+        if pending != 0 {
+            return Err(StorageError::Conflict(
+                "Unsettled command intents require native recovery".into(),
+            ));
+        }
+        let store = Self {
+            root,
+            db: Mutex::new(db),
+            clock: Arc::new(SystemClock),
+            faults: Arc::new(NoFault),
+            _writer: writer,
+        };
+        Ok((store.inspect_integrity()?, store.snapshot(session)?))
+    }
     pub fn open(path: &Path) -> StorageResult<Self> {
         Self::open_with(path, Arc::new(SystemClock), Arc::new(NoFault))
     }
@@ -530,8 +598,13 @@ impl Store {
         Ok(q.query_map([], |r| r.get::<_, String>(0))?
             .collect::<Result<_, _>>()?)
     }
-    pub fn reconcile(&self) -> StorageResult<Health> {
+    /// Inspect durable closure without moving staging files or rebuilding indexes.
+    pub fn inspect_integrity(&self) -> StorageResult<Health> {
         let db = self.conn()?;
+        let integrity: String = db.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if integrity != "ok" {
+            return Err(StorageError::Corrupt(integrity));
+        }
         let referenced = Self::referenced_blobs(&db)?;
         for hash in &referenced {
             self.verify_blob(hash)?;
@@ -541,6 +614,28 @@ impl Store {
             .filter(|e| !referenced.contains(&e.file_name().to_string_lossy().into_owned()))
             .count();
         let staged_files = fs::read_dir(self.root.join("staging"))?.count();
+        let sequence = db.query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='sequence'",
+            [],
+            |r| r.get(0),
+        )?;
+        let uncertain_commands = db.query_row(
+            "SELECT count(*) FROM commands WHERE state='uncertain'",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(Health {
+            schema: 1,
+            sequence,
+            integrity,
+            orphan_blobs,
+            staged_files,
+            uncertain_commands,
+        })
+    }
+    pub fn reconcile(&self) -> StorageResult<Health> {
+        let health = self.inspect_integrity()?;
+        let db = self.conn()?;
         // Preserve failed publication bytes for diagnosis; no incomplete metadata is invented.
         for entry in fs::read_dir(self.root.join("staging"))? {
             let e = entry?;
@@ -557,24 +652,7 @@ impl Store {
             "INSERT INTO catalog SELECT origin,id,digest FROM artifacts WHERE encoding='utf8'",
             [],
         )?;
-        let sequence = db.query_row(
-            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='sequence'",
-            [],
-            |r| r.get(0),
-        )?;
-        let uncertain_commands = db.query_row(
-            "SELECT count(*) FROM commands WHERE state='uncertain'",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(Health {
-            schema: 1,
-            sequence,
-            integrity: "ok".into(),
-            orphan_blobs,
-            staged_files,
-            uncertain_commands,
-        })
+        Ok(health)
     }
     pub fn metadata(&self, kind: &str, id: &str) -> StorageResult<Option<Vec<u8>>> {
         let db = self.conn()?;

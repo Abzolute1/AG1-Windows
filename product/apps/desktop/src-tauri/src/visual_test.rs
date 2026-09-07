@@ -12,7 +12,20 @@ use std::{
 use tauri::Manager;
 use webkit2gtk::WebViewExt;
 pub fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::var("AG1_FIXTURE_PROVIDER").as_deref() != Ok("1") {
+    let fixture = std::env::var("AG1_FIXTURE_PROVIDER").as_deref() == Ok("1");
+    if let Some(workspace) = std::env::var_os("AG1_CUTOVER_WORKSPACE") {
+        if fixture || std::env::var_os("AG1_NATIVE_CONFIG").is_some() {
+            return Err(
+                "Cutover visual mode requires the recorded production configuration".into(),
+            );
+        }
+        let audit = ag1_platform::cutover::Registry::for_user()
+            .and_then(|registry| registry.audit_cutover(std::path::Path::new(&workspace)))
+            .map_err(|_| "Cutover visual mode requires an audited quiescent native workspace")?;
+        if audit["fixture"] != false || audit["status"] != "production_authority_verified" {
+            return Err("Fixture authority cannot enable production visual measurement".into());
+        }
+    } else if !fixture {
         return Err("Visual broker requires fixture provider".into());
     }
     let path = PathBuf::from(std::env::var("AG1_VISUAL_SOCKET")?);
@@ -24,6 +37,10 @@ pub fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let window = app
         .get_webview_window("main")
         .ok_or("main webview missing")?;
+    let desktop = app
+        .state::<std::sync::Arc<ag1_desktop::Desktop>>()
+        .inner()
+        .clone();
     std::thread::spawn(move || {
         for incoming in listener.incoming() {
             let Ok(mut stream) = incoming else { break };
@@ -34,6 +51,28 @@ pub fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             let response = (|| -> Result<Value, String> {
                 let request: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+                if request["native_view"] == true {
+                    // Observe the native host independently of the renderer's
+                    // JavaScript thread. This grants no mutation capability.
+                    return tauri::async_runtime::block_on(async {
+                        let host = desktop.native.host().await?;
+                        let view = host.settled_view().await.map_err(|e| format!("{e:?}"))?;
+                        let configuration = host
+                            .registry
+                            .selected()
+                            .map_err(|e| format!("{e:?}"))?
+                            .services
+                            .runtime()
+                            .configuration()
+                            .map_err(|e| format!("{e:?}"))?;
+                        let tools: Vec<&str> = configuration
+                            .tools
+                            .iter()
+                            .filter_map(|tool| tool["name"].as_str())
+                            .collect();
+                        Ok(json!({"view":view,"tools":tools}))
+                    });
+                }
                 let (tx, rx) = mpsc::sync_channel(1);
                 if let Some(script) = request["script"].as_str() {
                     let script = script.to_owned();

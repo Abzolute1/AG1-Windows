@@ -4058,7 +4058,34 @@ fn selected_original_search_and_listing_cases_match_sdk_order_metadata_and_hints
                     .replace(dir.path().to_str().unwrap(), "/fixture"),
             )
             .unwrap();
-            assert_eq!(result, input["output"], "{}", row["name"]);
+            if row["name"]
+                == "Coding Agent Tools find tool should emit compact result-limit notices"
+            {
+                // fd stops after two matches; its parallel filesystem traversal
+                // does not promise which two arrive first. The pinned SDK test
+                // requires the limit notice, not one captured traversal order.
+                let text = result["result"]["content"][0]["text"].as_str().unwrap();
+                let paths: Vec<_> = text
+                    .strip_suffix("\n\n[2 results limit; next limit=4]")
+                    .unwrap()
+                    .split('\n')
+                    .collect();
+                assert_eq!(paths.len(), 2);
+                assert_ne!(paths[0], paths[1]);
+                assert!(
+                    paths
+                        .iter()
+                        .all(|p| ["alpha.txt", "beta.txt", "gamma.txt"].contains(p))
+                );
+                assert_eq!(
+                    result,
+                    json!({"result":{"content":[{"type":"text","text":text}],
+                        "details":{"resultCount":2,"firstMatchPath":paths[0],
+                            "firstMatchIsDirectory":false,"resultLimitReached":2}}})
+                );
+            } else {
+                assert_eq!(result, input["output"], "{}", row["name"]);
+            }
             assert_eq!(input["before"], input["after"]);
             for (path, entry) in input["before"].as_object().unwrap() {
                 let path = dir.path().join(path);
