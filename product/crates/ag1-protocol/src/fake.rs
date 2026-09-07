@@ -185,7 +185,8 @@ impl FakeHost {
                         capacity: MAX_SESSION_QUEUE as u32,
                     });
                 }
-                if let PromptInput::Artifact { artifact } = input
+                if let PromptInput::Artifact { artifact }
+                | PromptInput::MessageArtifact { artifact } = input
                     && !self.artifacts.contains_key(artifact)
                 {
                     return rejected(ProtocolError::NotFound);

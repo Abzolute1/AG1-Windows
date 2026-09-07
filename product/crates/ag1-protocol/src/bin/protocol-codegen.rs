@@ -154,6 +154,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BridgeQuestion,
         BridgeSnapshot,
         BridgeFrame,
+        MessageBlock,
+        ClientMessage,
+        ClientDetails,
+        ClientView,
         WireMessage
     );
     let fixture_json = serde_json::to_string_pretty(&fixtures())? + "\n";

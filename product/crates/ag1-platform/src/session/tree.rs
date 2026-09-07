@@ -221,9 +221,7 @@ impl NativeSession {
         let summary = if let Some(result) = override_summary {
             Some(result.clone())
         } else if options.summarize && !navigation.entries.is_empty() {
-            let window = capture.configuration().model["contextWindow"]
-                .as_u64()
-                .unwrap_or(128000);
+            let window = capture.configuration().context_limit();
             let prepared = tree::summary(
                 &navigation.entries,
                 window.min(i64::MAX as u64) as i64 - input.reserve_tokens as i64,

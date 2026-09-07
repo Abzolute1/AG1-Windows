@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { BridgeSnapshot, BridgeFrame, Command, CommandEnvelope } from "./generated/protocol";
-export type View = { snapshot: BridgeSnapshot | null; error: string | null; progress: string };
+import type { BridgeSnapshot, BridgeFrame, Command, CommandEnvelope, ClientDetails } from "./generated/protocol";
+export type View = { snapshot: BridgeSnapshot | null; error: string | null; progress: string; details?: ClientDetails };
 export type Catalog = { projects: string[]; theme: "light" | "dark" | "system" };
 export const api = {
   catalog: () => invoke<Catalog>("catalog"),
@@ -20,7 +20,7 @@ export const api = {
       envelope,
     });
     if (result.status === "rejected" || result.status === "failed")
-      throw new Error((result.data as { detail?: string })?.detail ?? "Command failed");
+      throw new Error(`${(result.data as { detail?: string })?.detail ?? JSON.stringify(result.data)} (command ${id})`);
     return result;
   },
 };

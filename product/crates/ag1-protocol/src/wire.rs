@@ -187,6 +187,7 @@ pub struct CommandEnvelope {
 pub enum PromptInput {
     Inline { text: String },
     Artifact { artifact: ArtifactId },
+    MessageArtifact { artifact: ArtifactId },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -393,6 +394,7 @@ pub enum WireMessage {
     Cursor(Cursor),
     Error(ProtocolError),
     Bridge(BridgeFrame),
+    Client(Box<crate::ClientView>),
 }
 
 pub fn decode(bytes: &[u8]) -> Result<WireMessage, ProtocolError> {

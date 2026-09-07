@@ -80,6 +80,15 @@ pub struct Configuration {
     pub compiler: CompileOptions,
 }
 impl Configuration {
+    pub fn context_limit(&self) -> u64 {
+        let maximum = self.model["contextWindow"].as_u64().unwrap_or(0);
+        if self.compiler.context_window == 0 {
+            maximum
+        } else {
+            self.compiler.context_window.min(maximum)
+        }
+    }
+
     /// A validated request-local tool view with its resource prompt rebuilt.
     pub fn with_tools(&self, tools: Vec<Value>) -> Result<Self, DomainError> {
         let mut configuration = self.clone();
@@ -282,7 +291,12 @@ impl PreparationAction {
     }
     pub fn compile_options(&self) -> CompileOptions {
         let mut options = self.configuration.compiler.clone();
-        options.context_window = self.configuration.model["contextWindow"].as_u64().unwrap();
+        let maximum = self.configuration.model["contextWindow"].as_u64().unwrap();
+        options.context_window = if options.context_window == 0 {
+            maximum
+        } else {
+            options.context_window.min(maximum)
+        };
         options.fixed_tokens = Some(self.configuration.fixed_tokens());
         options
     }
@@ -332,6 +346,18 @@ impl SessionRuntime {
                         .ok_or_else(|| invalid("compaction context epoch"))?,
                 );
             }
+            if entry["type"] == "model_change" {
+                configuration.compiler.context_window = 0;
+            }
+            if entry["customType"] == "ag1_context_limit" {
+                let tokens = entry["data"]["tokens"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("context limit"))?;
+                if tokens < 1024 {
+                    return Err(invalid("context limit"));
+                }
+                configuration.compiler.context_window = tokens;
+            }
             if entry["type"] == "thinking_level_change" {
                 configuration.thinking = entry["thinkingLevel"]
                     .as_str()
@@ -355,6 +381,11 @@ impl SessionRuntime {
             && entry["data"] != json!(configuration.names())
         {
             return Err(invalid("resolve the branch's active tools before resume"));
+        }
+        if configuration.compiler.context_window
+            > configuration.model["contextWindow"].as_u64().unwrap_or(0)
+        {
+            return Err(invalid("restored context exceeds model capacity"));
         }
         configuration.refresh_prompt()?;
         configuration.validate()?;
@@ -544,10 +575,36 @@ impl SessionRuntime {
     ) -> Result<AppendAction, DomainError> {
         let mut configuration = self.configuration.as_ref().clone();
         configuration.model = model;
+        configuration.compiler.context_window = 0;
         configuration.refresh_prompt()?;
         configuration.validate()?;
         let record = json!({"type":"model_change","provider":configuration.model["provider"],"modelId":configuration.model["id"]});
         self.append(command, id, timestamp, record, Arc::new(configuration))
+    }
+    /// An explicit working-context limit within the admitted model capacity.
+    /// This changes compilation only; runtime profiles and server argv are not rewritten.
+    pub fn select_context(
+        &mut self,
+        command: &str,
+        id: &str,
+        timestamp: &str,
+        tokens: u64,
+    ) -> Result<AppendAction, DomainError> {
+        let maximum = self.configuration.model["contextWindow"]
+            .as_u64()
+            .ok_or_else(|| invalid("model context"))?;
+        if tokens < 1024 || tokens > maximum {
+            return Err(invalid("context limit exceeds admitted model capacity"));
+        }
+        let mut configuration = self.configuration.as_ref().clone();
+        configuration.compiler.context_window = tokens;
+        self.append(
+            command,
+            id,
+            timestamp,
+            json!({"type":"custom","customType":"ag1_context_limit","data":{"tokens":tokens}}),
+            Arc::new(configuration),
+        )
     }
     pub fn select_tools(
         &mut self,
@@ -688,12 +745,7 @@ impl SessionRuntime {
             || !self.settled()
             || self.branch.last().is_none_or(|entry| entry["id"] != failed)
             || entry["message"]["role"] != "assistant"
-            || !super::retry::overflow(
-                &entry["message"],
-                self.configuration.model["contextWindow"]
-                    .as_u64()
-                    .unwrap_or(0),
-            )
+            || !super::retry::overflow(&entry["message"], self.configuration.context_limit())
             || entry["message"]["content"]
                 .as_array()
                 .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "toolCall"))
@@ -1172,11 +1224,7 @@ impl SessionRuntime {
                 .checked_mul(11)
                 .ok_or_else(|| invalid("context token estimate"))?
                 .div_ceil(10);
-            if with_margin
-                > preparation.configuration.model["contextWindow"]
-                    .as_u64()
-                    .unwrap()
-            {
+            if with_margin > preparation.configuration.context_limit() {
                 return Err(DomainError::LimitExceeded(
                     "request context admission margin".into(),
                 ));

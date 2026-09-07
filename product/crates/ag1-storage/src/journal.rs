@@ -358,6 +358,24 @@ impl Store {
         )?;
         self.record_fenced_intent(id, &intent, Some((session, expected)))
     }
+    /// Isolated client effects share the writer and fences while remaining
+    /// distinguishable from executable session commands during recovery.
+    pub fn admit_client_command(
+        &self,
+        session: &str,
+        id: &str,
+        expected: u64,
+        payload: &Value,
+    ) -> StorageResult<CommandAdmission> {
+        valid_id(session)?;
+        if !payload.is_object() || serde_json::to_vec(payload)?.len() > 64 * 1024 {
+            return Err(StorageError::Limit("Client effect payload".into()));
+        }
+        let intent = serde_json::to_vec(
+            &serde_json::json!({"version":1,"kind":"native-client-effect","session":session,"expectedRevision":expected.to_string(),"payload":payload}),
+        )?;
+        self.record_fenced_intent(id, &intent, Some((session, expected)))
+    }
     fn record_fenced_intent(
         &self,
         id: &str,

@@ -132,6 +132,7 @@ impl SessionCommands {
                     journal_revision: state.journal_revision(),
                     context_epoch: state.stamp().epoch(),
                     execution_settled: true,
+                    error: None,
                     generations: None,
                 })
                 .map_err(|_| unavailable("native_command_recovery"))?

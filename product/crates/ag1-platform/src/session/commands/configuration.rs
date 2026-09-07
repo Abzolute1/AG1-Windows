@@ -42,6 +42,7 @@ enum Change {
     ),
     Model(Value),
     Thinking(String),
+    Context(u64),
     Tools(Vec<Value>),
     Task(Option<ag1_core::task::TaskState>),
 }
@@ -87,8 +88,30 @@ impl SessionCommands {
                     .find(|m| m["provider"] == selected.provider && m["id"] == selected.model_id)
                     .ok_or(w::ProtocolError::NotFound)?
                     .clone();
+                if model
+                    .get("runtimeConflict")
+                    .is_some_and(|v| v != false && !v.is_null())
+                {
+                    return Err(unavailable("model_runtime_conflict"));
+                }
                 next.model = model.clone();
                 Change::Model(model)
+            }
+            w::Command::Model { action, args } if action == "context" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Context {
+                    tokens: u64,
+                }
+                let context: Context = parse(args)?;
+                if context.tokens < 1024
+                    || context.tokens > next.model["contextWindow"].as_u64().unwrap_or(0)
+                {
+                    return Err(w::ProtocolError::Malformed {
+                        detail: "Context limit exceeds admitted model capacity".into(),
+                    });
+                }
+                Change::Context(context.tokens)
             }
             w::Command::Model { action, args } if action == "thinking" => {
                 let thinking: Thinking = parse(args)?;
@@ -186,6 +209,15 @@ impl SessionCommands {
         envelope: &w::CommandEnvelope,
         key: &str,
     ) -> Result<w::CommandResult, w::ProtocolError> {
+        if self
+            .book()
+            .map_err(domain)?
+            .active
+            .as_ref()
+            .is_some_and(|a| a.client_control)
+        {
+            return Err(unavailable("native_client_action_busy"));
+        }
         let timestamp = i64::try_from(self.clock.now_ms())
             .ok()
             .and_then(chrono::DateTime::from_timestamp_millis)
@@ -229,6 +261,9 @@ impl SessionCommands {
                         Some(state.update_plan(&id, &id, &timestamp, change.0, change.1))
                     }
                     Change::Model(model) => Some(state.select_model(&id, &id, &timestamp, model)),
+                    Change::Context(tokens) => {
+                        Some(state.select_context(&id, &id, &timestamp, tokens))
+                    }
                     Change::Thinking(level) => {
                         Some(state.select_thinking(&id, &id, &timestamp, level))
                     }
@@ -256,6 +291,7 @@ impl SessionCommands {
                     journal_revision: state.journal_revision(),
                     context_epoch: state.stamp().epoch(),
                     execution_settled: true,
+                    error: None,
                     generations: None,
                 })
                 .map_err(|_| unavailable("native_command_recovery"))?

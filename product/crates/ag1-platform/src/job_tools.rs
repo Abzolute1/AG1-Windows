@@ -266,6 +266,13 @@ impl<S: StoragePort> JobService<S> {
         }
         Ok(())
     }
+    /// Recorded state only. Refresh requires the owned host's artifact port.
+    pub fn client_records(&self) -> Result<serde_json::Value, DomainError> {
+        let (revision, book) = self.load()?;
+        Ok(
+            serde_json::json!({"revision":revision,"jobs":book.jobs,"measurement":"Last recorded owned-process observation"}),
+        )
+    }
     pub fn notices(&self) -> Result<Vec<Notice>, DomainError> {
         let (_, book) = self.load()?;
         Ok(book

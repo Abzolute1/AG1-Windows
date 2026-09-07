@@ -34,6 +34,7 @@ use std::{
 
 #[derive(Clone, Default)]
 pub struct NativeAdapters {
+    pub resources: Option<Arc<crate::client::resource_actions::Actions>>,
     pub project: Option<Arc<std::sync::Mutex<crate::projects::ProjectPort>>>,
     /// Host-selected planning capability. Ordinary sessions do not expose it.
     pub planning: bool,
@@ -122,6 +123,10 @@ impl NativeAdapters {
         let mut names: Vec<String> = names.into_iter().map(str::to_owned).collect();
         if let Some(project) = &self.project {
             match &*project.lock().unwrap() {
+                crate::projects::ProjectPort::Shared(p) => names.extend(p.names()),
+                crate::projects::ProjectPort::SharedCheck(p) if p.available() => {
+                    names.push("check".into())
+                }
                 crate::projects::ProjectPort::Check(p)
                     if p.runtime.command(p.kind, "check").is_ok() =>
                 {

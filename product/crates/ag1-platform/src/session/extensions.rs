@@ -11,9 +11,12 @@ use std::sync::Mutex;
 mod resources;
 pub(super) mod snapshot;
 
+type ClientBridgeFactory =
+    dyn Fn(&Scope) -> Result<Box<dyn crate::extension_host::Bridge>, DomainError> + Send + Sync;
 pub struct NativeExtensions {
     host: Mutex<ExtensionHost>,
     catalog: Value,
+    client_bridge: Option<std::sync::Arc<ClientBridgeFactory>>,
     resources: Mutex<Option<crate::resources::ResourceLoader>>,
 }
 impl NativeExtensions {
@@ -115,8 +118,96 @@ impl NativeExtensions {
         Ok(Self {
             host: Mutex::new(host),
             catalog,
+            client_bridge: None,
             resources: Mutex::new(None),
         })
+    }
+    /// Explicit client commands may have a host UI port. Native tool/request/
+    /// lifecycle callbacks above retain DenyBridge and static catalog fences.
+    pub fn with_client_bridge_factory(
+        mut self,
+        factory: std::sync::Arc<ClientBridgeFactory>,
+    ) -> Self {
+        self.client_bridge = Some(factory);
+        self
+    }
+    pub(super) fn client_call(
+        &self,
+        scope: &Scope,
+        snapshot: &Value,
+        method: &str,
+        args: &Value,
+        control: &ScanControl<'_>,
+    ) -> Result<Option<Value>, DomainError> {
+        if !matches!(method, "command" | "shortcut" | "flags.set") {
+            return Err(DomainError::PermissionDenied);
+        }
+        let mut args = args.clone();
+        if method == "shortcut" {
+            let key = args["key"]
+                .as_str()
+                .ok_or(DomainError::NotFound)?
+                .to_lowercase();
+            if [
+                "ctrl+s", "meta+s", "ctrl+o", "meta+o", "enter", "escape", "ctrl+c",
+            ]
+            .contains(&key.as_str())
+            {
+                return Err(DomainError::PermissionDenied);
+            }
+            args["keybindings"] = client_keybindings();
+        }
+        if method == "flags.set" {
+            let flag = self.catalog["flags"]
+                .as_array()
+                .and_then(|flags| flags.iter().find(|f| f["name"] == args["name"]))
+                .ok_or(DomainError::NotFound)?;
+            if !(args["value"].is_boolean()
+                || args["value"].as_str().is_some_and(|s| s.len() <= 16384))
+                || (flag["type"] == "boolean" && !args["value"].is_boolean())
+                || (flag["type"] == "string" && !args["value"].is_string())
+            {
+                return Err(DomainError::InvalidInput("extension flag value".into()));
+            }
+        }
+        let mut host = self.host.lock().map_err(|_| DomainError::Conflict)?;
+        let mut bridge = self
+            .client_bridge
+            .as_ref()
+            .map(|factory| factory(scope))
+            .transpose()?;
+        host.advance_scope(scope)?;
+        self.check_catalog(&mut host, scope, control)?;
+        let mut snapshot = snapshot.clone();
+        snapshot["hasUI"] = json!(bridge.is_some());
+        let result = match bridge.as_mut() {
+            Some(bridge) => {
+                host.call_with_snapshot(scope, method, &args, &snapshot, control, bridge.as_mut())
+            }
+            None => {
+                host.call_with_snapshot(scope, method, &args, &snapshot, control, &mut DenyBridge)
+            }
+        };
+        self.check_catalog(&mut host, scope, control)?;
+        result
+    }
+    pub fn client_settings(
+        &self,
+        scope: &Scope,
+        control: &ScanControl<'_>,
+    ) -> Result<Value, DomainError> {
+        let mut host = self.host.try_lock().map_err(|_| DomainError::QueueFull)?;
+        host.advance_scope(scope)?;
+        self.check_catalog(&mut host, scope, control)?;
+        let flags = host.call(scope, "flags.values", &json!({}), control, &mut DenyBridge)?;
+        let shortcuts = host.call(
+            scope,
+            "shortcuts.resolve",
+            &json!({"keybindings":client_keybindings()}),
+            control,
+            &mut DenyBridge,
+        )?;
+        Ok(json!({"flags":flags,"shortcuts":shortcuts}))
     }
     pub fn catalog(&self) -> &Value {
         &self.catalog
@@ -212,4 +303,8 @@ impl NativeExtensions {
         }
         Ok(())
     }
+}
+
+fn client_keybindings() -> Value {
+    json!({"app.interrupt":["escape","ctrl+c"],"tui.input.submit":["enter","ctrl+s","meta+s","ctrl+o","meta+o"]})
 }

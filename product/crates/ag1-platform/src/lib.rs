@@ -116,3 +116,6 @@ pub mod episode_tools;
 
 #[cfg(target_os = "linux")]
 pub mod projects;
+
+#[cfg(target_os = "linux")]
+pub mod client;

@@ -122,6 +122,27 @@ fn parse<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, w::ProtocolE
     })
 }
 impl RuntimeCommands {
+    pub async fn reconcile_terminal(
+        &self,
+        id: w::CommandId,
+    ) -> Result<w::OperationView, DomainError> {
+        self.current(false)?.reconcile_terminal(id).await
+    }
+    pub fn last_failure(&self) -> Result<Option<String>, DomainError> {
+        self.current(true)?.last_failure()
+    }
+    pub fn client_transition_pending(&self) -> Result<bool, DomainError> {
+        Ok(self
+            .book
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .pending
+            .is_some())
+    }
+    /// Presentation-only access to the current approval projection.
+    pub fn pending_approvals(&self) -> Result<Vec<commands::PendingApproval>, DomainError> {
+        self.current(true)?.pending_approvals()
+    }
     pub fn new(
         registry: Arc<RuntimeRegistry>,
         factory: Arc<dyn RuntimeFactory>,

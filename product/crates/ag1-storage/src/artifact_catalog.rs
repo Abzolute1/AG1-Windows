@@ -59,7 +59,7 @@ impl Store {
         let db = self.conn()?;
         Self::ready(&db)?;
         active_session(&db, session)?;
-        let mut query = db.prepare("SELECT a.origin,a.id,a.record,json_extract(CAST(a.record AS TEXT),'$.createdAt') AS created FROM artifacts a JOIN access x ON x.origin=a.origin AND x.artifact=a.id WHERE x.session=?1 AND (?2 IS NULL OR json_extract(CAST(a.record AS TEXT),'$.kind')=?2) AND (?3 IS NULL OR (json_extract(CAST(a.record AS TEXT),'$.createdAt'),a.id,a.origin)<(?3,?4,?5)) AND (NOT ?7 OR json_extract(CAST(a.record AS TEXT),'$.kind') NOT IN (SELECT value FROM json_each(?8))) ORDER BY created DESC,a.id DESC,a.origin DESC LIMIT ?6")?;
+        let mut query = db.prepare("SELECT a.origin,a.id,a.record,COALESCE(json_extract(CAST(a.record AS TEXT),'$.createdAt'),'') AS created FROM artifacts a JOIN access x ON x.origin=a.origin AND x.artifact=a.id WHERE x.session=?1 AND (?2 IS NULL OR json_extract(CAST(a.record AS TEXT),'$.kind')=?2) AND (?3 IS NULL OR (COALESCE(json_extract(CAST(a.record AS TEXT),'$.createdAt'),''),a.id,a.origin)<(?3,?4,?5)) AND (NOT ?7 OR json_extract(CAST(a.record AS TEXT),'$.kind') NOT IN (SELECT value FROM json_each(?8))) ORDER BY created DESC,a.id DESC,a.origin DESC LIMIT ?6")?;
         let rows = query.query_map(
             params![
                 session,

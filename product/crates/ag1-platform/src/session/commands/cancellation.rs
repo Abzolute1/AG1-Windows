@@ -34,7 +34,8 @@ fn target_record(
     );
     if envelope.scope.workspace != scope.workspace
         || envelope.scope.session != scope.session
-        || super::messages::input(&envelope.command).is_err()
+        || (super::messages::input(&envelope.command).is_err()
+            && super::modes::queued(&envelope.command)?.is_none())
         || expected_key != key
     {
         return Err(w::ProtocolError::NotFound);

@@ -344,7 +344,7 @@ impl NativeSession {
             };
             compaction::attach_provenance(&mut result, &trajectory)?;
             if input.reason != Reason::Manual && result["details"]["method"] != "persistent_emergency_checkpoint" {
-                compaction::guard_summary(&mut result, capture.configuration().model["contextWindow"].as_u64().unwrap())?;
+                compaction::guard_summary(&mut result, capture.configuration().context_limit())?;
             }
             result["details"]["originalJournal"] = json!(original.original_journal);
             result["details"]["originalRequest"] = json!(original.original_request);

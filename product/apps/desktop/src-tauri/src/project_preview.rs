@@ -1,7 +1,7 @@
 //! Host-only interactive preview. P12 supplies its client actions; P13 owns
 //! desktop authority transfer. No renderer URL becomes an AG1 capability.
 use ag1_platform::projects::{Runtime, preview::Grant};
-use tauri::{WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 pub struct ProjectPreview {
     pub grant: Grant,
     window: WebviewWindow,
@@ -33,6 +33,14 @@ impl ProjectPreview {
     }
     pub fn close(&mut self) -> Result<(), String> {
         self.grant.close();
+        if self
+            .window
+            .app_handle()
+            .get_webview_window(self.window.label())
+            .is_none()
+        {
+            return Ok(());
+        }
         self.window.close().map_err(|e| e.to_string())
     }
 }

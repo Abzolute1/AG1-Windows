@@ -1032,6 +1032,15 @@ pub fn parse_diagnostics(bytes: &[u8], source: &str) -> Vec<Diagnostic> {
     String::from_utf8_lossy(bytes)
         .lines()
         .filter_map(|line| {
+            // HTTP access timestamps contain colons but are not compiler
+            // locations. Keep these in the raw runtime log, not Problems.
+            static ACCESS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                regex::Regex::new(r#"^\S+ - \S+ \[[^]]+\] "[A-Z]+ [^"]+ HTTP/[0-9.]+" [0-9]{3} "#)
+                    .unwrap()
+            });
+            if ACCESS.is_match(line) {
+                return None;
+            }
             if let Ok(value) = serde_json::from_str::<Value>(line)
                 && value["reason"] == "compiler-message"
             {

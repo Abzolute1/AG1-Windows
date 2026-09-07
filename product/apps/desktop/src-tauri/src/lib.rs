@@ -251,6 +251,7 @@ fn actor(mut process: OwnedProcess, rx: mpsc::Receiver<Control>, view: Arc<Mutex
 }
 
 pub struct Desktop {
+    pub native: native_client::NativeClient,
     pub worker: Mutex<Option<Worker>>,
     pub root: PathBuf,
     pub state: PathBuf,
@@ -273,6 +274,7 @@ impl Desktop {
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| "Desktop state already has a writer")?;
         Ok(Self {
+            native: native_client::NativeClient::from_environment()?,
             worker: Mutex::new(None),
             root,
             state,
@@ -395,7 +397,7 @@ impl Desktop {
         value["theme"] = json!(theme);
         self.write_preferences(value)
     }
-    fn add_project(&self, path: &Path) -> Result<()> {
+    pub fn add_project(&self, path: &Path) -> Result<()> {
         let _guard = self.catalog_guard.lock().unwrap();
         let mut value = self.read_catalog()?;
         let projects = value["projects"]
@@ -424,3 +426,5 @@ impl Desktop {
 }
 
 pub mod project_preview;
+
+pub mod native_client;

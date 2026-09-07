@@ -20,6 +20,14 @@ async fn open_project(
 ) -> Result<Value, String> {
     local(&window)?;
     let state = state.inner().clone();
+    if state.native.enabled() {
+        let result = state
+            .native
+            .open(std::path::Path::new(&path), &state.state)
+            .await?;
+        state.add_project(std::path::Path::new(&path))?;
+        return Ok(result);
+    }
     tauri::async_runtime::spawn_blocking(move || state.open(&path))
         .await
         .map_err(|e| e.to_string())?
@@ -32,6 +40,17 @@ async fn bridge_command(
 ) -> Result<Value, String> {
     local(&window)?;
     let state = state.inner().clone();
+    if state.native.enabled() {
+        if let ag1_protocol::Command::Project { action, .. } = &envelope.command
+            && action.starts_with("preview_")
+        {
+            return state.native.preview(window.app_handle(), envelope).await;
+        }
+        let host = state.native.host().await?;
+        let result = host.reply(envelope).await;
+
+        return serde_json::to_value(result).map_err(|e| e.to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let worker = state.worker.lock().unwrap();
         let result = worker
@@ -50,6 +69,9 @@ async fn bridge_view(
 ) -> Result<Value, String> {
     local(&window)?;
     let state = state.inner().clone();
+    if state.native.enabled() {
+        return state.native.view().await;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         Ok(state
             .worker
@@ -87,6 +109,7 @@ async fn quit(
 ) -> Result<(), String> {
     local(&window)?;
     let state = state.inner().clone();
+    state.native.shutdown().await?;
     tauri::async_runtime::spawn_blocking(move || {
         if let Some(worker) = state.worker.lock().unwrap().as_mut() {
             worker.stop();
@@ -163,7 +186,7 @@ fn main() {
                     let view = w.view();
                     view["snapshot"]["status"] != "idle" && view["error"].is_null()
                 });
-                if active {
+                if active || state.native.enabled() {
                     api.prevent_close();
                     let _ = window.emit("close-requested", ());
                 }

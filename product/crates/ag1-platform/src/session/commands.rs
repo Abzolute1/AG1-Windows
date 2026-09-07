@@ -20,6 +20,7 @@ const EVENT_HISTORY: usize = 1024;
 mod approval;
 mod cancellation;
 mod configuration;
+mod input;
 mod messages;
 mod modes;
 mod planning;
@@ -73,6 +74,7 @@ struct Queued {
     mode: Option<modes::Request>,
 }
 struct Active {
+    client_control: bool,
     key: String,
     operation: w::OperationId,
     recovery: bool,
@@ -87,6 +89,7 @@ struct Book {
     sequence: u64,
     events: VecDeque<w::Event>,
     last_terminal: Option<w::OperationView>,
+    last_failure: Option<String>,
     delivery: delivery::State,
 }
 #[derive(Serialize, Deserialize)]
@@ -97,6 +100,8 @@ struct Terminal {
     journal_revision: u64,
     context_epoch: u64,
     execution_settled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     generations: Option<u64>,
 }
 pub struct SessionCommands {
@@ -193,6 +198,9 @@ impl SessionCommands {
             instance,
             epoch: w::Sequence::new(selection.epoch),
         };
+        if settings.tools.is_empty() {
+            settings.tools = selection.services.tools().client_catalog();
+        }
         configuration::catalogs(&runtime.configuration()?, &mut settings)?;
         // Control admission must not queue behind a tool waiting for approval.
         // One bounded worker belongs to this facade and is shared by all callers.
@@ -247,6 +255,7 @@ impl SessionCommands {
                     "cancel".into(),
                     "model.select".into(),
                     "model.thinking".into(),
+                    "model.context".into(),
                     "runtime.tools".into(),
                     "task".into(),
                     "plan.accept".into(),
@@ -259,6 +268,7 @@ impl SessionCommands {
                     "session.steer".into(),
                     "session.follow_up".into(),
                     "session.compact".into(),
+                    "session.print".into(),
                     "session.tree".into(),
                     "command_result".into(),
                     "artifact_read".into(),
@@ -312,6 +322,9 @@ impl SessionCommands {
                 .collect(),
             last_terminal: book.last_terminal.clone(),
         })
+    }
+    pub fn last_failure(&self) -> Result<Option<String>, DomainError> {
+        Ok(self.book()?.last_failure.clone())
     }
     pub fn snapshot(&self) -> Result<w::Snapshot, DomainError> {
         self.snapshot_at(&*self.book()?)
@@ -543,7 +556,8 @@ impl SessionCommands {
         if matches!(
             envelope.command,
             w::Command::Model { .. } | w::Command::Runtime { .. } | w::Command::Task { .. }
-        ) {
+        ) && plan_input.is_none()
+        {
             return self.configuration_worker(&envelope, &key);
         }
         let (kind, input, mode) = if let Some((mode, input)) = plan_input {
@@ -555,14 +569,14 @@ impl SessionCommands {
         if !self.runtime().persistence_healthy().map_err(domain)? {
             return Err(unavailable("native_command_recovery"));
         }
-        if let w::PromptInput::Artifact { artifact } = &input {
-            // Validate before intent. Queue retains only the ID, not another
-            // copy of a potentially large prompt. Execution revalidates it.
-            self.artifacts()
-                .map_err(domain)?
-                .bounded_text(artifact.as_str(), MAX_PROMPT_BYTES)
+        if matches!(
+            &input,
+            w::PromptInput::Artifact { .. } | w::PromptInput::MessageArtifact { .. }
+        ) {
+            self.input_message(&input, self.clock.now_ms())
                 .map_err(domain)?;
         }
+
         {
             let mut book = self.book().map_err(domain)?;
             let count = book.queue.len() + book.reserved + usize::from(book.active.is_some());
@@ -786,7 +800,12 @@ impl SessionCommands {
                 return Ok(None);
             };
             let queued = book.queue.remove(index).ok_or(DomainError::Conflict)?;
+            book.last_failure = None;
             book.active = Some(Active {
+                client_control: matches!(
+                    queued.mode,
+                    Some(modes::Request::Extension { .. } | modes::Request::Resource { .. })
+                ),
                 key: queued.key.clone(),
                 operation: queued.operation.clone(),
                 recovery: false,
@@ -800,34 +819,25 @@ impl SessionCommands {
             .and_then(chrono::DateTime::from_timestamp_millis)
             .ok_or_else(|| DomainError::InvalidInput("command clock".into()))?
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        let text = if queued.cancelled.load(Ordering::Acquire) {
+        let message = if queued.cancelled.load(Ordering::Acquire) {
             Err(DomainError::Cancelled)
         } else {
-            match &queued.input {
-                w::PromptInput::Inline { text } => Ok(text.clone()),
-                w::PromptInput::Artifact { artifact } => {
-                    let owner = self.clone();
-                    let artifact = artifact.clone();
-                    self.runtime()
-                        .pool
-                        .submit(move || {
-                            owner
-                                .artifacts()?
-                                .bounded_text(artifact.as_str(), MAX_PROMPT_BYTES)
-                        })
-                        .await
-                }
-            }
+            let owner = self.clone();
+            let input = queued.input.clone();
+            self.runtime()
+                .pool
+                .submit(move || owner.input_message(&input, now))
+                .await
         };
         let relay = delivery::Relay::new(self, &queued.operation, listener);
-        let result = match text {
-            Ok(text) => {
+        let result = match message {
+            Ok(message) => {
                 let input = TurnInput {
                     command: format!(
                         "native-prompt-{}",
                         ag1_storage::digest(queued.key.as_bytes())
                     ),
-                    message: json!({"role":"user","content":[{"type":"text","text":text}],"timestamp":now}),
+                    message,
                     timestamp,
                     max_generations: self.settings.max_generations,
                     compaction: self.settings.compaction.clone(),
@@ -836,6 +846,45 @@ impl SessionCommands {
                 };
                 let origin = super::RunOrigin::Command(queued.cancelled.clone(), self.clone());
                 match &queued.mode {
+                    Some(modes::Request::Resource { name, args }) => {
+                        self.runtime()
+                            .client_resource(
+                                self.selection.services.tools().clone(),
+                                queued.key.clone(),
+                                name.clone(),
+                                args.clone(),
+                                queued.cancelled.clone(),
+                            )
+                            .await
+                    }
+                    Some(modes::Request::Extension { method, args }) => {
+                        self.runtime()
+                            .client_extension(
+                                self.selection.services.tools().clone(),
+                                method.clone(),
+                                args.clone(),
+                                queued.cancelled.clone(),
+                            )
+                            .await
+                    }
+                    Some(modes::Request::Print) => super::print::run_selected(
+                        self.runtime(),
+                        input,
+                        self.selection.services.provider().as_ref(),
+                        self.selection.services.tools().clone(),
+                        &relay,
+                        (Default::default(), origin),
+                    )
+                    .await
+                    .and_then(|r| {
+                        if r.exit_code == 0 {
+                            Ok(r.turn)
+                        } else {
+                            Err(DomainError::Unavailable(
+                                "print completion requirements were not met".into(),
+                            ))
+                        }
+                    }),
                     Some(modes::Request::Planning(planning::Request::Draft {
                         previous,
                         feedback,
@@ -962,10 +1011,12 @@ impl SessionCommands {
                 journal_revision: state.journal_revision(),
                 context_epoch: state.stamp().epoch(),
                 execution_settled: true,
+                error: result.as_ref().err().map(|e| format!("{e:?}")),
                 generations: result.as_ref().ok().map(|r| r.generations),
             })
             .map_err(|_| DomainError::Conflict)?
         };
+        let failure = result.as_ref().err().map(|e| format!("{e:?}"));
         let owner = self.clone();
         self.runtime()
             .pool
@@ -978,6 +1029,7 @@ impl SessionCommands {
                 let mut book = owner.book()?;
                 owner.publish(&mut book, operation.clone())?;
                 book.last_terminal = Some(operation.clone());
+                book.last_failure = failure;
                 book.active = None;
                 Ok(Some(operation))
             })

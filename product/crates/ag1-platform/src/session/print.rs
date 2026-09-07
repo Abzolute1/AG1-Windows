@@ -27,12 +27,18 @@ impl<'a> ModeLease<'a> {
         host: &'a NativeSession,
         verification_command: Option<String>,
     ) -> Result<Self, DomainError> {
+        Self::begin_with_cancel(host, verification_command, Arc::new(AtomicBool::new(false)))
+    }
+    pub(super) fn begin_with_cancel(
+        host: &'a NativeSession,
+        verification_command: Option<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Self, DomainError> {
         let active = host.active.lock().map_err(|_| DomainError::Conflict)?;
         let mut mode = host.mode.lock().map_err(|_| DomainError::Conflict)?;
         if active.is_some() || mode.is_some() {
             return Err(DomainError::Conflict);
         }
-        let cancelled = Arc::new(AtomicBool::new(false));
         *mode = Some(cancelled.clone());
         Ok(Self {
             host,
@@ -211,6 +217,26 @@ pub async fn run(
     listener: &dyn Listener,
     options: Options,
 ) -> std::result::Result<PrintResult, DomainError> {
+    run_selected(
+        host,
+        input,
+        resolver,
+        tools,
+        listener,
+        (options, super::RunOrigin::User),
+    )
+    .await
+}
+
+pub(super) async fn run_selected(
+    host: &NativeSession,
+    input: TurnInput,
+    resolver: &dyn ProviderResolver,
+    tools: Arc<dyn ToolRunner>,
+    listener: &dyn Listener,
+    mode: (Options, super::RunOrigin),
+) -> Result<PrintResult, DomainError> {
+    let (options, origin) = mode;
     let _activity = host.enter()?;
     if options
         .recommended_verifier
@@ -306,7 +332,7 @@ pub async fn run(
             resolver,
             tools.clone(),
             listener,
-            super::RunOrigin::User,
+            origin.clone(),
             Some(&lease),
         )
         .await?;
@@ -400,7 +426,12 @@ pub async fn run(
                 resolver,
                 tools.clone(),
                 listener,
-                super::RunOrigin::Continuation,
+                match &origin {
+                    super::RunOrigin::Command(cancel, queue) => {
+                        super::RunOrigin::CommandContinuation(cancel.clone(), queue.clone())
+                    }
+                    _ => super::RunOrigin::Continuation,
+                },
                 Some(&lease),
             )
             .await?;

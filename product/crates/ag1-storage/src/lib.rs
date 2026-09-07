@@ -26,3 +26,4 @@ mod runtime_recovery;
 mod runtime_selection;
 pub use runtime_recovery::InterruptedCommand;
 pub use runtime_selection::{RuntimeSelection, SelectionAck, SelectionChange, StoredSelection};
+mod client;

@@ -8,6 +8,14 @@ use ag1_core::{
 };
 
 impl NativeSession {
+    pub(crate) fn client_prompt(
+        cwd: &std::path::Path,
+        timestamp: &str,
+        resources: &crate::resources::Snapshot,
+        registry: Registry,
+    ) -> Result<PromptConfiguration, DomainError> {
+        configuration(cwd, timestamp, resources, registry)
+    }
     /// The host supplies a fully captured P09 resource snapshot and the registry
     /// whose concrete adapters it owns. Resource discovery never grants execution.
     pub async fn install_resources(

@@ -27,6 +27,12 @@ import { Input } from "./components/ui/input";
 import { Skeleton } from "./components/ui/skeleton";
 import { api, createCommandQueue, errorMessage, type Catalog, type View } from "./bridge";
 import type { BridgeSnapshot, Command, JsonValue } from "./generated/protocol";
+import { uploadMessage } from "./attachments";
+import { ExtensionShortcuts } from "./ExtensionSettings";
+import { navigateSession } from "./sessionNavigation";
+import { ExtensionUI } from "./ExtensionUI";
+import { NativeConversation } from "./NativeConversation";
+import { NativeDetails, Blocks } from "./NativeDetails";
 import { previewDocument } from "./preview";
 const Editor = lazy(() => import("./Editor"));
 type Page = "home" | "chat" | "files" | "diff" | "settings";
@@ -43,6 +49,7 @@ export default function App() {
     [quitDialog, setQuitDialog] = useState(false),
     [answer, setAnswer] = useState("");
   const [editorReset, setEditorReset] = useState(0);
+  const [attachments, setAttachments] = useState<File[]>([]);
   const [requestPage, setRequestPage] = useState<{
       id: string;
       text: string;
@@ -65,6 +72,8 @@ export default function App() {
   const dark =
     catalog.theme === "dark" ||
     (catalog.theme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+  const themeGeneration = useRef(0);
+  const editRef = useRef(edit); editRef.current = edit;
   const activeRef = useRef(active);
   activeRef.current = active;
   const dirtyRef = useRef(dirty);
@@ -73,17 +82,22 @@ export default function App() {
     document.documentElement.classList.toggle("dark", dark);
   }, [dark]);
   useEffect(() => {
+    const themeAtStart = themeGeneration.current;
     api
       .catalog()
-      .then(setCatalog)
+      .then(next => setCatalog(current => themeGeneration.current === themeAtStart ? next : { ...next, theme: current.theme }))
       .catch((e) => setError(String(e)));
     let cancelled = false,
       inflight = false;
+    let native = false, lastPoll = 0;
     const poll = async () => {
+      if (!native && Date.now() - lastPoll < 150) return;
+      lastPoll = Date.now();
       if (inflight) return;
       inflight = true;
       try {
         const next = await api.view();
+        native = !!next.details;
         if (!cancelled)
           setView((previous) =>
             JSON.stringify(previous) === JSON.stringify(next) ? previous : next,
@@ -95,7 +109,7 @@ export default function App() {
       }
     };
     void poll();
-    const timer = setInterval(poll, 150);
+    const timer = setInterval(poll, 16);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -150,7 +164,8 @@ export default function App() {
     setFile(null);
     setFiles([]);
     setProjectDialog(false);
-    setCatalog(await api.catalog());
+    const nextCatalog = await api.catalog();
+    setCatalog(current => ({ ...nextCatalog, theme: current.theme }));
   }
   async function loadFiles() {
     setFiles((await run({ kind: "files", action: "list", args: {} })) as string[]);
@@ -163,13 +178,14 @@ export default function App() {
   }
   async function save() {
     if (!file) return;
+    const submitted = edit;
     const data = (await run({
       kind: "files",
       action: "save",
       args: { path: file.path, text: edit, revision: file.revision },
     })) as FileView;
     setFile(data);
-    setEdit(data.text);
+    if (editRef.current === submitted) setEdit(data.text);
   }
   useEffect(() => {
     function key(e: KeyboardEvent) {
@@ -220,7 +236,7 @@ export default function App() {
     setRequestPage({ id: pending.binding.id, text, next: data.next });
     if (data.next === null) setReviewedRequest(pending.binding.id);
   }
-  const executing = active?.status === "running" || active?.status === "awaiting_input";
+  const executing = ["running", "streaming", "awaiting_input"].includes(active?.status ?? "");
   return (
     <div className="shell">
       <aside className="rail">
@@ -259,6 +275,7 @@ export default function App() {
         <button
           aria-label="Toggle theme"
           onClick={() => {
+            themeGeneration.current++;
             const theme = dark ? "light" : "dark";
             setCatalog({ ...catalog, theme });
             void api.theme(theme);
@@ -297,6 +314,9 @@ export default function App() {
             </button>
           </div>
         )}
+        {view.details && <ExtensionShortcuts key={`shortcuts/${active?.scope.session}`} run={run} />}
+        {view.details && <ExtensionUI activity={view.details.activity} run={run} key={`extension-ui/${active?.scope.session}`} onEditor={(text, paste) => setDraft(current => paste ? current + text : text)} />}
+        {view.details && active && <NativeDetails details={view.details} status={active.status} model={active.model} run={run} onEditor={text => setDraft(current => current === draft ? text : current)} />}
         {page === "home" ? (
           <div className="home">
             <div className="home-intro">
@@ -389,7 +409,7 @@ export default function App() {
                   Viewing a saved snapshot. Return to the active tab to send a message.
                 </div>
               )}
-              {snapshot?.messages.length ? (
+              {view.details && !viewer && snapshot ? <NativeConversation key={`${snapshot.scope.workspace}/${snapshot.scope.session}/${snapshot.scope.epoch}`} details={view.details} snapshot={snapshot} run={run} /> : snapshot?.messages.length ? (
                 <Virtuoso
                   className="messages"
                   data={snapshot.messages}
@@ -413,12 +433,12 @@ export default function App() {
                               ? "Tool result"
                               : "AG1"}
                         </strong>
-                        <pre>{m.text}</pre>
+                        {view.details?.messages.find(message => message.id === m.id) ? <Blocks message={view.details.messages.find(message => message.id === m.id)!} /> : <pre>{m.text}</pre>}
                         <button
                           className="evidence-button"
                           onClick={() =>
                             void action(async () => {
-                              const data = (await run({
+                              const data = (await run(view.details ? { kind: "session", action: "entry", args: { id: m.id, offset: "0" } } : {
                                 kind: "artifact_read",
                                 artifact: m.evidence,
                                 offset: "0",
@@ -468,6 +488,7 @@ export default function App() {
                 </div>
               )}
               <div className="composer-area">
+                {view.details && <label className="attachment-picker">Attach files<input aria-label="Attach files" type="file" multiple onChange={e => setAttachments(Array.from(e.target.files ?? []))} />{attachments.map(file => <span key={file.name}>{file.name} </span>)}</label>}
                 <form
                   className="composer"
                   onSubmit={(e) => {
@@ -475,12 +496,17 @@ export default function App() {
                     const text = draft;
                     void action(async () => {
                       if (viewer) throw new Error("Saved tabs are snapshot viewers");
+                      if (text.startsWith("/") && attachments.length) throw new Error("Send attachments as a message before running a slash action");
+                      const input = view.details ? await uploadMessage(text, attachments, run) : { kind: "inline" as const, text };
                       await run(
-                        executing
-                          ? { kind: "session", action: "steer", args: { text } }
-                          : { kind: "prompt", input: { kind: "inline", text } },
+                        view.details && text.startsWith("/")
+                          ? { kind: "runtime", action: "client_action", args: { text } }
+                          : executing
+                          ? { kind: "session", action: "steer", args: view.details ? { input } : { text } }
+                          : { kind: "prompt", input },
                       );
                       setDraft("");
+                      setAttachments([]);
                     });
                   }}
                 >
@@ -530,7 +556,7 @@ export default function App() {
                         type="submit"
                         size="icon"
                         aria-label={executing ? "Send steering" : "Send message"}
-                        disabled={!draft.trim() || busy || !!viewer}
+                        disabled={(!draft.trim() && !attachments.length) || busy || !!viewer}
                       >
                         <ArrowUp size={18} />
                       </Button>
@@ -678,6 +704,7 @@ export default function App() {
                     className={"theme-card " + theme}
                     key={theme}
                     onClick={() => {
+                      themeGeneration.current++;
                       setCatalog({ ...catalog, theme });
                       void api.theme(theme);
                     }}
@@ -706,16 +733,16 @@ export default function App() {
                       <strong>{model.id}</strong>
                       <p>
                         {String(model.profile.contextWindow)} context ·{" "}
-                        {String(model.profile.cacheTypeK)} KV cache
+                        {view.details ? String(model.profile.provider) : `${String(model.profile.cacheTypeK)} KV cache`}
                       </p>
-                      <code>{String(model.profile.serverPath)}</code>
+                      <code>{view.details ? JSON.stringify(model.profile.runtime ?? "Host-configured endpoint") : String(model.profile.serverPath)}</code>{!!model.profile.conflict && <p role="alert">Configuration conflict: {String(model.profile.conflict)}</p>}
                     </div>
                     <Button
                       variant={active.model === model.id ? "secondary" : "outline"}
-                      disabled={executing || busy}
+                      disabled={executing || busy || !!model.profile.conflict}
                       onClick={() =>
                         void action(() =>
-                          run({ kind: "model", action: "select", args: { id: model.id } }),
+                          run({ kind: "model", action: "select", args: view.details ? { provider: String(model.profile.provider), model_id: model.id } : { id: model.id } }),
                         )
                       }
                     >
@@ -742,7 +769,7 @@ export default function App() {
                   variant="outline"
                   disabled={executing || busy || !active.message_count}
                   onClick={() =>
-                    void action(() => run({ kind: "session", action: "fork", args: {} }))
+                    void action(() => view.details ? navigateSession(run, "fork", { id: [...active.messages].reverse().find(m => m.role === "user")?.id ?? "", role: "user" }, false, text => setDraft(current => current === draft ? text : current)) : run({ kind: "session", action: "fork", args: {} }))
                   }
                 >
                   <Copy size={14} /> Fork current conversation
@@ -754,7 +781,7 @@ export default function App() {
                     disabled={executing || busy}
                     onClick={() =>
                       void action(() =>
-                        run({ kind: "session", action: "resume", args: { file: name } }),
+                        run({ kind: "session", action: "resume", args: view.details ? { session: name } : { file: name } }),
                       )
                     }
                   >

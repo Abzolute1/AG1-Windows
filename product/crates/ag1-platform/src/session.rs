@@ -89,6 +89,18 @@ pub trait ProviderResolver: Send + Sync {
 /// receipts. Implementations own policy/preflight and concurrency; they must
 /// drain accepted effects even if cancellation is requested.
 pub trait ToolRunner: Send + Sync {
+    fn client_activity(&self) -> Result<Value, DomainError> {
+        Ok(serde_json::json!({}))
+    }
+    fn client_resources(&self) -> Option<Arc<crate::client::resource_actions::Actions>> {
+        None
+    }
+    fn client_extensions(&self) -> Option<Arc<extensions::NativeExtensions>> {
+        None
+    }
+    fn client_catalog(&self) -> Vec<Value> {
+        vec![]
+    }
     fn discover_session_resources(
         &self,
         _scope: &Scope,
@@ -214,10 +226,12 @@ pub struct TurnInput {
     pub compaction_timeout_ms: u64,
     pub retry: ag1_core::runtime::retry::Settings,
 }
+#[derive(Clone)]
 enum RunOrigin {
     User,
     Continuation,
     Command(Arc<AtomicBool>, Arc<commands::SessionCommands>),
+    CommandContinuation(Arc<AtomicBool>, Arc<commands::SessionCommands>),
 }
 struct ActiveTurn {
     cancelled: Arc<AtomicBool>,
@@ -225,6 +239,7 @@ struct ActiveTurn {
 }
 pub struct NativeSession {
     state: Arc<Mutex<SessionRuntime>>,
+    last_context: Mutex<Value>,
     store: Arc<Store>,
     origin: String,
     workspace: String,
@@ -304,6 +319,17 @@ impl Drop for QueuedTicket {
     }
 }
 impl NativeSession {
+    /// A committed, immutable journal projection for client views. No mutable
+    /// runtime handle or execution authority crosses this boundary.
+    pub fn client_context(&self) -> Result<Value, DomainError> {
+        self.last_context
+            .lock()
+            .map(|v| v.clone())
+            .map_err(|_| DomainError::Conflict)
+    }
+    pub fn client_records(&self) -> Result<Arc<Vec<Value>>, DomainError> {
+        Ok(self.state()?.branch_snapshot())
+    }
     pub fn new(
         state: SessionRuntime,
         store: Arc<Store>,
@@ -331,6 +357,7 @@ impl NativeSession {
             )?
             .is_empty();
         Ok(Self {
+            last_context: Mutex::new(Value::Null),
             state: Arc::new(Mutex::new(state)),
             store,
             origin,
@@ -368,6 +395,9 @@ impl NativeSession {
     }
     pub fn journal_revision(&self) -> Result<u64, DomainError> {
         Ok(self.state()?.journal_revision())
+    }
+    pub fn context_epoch(&self) -> Result<u64, DomainError> {
+        Ok(self.state()?.stamp().epoch())
     }
     pub fn persistence_healthy(&self) -> Result<bool, DomainError> {
         Ok(self.state()?.persistence_healthy())
@@ -764,7 +794,10 @@ impl NativeSession {
     ) -> Result<TurnResult, DomainError> {
         let _activity = self.enter()?;
         if self.commands_claimed.load(Ordering::Acquire)
-            && !matches!(origin, RunOrigin::Command(..))
+            && !matches!(
+                origin,
+                RunOrigin::Command(..) | RunOrigin::CommandContinuation(..)
+            )
         {
             return Err(DomainError::Unavailable(
                 "command facade owns prompt admission".into(),
@@ -776,7 +809,10 @@ impl NativeSession {
             ));
         }
         OperationId::new(&input.command)?;
-        let continuation = matches!(origin, RunOrigin::Continuation);
+        let continuation = matches!(
+            origin,
+            RunOrigin::Continuation | RunOrigin::CommandContinuation(..)
+        );
         let valid_role = if continuation {
             input.message["role"] == "custom"
                 && input.message["display"].is_boolean()
@@ -798,11 +834,15 @@ impl NativeSession {
         // Turn cleanup cancels its own source even after a normal terminal.
         // The encompassing mode's cancellation flag must outlive that cleanup.
         let command_queue = match &origin {
-            RunOrigin::Command(_, queue) => Some(queue.clone()),
+            RunOrigin::Command(_, queue) | RunOrigin::CommandContinuation(_, queue) => {
+                Some(queue.clone())
+            }
             _ => None,
         };
         let cancelled = match origin {
-            RunOrigin::Command(cancelled, _) => cancelled,
+            RunOrigin::Command(cancelled, _) | RunOrigin::CommandContinuation(cancelled, _) => {
+                cancelled
+            }
             _ => Arc::new(AtomicBool::new(false)),
         };
         {
@@ -1059,9 +1099,7 @@ impl NativeSession {
                     .iter()
                     .map(ag1_core::context::estimate_tokens)
                     .sum::<u64>();
-            let window = preparation.configuration().model["contextWindow"]
-                .as_u64()
-                .unwrap();
+            let window = preparation.configuration().context_limit();
             if attempted_compaction != Some(preparation.journal_revision())
                 && ag1_core::context::compaction::should_compact(
                     estimated.saturating_mul(11).div_ceil(10),
@@ -1270,7 +1308,7 @@ impl NativeSession {
                 let health = ag1_core::runtime::health::analyze(&message, rails);
                 let xml = if error.is_none()
                     && !cancelled.load(Ordering::Acquire)
-                    && (!input.compaction.enabled || !ag1_core::runtime::retry::overflow(&message, generation.configuration().model["contextWindow"].as_u64().unwrap()))
+                    && (!input.compaction.enabled || !ag1_core::runtime::retry::overflow(&message, generation.configuration().context_limit()))
                 {
                     let names = state.configuration().tools.iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect::<Vec<_>>();
                     match xml_fallback.prepare(&mut message, &names, &operation) {
@@ -1432,8 +1470,7 @@ impl NativeSession {
                     self.commit(action, listener).await?;
                 }
             }
-            let window = generation.configuration().model["contextWindow"]
-                .as_u64().unwrap();
+            let window = generation.configuration().context_limit();
             if input.compaction.enabled
                 && (error.is_some() || !has_calls)
                 && ag1_core::runtime::retry::overflow(&message, window)

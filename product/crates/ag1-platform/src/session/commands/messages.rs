@@ -98,24 +98,15 @@ impl SessionCommands {
             let status = if queued.cancelled.load(Ordering::Acquire) {
                 w::OperationStatus::Cancelled
             } else {
-                let text = match &queued.input {
-                    w::PromptInput::Inline { text } => text.clone(),
-                    w::PromptInput::Artifact { artifact } => {
-                        let owner = self.clone();
-                        let artifact = artifact.clone();
-                        self.runtime()
-                            .pool
-                            .submit(move || {
-                                owner
-                                    .artifacts()?
-                                    .bounded_text(artifact.as_str(), MAX_PROMPT_BYTES)
-                            })
-                            .await?
-                    }
-                };
+                let owner = self.clone();
+                let input = queued.input.clone();
+                let message = self
+                    .runtime()
+                    .pool
+                    .submit(move || owner.input_message(&input, now))
+                    .await?;
+                let text = ag1_core::context::hygiene::content(&message, "\n");
                 let id = format!("queued-{}", ag1_storage::digest(key.as_bytes()));
-                let message =
-                    json!({"role":"user","content":[{"type":"text","text":text}],"timestamp":now});
                 let action = loop {
                     self.runtime().wait_for_commit().await?;
                     let mut state = self.runtime().state()?;
@@ -155,6 +146,7 @@ impl SessionCommands {
                     journal_revision: state.journal_revision(),
                     context_epoch: state.stamp().epoch(),
                     execution_settled: true,
+                    error: None,
                     generations: None,
                 })
                 .map_err(|_| DomainError::Conflict)?

@@ -7,4 +7,4 @@ pub mod preview;
 mod runtime;
 mod target;
 pub use runtime::*;
-pub use target::{CheckPort, ProjectPlan, ProjectPort, VisualPort};
+pub use target::{CheckPort, ProjectPlan, ProjectPort, SharedCheck, SharedProject, VisualPort};

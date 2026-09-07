@@ -252,32 +252,48 @@ fn foreign_listener_is_rejected_and_survives() {
 #[test]
 fn stale_readiness_never_certifies_an_owned_run() {
     let mut f = Fixture::new();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
     f.runtime.workspace.create_checked("serve.py",b"import http.server\nclass H(http.server.BaseHTTPRequestHandler):\n def do_GET(self):\n  self.send_response(200);self.end_headers();self.wfile.write(b'old-nonce')\nhttp.server.HTTPServer(('127.0.0.1',int(__import__('sys').argv[1])),H).serve_forever()\n",false,||Ok(())).unwrap();
     let c = AtomicBool::new(false);
     let target = f.runtime.project.targets[0].id.clone();
-    f.runtime
-        .start(
-            &target,
-            "run",
-            Launch {
-                commands: vec![Command {
-                    executable: "/usr/bin/python3".into(),
-                    argv: vec!["serve.py".into(), address.port().to_string()],
-                    cwd: "".into(),
-                }],
-                timeout_ms: 10000,
-                readiness: Some(ag1_platform::projects::ReadyHttp {
-                    address,
-                    path: "/".into(),
-                    expected_body: "new-nonce".into(),
-                }),
-            },
-            &control(&c),
-        )
-        .unwrap();
+    // The OS may reuse a released ephemeral port for another concurrent
+    // fixture. Retry only rejected, unadmitted launches on a new port.
+    let address = (0..8)
+        .find_map(|_| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            let result = f.runtime.start(
+                &target,
+                "run",
+                Launch {
+                    commands: vec![Command {
+                        executable: "/usr/bin/python3".into(),
+                        argv: vec!["serve.py".into(), address.port().to_string()],
+                        cwd: "".into(),
+                    }],
+                    timeout_ms: 10000,
+                    readiness: Some(ag1_platform::projects::ReadyHttp {
+                        address,
+                        path: "/".into(),
+                        expected_body: "new-nonce".into(),
+                    }),
+                },
+                &control(&c),
+            );
+            match result {
+                Ok(_) => Some(address),
+                Err(DomainError::Conflict) => {
+                    assert!(
+                        f.runtime.history().unwrap().is_empty(),
+                        "An admitted operation must never be retried"
+                    );
+                    None
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        })
+        .expect("Could not reserve an unused fixture port");
+
     for _ in 0..15 {
         let result = f.runtime.poll(&control(&c)).unwrap();
         assert_ne!(result.lifecycle, Lifecycle::Ready);
@@ -1008,6 +1024,13 @@ fn real_tauri_frontend_cargo_install_build_and_dev_group() {
 #[test]
 fn structured_and_text_diagnostics_do_not_misclassify_cargo_artifacts() {
     let values = ag1_platform::projects::parse_diagnostics(b"src/file.ts(2,3): error TS2322: wrong type\nmain.go:4:5: missing name\nCompiling thiserror v1.0\n{\"reason\":\"compiler-artifact\",\"package_id\":\"thiserror\"}\n", "compiler");
+    assert!(
+        ag1_platform::projects::parse_diagnostics(
+            br#"127.0.0.1 - - [07/Sep/2026 03:44:44] "GET /error HTTP/1.0" 200 -"#,
+            "process"
+        )
+        .is_empty()
+    );
     assert_eq!(values.len(), 2);
     assert_eq!(values[0].file.as_deref(), Some("src/file.ts"));
     assert_eq!(values[0].column, Some(3));

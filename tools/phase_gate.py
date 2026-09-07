@@ -185,6 +185,9 @@ def main():
     elif args.phase=='P11':
         from project_gate import execute_p11
         execute_p11()
+    elif args.phase=='P12':
+        from client_gate import execute_p12
+        execute_p12()
     else:raise GateError(f'{args.phase} has no implemented gate yet; refusing a placeholder pass')
 
 

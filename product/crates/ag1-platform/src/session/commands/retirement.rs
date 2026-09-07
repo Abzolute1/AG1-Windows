@@ -56,6 +56,7 @@ impl SessionCommands {
                         journal_revision: state.journal_revision(),
                         context_epoch: state.stamp().epoch(),
                         execution_settled: true,
+                        error: None,
                         generations: Some(0),
                     })
                     .map_err(|_| DomainError::Conflict)?

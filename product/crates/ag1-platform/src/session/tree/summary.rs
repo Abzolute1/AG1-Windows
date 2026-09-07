@@ -40,9 +40,7 @@ impl NativeSession {
                 .iter()
                 .map(ag1_core::context::estimate_tokens)
                 .sum::<u64>();
-        if estimate.saturating_mul(11).div_ceil(10)
-            > configuration.model["contextWindow"].as_u64().unwrap_or(0)
-        {
+        if estimate.saturating_mul(11).div_ceil(10) > configuration.context_limit() {
             return Err(DomainError::LimitExceeded(
                 "branch summary context admission margin".into(),
             ));

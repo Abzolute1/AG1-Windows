@@ -83,6 +83,82 @@ impl NativeSession {
         );
         Ok((scope, snapshot))
     }
+    pub(super) async fn client_resource(
+        self: &Arc<Self>,
+        tools: Arc<dyn super::ToolRunner>,
+        operation: String,
+        name: String,
+        args: serde_json::Value,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<super::TurnResult, DomainError> {
+        let service = tools.client_resources().ok_or_else(|| {
+            DomainError::Unavailable("Resource helpers are not configured".into())
+        })?;
+        let activity = self.enter_owned()?;
+        let runtime = self.clone();
+        self.pool
+            .submit(move || {
+                let _activity = activity;
+                let _mode =
+                    super::print::ModeLease::begin_with_cancel(&runtime, None, cancel.clone())?;
+                let (scope, _) = runtime.lifecycle_snapshot()?;
+                let result = service.execute(&scope, &operation, &name, &args, &cancel)?;
+                if result["record"]["status"] != "completed" || result["result"]["isError"] == true
+                {
+                    return Err(DomainError::Unavailable(format!(
+                        "Resource action ended with {}",
+                        result["record"]["status"]
+                    )));
+                }
+                Ok(super::TurnResult {
+                    generations: 0,
+                    journal_revision: runtime.journal_revision()?,
+                    assistant: result,
+                })
+            })
+            .await
+    }
+    pub(super) async fn client_extension(
+        self: &Arc<Self>,
+        tools: Arc<dyn super::ToolRunner>,
+        method: String,
+        args: serde_json::Value,
+        cancel: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<super::TurnResult, DomainError> {
+        let extension = tools
+            .client_extensions()
+            .ok_or_else(|| DomainError::Unavailable("No admitted extension host".into()))?;
+        let activity = self.enter_owned()?;
+        let runtime = self.clone();
+        self.pool
+            .submit(move || {
+                let _activity = activity;
+                let _mode =
+                    super::print::ModeLease::begin_with_cancel(&runtime, None, cancel.clone())?;
+                let (scope, snapshot) = runtime.lifecycle_snapshot()?;
+                let result = extension.client_call(
+                    &scope,
+                    &snapshot,
+                    &method,
+                    &args,
+                    &crate::resource_fs::ScanControl {
+                        cancel: &cancel,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(300),
+                    },
+                )?;
+                if runtime.journal_revision()? != scope.revision
+                    || runtime.context_epoch()? != scope.epoch
+                {
+                    return Err(DomainError::Conflict);
+                }
+                Ok(super::TurnResult {
+                    generations: 0,
+                    journal_revision: scope.revision,
+                    assistant: result.unwrap_or(serde_json::Value::Null),
+                })
+            })
+            .await
+    }
     pub(super) fn lifecycle_event_sync(
         &self,
         tools: &dyn super::ToolRunner,

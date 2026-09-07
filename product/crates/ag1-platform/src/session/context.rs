@@ -108,7 +108,7 @@ impl NativeSession {
             None
         };
         let activity = self.retain_work()?;
-        self.pool
+        let prepared=self.pool
             .submit(move || {
                 let _activity = activity;
                 if let Some((tools, cancel)) = callback {
@@ -239,7 +239,16 @@ impl NativeSession {
                     },
                 })
             })
-            .await
+            .await?;
+        *self
+            .last_context
+            .lock()
+            .map_err(|_| DomainError::Conflict)? = json!({
+            "state":"prepared", "journal_revision":revision.to_string(),
+            "stats":prepared.projection.stats,
+            "sources":prepared.witness.sources.values().map(|s|json!({"reference":s.reference,"status":format!("{:?}",s.status),"current":s.current})).collect::<Vec<_>>()
+        });
+        Ok(prepared)
     }
 
     pub(super) async fn context_current(
@@ -287,7 +296,7 @@ pub(super) fn research_profile(
 ) -> Result<ag1_core::tools::research::Profile, ag1_core::DomainError> {
     use ag1_core::context::{compaction::usage_estimate, estimate_tokens};
     let config = state.configuration();
-    let window = config.model["contextWindow"].as_f64().unwrap_or(0.);
+    let window = config.context_limit() as f64;
     let messages = state.messages().values().cloned().collect::<Vec<_>>();
     let latest_compaction = state
         .branch()

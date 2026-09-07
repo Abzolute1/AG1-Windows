@@ -111,3 +111,72 @@ test("long approvals require paging through the full request before enabling All
     ),
   ).toHaveLength(0);
 });
+
+test("late native theme bootstrap cannot overwrite a user's newer choice", async () => {
+  let resolveCatalog!: (value: unknown) => void;
+  invoke.mockImplementation((name: string) => name === "catalog" ? new Promise(resolve => { resolveCatalog = resolve; }) : Promise.resolve({ snapshot: null, error: null, progress: "" }));
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "Toggle theme" }));
+  const chosen = document.documentElement.classList.contains("dark");
+  resolveCatalog({ projects: [], theme: chosen ? "light" : "dark" });
+  await waitFor(() => expect(document.documentElement.classList.contains("dark")).toBe(chosen));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  expect(document.documentElement.classList.contains("dark")).toBe(chosen);
+});
+
+vi.mock("./Editor", () => ({ default: ({ text, onChange }: { text: string; onChange: (text: string) => void }) => <textarea aria-label="File editor" value={text} onChange={e => onChange(e.target.value)} /> }));
+function fileFixture(save: (args: any) => Promise<unknown>) {
+  const snapshot = { version: { major: 1, minor: 0, schema: "fixture" }, scope: { workspace: "ws", session: "s", instance: "i", epoch: "1" }, revision: "1", watermark: "1", workspace_path: "/fixture", status: "idle", active_operation: null, messages: [], message_count: 0, pending: [], model: "fixture", diagnostic: null, session_file: null, fixture_provider: true };
+  invoke.mockImplementation(async (name: string, args: any) => {
+    if (name === "catalog") return { projects: [], theme: "light" };
+    if (name === "bridge_view") return { snapshot, error: null, progress: "" };
+    if (name === "bridge_command") {
+      const command = args.envelope.command;
+      const data = command.action === "list" ? ["notes.txt"] : command.action === "read" ? { path: "notes.txt", text: "original", revision: "file-1" } : await save(command.args);
+      return { kind: "reply", id: args.envelope.id, scope: snapshot.scope, revision: "1", durable: false, status: "query", data };
+    }
+  });
+}
+async function editFile() {
+  render(<App />);
+  await waitFor(() => expect(invoke.mock.calls.some(([name]) => name === "bridge_view")).toBe(true));
+  await new Promise(resolve => setTimeout(resolve, 30));
+  fireEvent.click(screen.getByRole("button", { name: "Files" }));
+  fireEvent.click(await screen.findByRole("button", { name: "notes.txt" }));
+  const editor = await screen.findByRole("textbox", { name: "File editor" });
+  fireEvent.change(editor, { target: { value: "local edit" } });
+  return editor as HTMLTextAreaElement;
+}
+test("failed native save retains the dirty editor buffer", async () => {
+  fileFixture(async () => { throw new Error("File revision conflict"); });
+  const editor = await editFile();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText("File revision conflict");
+  expect(editor.value).toBe("local edit");
+  expect(screen.getByLabelText("Unsaved changes")).toBeTruthy();
+});
+test("a late successful save cannot discard typing entered after submission", async () => {
+  let resolveSave!: (value: unknown) => void;
+  fileFixture(() => new Promise(resolve => { resolveSave = resolve; }));
+  const editor = await editFile();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(resolveSave).toBeTypeOf("function"));
+  fireEvent.change(editor, { target: { value: "newer local edit" } });
+  resolveSave({ path: "notes.txt", text: "local edit", revision: "file-2" });
+  await waitFor(() => expect(screen.getByRole("button", { name: "Save" }).hasAttribute("disabled")).toBe(false));
+  expect(editor.value).toBe("newer local edit");
+  expect(screen.getByLabelText("Unsaved changes")).toBeTruthy();
+});
+
+test("native polling keeps one shortcut subscription and leaves the command queue usable", async () => {
+  const snapshot = { version: { major: 1, minor: 0, schema: "fixture" }, scope: { workspace: "ws", session: "s", instance: "i", epoch: "1" }, revision: "1", watermark: "1", workspace_path: "/fixture", status: "idle", active_operation: null, messages: [], message_count: 0, pending: [], model: "fixture", diagnostic: null, session_file: null, fixture_provider: true };
+  let polls = 0;
+  invoke.mockImplementation(async (name: string, args: any) => {
+    if (name === "catalog") return { projects: [], theme: "light" };
+    if (name === "bridge_view") return { snapshot: { ...snapshot }, error: null, progress: String(++polls), details: { authority: "rust-isolated", messages: [], task: null, context: {}, memory: null, artifacts: [], activity: {}, models: [], capabilities: [] } };
+    if (name === "bridge_command") return { kind: "reply", id: args.envelope.id, scope: snapshot.scope, revision: "1", durable: false, status: "rejected", data: { detail: "No extension host" } };
+  });
+  render(<App />);
+  await waitFor(() => expect(polls).toBeGreaterThan(8));
+  expect(invoke.mock.calls.filter(([name, args]) => name === "bridge_command" && args.envelope.command.action === "extension_settings")).toHaveLength(1);
+});

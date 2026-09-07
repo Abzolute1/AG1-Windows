@@ -394,6 +394,27 @@ impl NativeToolRunner {
     }
 }
 impl ToolRunner for NativeToolRunner {
+    fn client_activity(&self) -> Result<Value, DomainError> {
+        self.adapters
+            .jobs
+            .as_ref()
+            .map(|jobs| jobs.client_records())
+            .unwrap_or_else(|| Ok(serde_json::json!({"jobs":[]})))
+    }
+    fn client_resources(&self) -> Option<Arc<crate::client::resource_actions::Actions>> {
+        self.adapters.resources.clone()
+    }
+    fn client_extensions(&self) -> Option<Arc<super::extensions::NativeExtensions>> {
+        self.adapters.extensions.clone()
+    }
+    fn client_catalog(&self) -> Vec<Value> {
+        let names = self.adapters.available_names();
+        self.registry
+            .public_tools()
+            .into_iter()
+            .filter(|tool| names.iter().any(|name| tool["name"] == *name))
+            .collect()
+    }
     fn supports_planning(&self) -> bool {
         true
     }
