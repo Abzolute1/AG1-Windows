@@ -2,6 +2,37 @@
 
 This handoff does not start P14. Require `implementation/evidence/P13/completion.json` with status `passed`, no pending gates and a valid complete artifact manifest before beginning any dependent work. The P13 task stops after its completion commit. Read the final P13 REPORT, `product/clients/CUTOVER.md`, compatibility dispositions and all L01–L08 requirements first.
 
+## Accepted entry and read-only verification
+
+P13 completed in commit `fca1500`, with 46 cutover contracts, 767 native regressions, 36 live canaries and all 149 artifact references verified. Native authority was active at epoch 2 and quiescent. The updated [P14 plan](../phases/P14-release-and-long-horizon-gates.md) carries forward the concrete build, recovery, performance and evidence boundaries. P14 implementation has not started; its gate and `release-differential` suite still need implementation.
+
+Verify the accepted entry without rerunning phase gates that overwrite their reports:
+
+```sh
+git status --short
+git log -3 --oneline
+python3 - <<'PY'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, 'tools')
+from phase_gate import verify_dependencies
+from cutover_gate import inputs
+root = Path.cwd()
+for phase in json.loads((root / 'planning/phase-graph.json').read_text()):
+    verify_dependencies(phase)
+p13 = json.loads((root / 'implementation/evidence/P13/completion.json').read_text())
+assert p13['status'] == 'passed' and not p13['pending_gates']
+assert p13['P14_started'] is False
+assert inputs() == p13['input_fingerprints']['product'], 'Review changes since accepted P13 before proceeding'
+print('P13 and prior artifact manifests verified; current inputs match accepted P13')
+PY
+sha256sum /home/alex/.ag1/agent/llamacpp-model-profiles.json product/target/release/ag1-process-host
+product/target/release/ag1-cutover inspect /home/alex/Projects/Cruzible
+```
+
+The input equality check applies before P14 implementation changes. Preserve the accepted fingerprints and record subsequent regressions under P14; do not rewrite P13 to make new source appear historically tested. Inspect current process ownership and perform fresh runtime preservation verification before live admission. When the native owner is quiescent, `product/target/release/ag1-cutover audit-cutover /home/alex/Projects/Cruzible` performs the full read-only inspection; allow time for its material/archive hashing (the measured P13 audit took about nine minutes). Inspection does not grant execution control.
+
 ## Selected local state
 
 The selected workspace is `/home/alex/Projects/Cruzible`, session `934360d3-bd97-4246-b48f-cee4addcf168`. Its durable per-user authority is under `/home/alex/.local/state/ag1/authority-v1`; native state is `/home/alex/Projects/AG1/.local/p13-production-20260907/native-state`. Ordinary desktop/CLI startup must obey that record. Do not create a second authority namespace or reopen the original TS state as a writer.
