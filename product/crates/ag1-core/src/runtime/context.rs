@@ -31,11 +31,21 @@ pub fn working_state(
     branch: &[Value],
     messages: &[Value],
     artifacts: &impl ContextArtifactPort,
+    validate: impl FnMut(&str) -> Option<SourceValidation>,
+) -> Option<String> {
+    working_state_with_task_tool(branch, messages, artifacts, validate, true)
+}
+/// The host supplies availability from the exact selected request tool catalog.
+pub fn working_state_with_task_tool(
+    branch: &[Value],
+    messages: &[Value],
+    artifacts: &impl ContextArtifactPort,
     mut validate: impl FnMut(&str) -> Option<SourceValidation>,
+    task_tool_available: bool,
 ) -> Option<String> {
     let task = latest_task(branch);
     let task_text = task.as_ref().and_then(|task| {
-        projections::task(
+        projections::task_with_tool(
             task,
             |source| {
                 let mut verdict = validate(source)?;
@@ -51,6 +61,7 @@ pub fn working_state(
                 Some(verdict)
             },
             |id| task.checkpoint_verified(id, branch),
+            task_tool_available,
         )
     });
     let runtime = [

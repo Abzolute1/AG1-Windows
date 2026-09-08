@@ -39,6 +39,17 @@ pub(super) fn poll(
     }
 }
 impl Host {
+    /// Explicit native preview actions share the command/poll exclusion gate.
+    /// Waiting is asynchronous; scope and authority are checked after admission.
+    /// The callback executes once, with no retry of a partially performed effect.
+    pub async fn with_project_control<T>(
+        &self,
+        scope: &w::Scope,
+        f: impl FnOnce(&crate::projects::Runtime) -> Result<T>,
+    ) -> Result<T> {
+        let _control = self.controls.lock().await;
+        self.with_project(scope, f)
+    }
     /// Host-only capability access for native preview windows. The renderer can
     /// select an action, but cannot supply a runtime, process, origin or grant.
     pub fn with_project<T>(
@@ -205,3 +216,6 @@ impl Host {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

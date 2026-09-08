@@ -17,14 +17,32 @@ fn clip(text: String, cap: usize, marker: &str) -> String {
 }
 pub fn task(
     state: &TaskState,
+    validate: impl FnMut(&str) -> Option<SourceValidation>,
+    verify: impl FnMut(&str) -> bool,
+) -> Option<String> {
+    task_with_tool(state, validate, verify, true)
+}
+/// Keep recorded evidence visible when the selected tools cannot edit task state.
+pub fn task_with_tool(
+    state: &TaskState,
     mut validate: impl FnMut(&str) -> Option<SourceValidation>,
     mut verify: impl FnMut(&str) -> bool,
+    task_tool_available: bool,
 ) -> Option<String> {
     let s = state.value();
     if string(s, "objective").is_empty() {
         return None;
     }
-    let mut lines=vec!["Current task control state (claims retain their evidence/confidence; update with taskState):".into(),format!("objective: {}",string(s,"objective")),format!("status: {}",string(s,"status"))];
+    let heading = if task_tool_available {
+        "Current task control state (claims retain their evidence/confidence; update with taskState):"
+    } else {
+        "Recorded task state (read-only in this turn; claims retain their evidence/confidence):\nThe taskState tool is unavailable. Shell output cannot update this state. Its recorded status does not require bookkeeping before answering the latest user instruction."
+    };
+    let mut lines = vec![
+        heading.into(),
+        format!("objective: {}", string(s, "objective")),
+        format!("status: {}", string(s, "status")),
+    ];
     for (field, label) in [
         ("currentPhase", "phase"),
         ("latestInstruction", "latest_user_instruction"),
@@ -38,7 +56,11 @@ pub fn task(
         "next_action: {}",
         s["nextAction"]
             .as_str()
-            .unwrap_or("not recorded; choose and record an evidence-bearing next action")
+            .unwrap_or(if task_tool_available {
+                "not recorded; choose and record an evidence-bearing next action"
+            } else {
+                "not recorded; use the latest instruction and current evidence to decide whether more work is needed"
+            })
     ));
     if !string(s, "blockerId").is_empty() {
         lines.push(format!("active_blocker: {}", string(s, "blockerId")));
@@ -150,7 +172,11 @@ pub fn task(
     Some(clip(
         lines.join("\n"),
         6000,
-        "[task state clipped; use taskState show for the complete state]",
+        if task_tool_available {
+            "[task state clipped; use taskState show for the complete state]"
+        } else {
+            "[recorded task state clipped; taskState is unavailable in this turn]"
+        },
     ))
 }
 pub fn memory(selection: &MemorySelection) -> Option<String> {

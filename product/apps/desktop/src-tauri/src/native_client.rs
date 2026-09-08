@@ -122,9 +122,12 @@ impl NativeClient {
         let w::Command::Project { action, .. } = &envelope.command else {
             return Err("Invalid preview action".into());
         };
-        let mut preview = self.preview.lock().map_err(|_| "Preview lock")?;
         let data = host
-            .with_project(&envelope.scope, |runtime| {
+            .with_project_control(&envelope.scope, |runtime| {
+                let mut preview = self
+                    .preview
+                    .lock()
+                    .map_err(|_| ag1_core::DomainError::Conflict)?;
                 let error = |e: String| ag1_core::DomainError::Unavailable(e);
                 match action.as_str() {
                     "preview_open" => {
@@ -151,6 +154,7 @@ impl NativeClient {
                 }
                 Ok(serde_json::json!({"open":preview.is_some()}))
             })
+            .await
             .map_err(|e| format!("{e:?}"))?;
         serde_json::to_value(w::BridgeFrame::Reply {
             id: envelope.id,

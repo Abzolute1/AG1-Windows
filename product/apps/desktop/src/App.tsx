@@ -89,17 +89,15 @@ export default function App() {
       .catalog()
       .then(next => setCatalog(current => themeGeneration.current === themeAtStart ? next : { ...next, theme: current.theme }))
       .catch((e) => setError(String(e)));
-    let cancelled = false,
-      inflight = false;
-    let native = false, lastPoll = 0;
+  }, []);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const poll = async () => {
-      if (!native && Date.now() - lastPoll < 150) return;
-      lastPoll = Date.now();
-      if (inflight) return;
-      inflight = true;
+      let delay = active ? (view.details ? 16 : 150) : 1000;
       try {
         const next = await api.view();
-        native = !!next.details;
+        delay = next.snapshot ? (next.details ? 16 : 150) : 1000;
         if (!cancelled)
           setView((previous) =>
             JSON.stringify(previous) === JSON.stringify(next) ? previous : next,
@@ -107,16 +105,17 @@ export default function App() {
       } catch (e) {
         if (!cancelled) setError(String(e));
       } finally {
-        inflight = false;
+        if (!cancelled) timer = setTimeout(poll, delay);
       }
     };
     void poll();
-    const timer = setInterval(poll, 16);
     return () => {
       cancelled = true;
-      clearInterval(timer);
+      clearTimeout(timer);
     };
-  }, []);
+    // Opening a session starts its streaming cadence immediately. Empty-home
+    // observation does not need a 60 Hz wakeup loop or overlapping requests.
+  }, [!!active, !!view.details]);
   useEffect(() => {
     if (active)
       setHistory((h) =>

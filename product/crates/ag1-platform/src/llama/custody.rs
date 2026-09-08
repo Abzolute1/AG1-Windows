@@ -172,6 +172,17 @@ where
                     // Rehash/material identity checks run for every admission, even
                     // when an already owned model reports healthy on the endpoint.
                     s.controller.host_mut().verify_materials(&plan.materials)?;
+                    if let Some(previous) = s.active.clone()
+                        && s.controller.reap_exited_owned_runtime()?
+                    {
+                        s.events.push(Event {
+                            plan_sha256: plans[&previous].plan_sha256.clone(),
+                            model: previous,
+                            action: "owned_exit".into(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        });
+                        s.active = None;
+                    }
                     if s.active.as_deref() != Some(&model) {
                         if let Some(previous) = s.active.clone() {
                             s.controller.stop_owned_runtime()?;

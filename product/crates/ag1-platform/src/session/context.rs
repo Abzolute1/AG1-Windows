@@ -21,6 +21,8 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
+const SOURCE_VERIFICATION_SCOPE: &str = "<source-verification-scope>\nBefore declaring a source change complete, compare the resulting code against each requirement in the latest instruction and current authoritative evidence. Read the relevant verifier to identify what its assertions cover. Run the canonical verifier when one is provided; do not weaken existing checks to make them pass. Use focused checks for uncovered boundary or degenerate inputs implied by the contract. A passing command proves only the checks it executed. Base completion claims on the current code and observed results; identify any remaining unverified behavior.\n</source-verification-scope>";
+
 pub(super) struct ContextWitness {
     observes_memory: bool,
     memory_revision: Option<String>,
@@ -31,6 +33,7 @@ pub(super) struct PreparedContext {
     pub system_prompt: String,
     pub witness: ContextWitness,
     pub loaded_memory: std::collections::BTreeSet<String>,
+    pub working_set: Option<super::working_set::WorkingSet>,
 }
 impl NativeSession {
     pub(super) async fn retain_provider_output(
@@ -87,6 +90,18 @@ impl NativeSession {
         callback: Option<(Arc<dyn super::ToolRunner>, Arc<AtomicBool>)>,
     ) -> Result<PreparedContext, DomainError> {
         let branch = preparation.branch().to_vec();
+        let stamp = preparation.stamp().clone();
+        // Context callbacks may rewrite arbitrary history. Preserve their raw
+        // input and bypass reuse; a successful such request clears the cache.
+        let reuse = if callback.is_none() && !self.delegated {
+            self.working_set
+                .lock()
+                .map_err(|_| DomainError::Conflict)?
+                .clone()
+        } else {
+            None
+        };
+        let cacheable = callback.is_none() && !self.delegated;
         let mut messages = preparation.messages().clone().into_values();
         let mut configuration = preparation.configuration().clone();
         let mut options = preparation.compile_options();
@@ -131,6 +146,7 @@ impl NativeSession {
                         projection: Compilation { messages:messages::to_provider(&ag1_core::context::hygiene::live(&reduced,chrono::DateTime::parse_from_rfc3339(&timestamp).map_err(|_| DomainError::InvalidInput("subagent timestamp".into()))?.timestamp_millis().max(0) as u64))?, stats:json!({"mode":"subagent-hygiene"}) },
                         system_prompt:configuration.system_prompt,
                         loaded_memory:Default::default(),
+                        working_set:None,
                         witness:ContextWitness { observes_memory:false,memory_revision:None,sources:Default::default() },
                     });
                 }
@@ -160,6 +176,12 @@ impl NativeSession {
                     Features::default(),
                 )?;
                 let (memory, memory_revision) = MemoryService::load(store.as_ref(), &memory_id)?;
+                let key = json!({"model":configuration.model,"thinking":configuration.thinking,
+                    "tools":configuration.tools,"system":configuration.system_prompt,
+                    "compiler":options,"memory_revision":memory_revision});
+                let reused = reuse.as_ref().and_then(|cache|cache.extend(&stamp,&key,&branch,&messages));
+                let cache_hit = reused.is_some();
+                let compiler_input = reused.as_deref().unwrap_or(&messages);
                 let query = context::latest_query(&messages).unwrap_or_default();
                 let selected = memory.select(&query, 1600, 16, |entry| {
                     memory_sources(entry, |source| {
@@ -177,6 +199,11 @@ impl NativeSession {
                     configuration.system_prompt.push_str("\n\n");
                     configuration.system_prompt.push_str(&addendum);
                 }
+                if configuration.tools.iter().any(|tool| tool["name"].as_str()
+                    .is_some_and(ag1_core::runtime::policy::orchestrator::mutation_tool)) {
+                    configuration.system_prompt.push_str("\n\n");
+                    configuration.system_prompt.push_str(SOURCE_VERIFICATION_SCOPE);
+                }
                 if let Some(controlled) = &controlled {
                     let controller = controlled.lock().map_err(|_| DomainError::Conflict)?;
                     configuration.system_prompt.push_str(&controller.policy().format());
@@ -187,7 +214,8 @@ impl NativeSession {
                         configuration.system_prompt.push_str(&format!("\nControlled runtime: next required action: {next}."));
                     }
                 }
-                let tail = context::working_state(&branch, &messages, &artifacts, validate);
+                let task_tool_available = configuration.tools.iter().any(|tool| tool["name"] == "taskState");
+                let tail = context::working_state_with_task_tool(&branch, &messages, &artifacts, validate, task_tool_available);
                 let original = context::append_working_state(&messages, tail.as_deref())?;
                 let tail_tokens = tail
                     .as_ref()
@@ -214,9 +242,12 @@ impl NativeSession {
                     &[],
                     None,
                 )?;
+                let mut canonical_working = None;
                 let projection = artifacts
                     .project(&original, revision, |_, store| {
-                        let mut compiled = compile_request(&messages, &options, store)?;
+                        let mut compiled = compile_request(compiler_input, &options, store)?;
+                        if cacheable { canonical_working = Some(compiled.messages.clone()); }
+                        compiled.stats["workingSetReused"] = json!(cache_hit);
                         compiled.messages = messages::to_provider(&context::append_working_state(
                             &compiled.messages,
                             tail.as_deref(),
@@ -224,8 +255,10 @@ impl NativeSession {
                         Ok(compiled)
                     })?
                     .projection;
+                let working_set = canonical_working.map(|compiled| super::working_set::WorkingSet::new(stamp,key,branch,messages,compiled));
                 Ok(PreparedContext {
                     projection,
+                    working_set,
                     loaded_memory: selected
                         .entries
                         .iter()

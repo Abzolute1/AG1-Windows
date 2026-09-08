@@ -84,7 +84,28 @@ async fn real_loopback_http_preserves_headers_body_and_fragmented_eof() {
         socket.write_all(b"0\r\n\r\n").unwrap();
         input
     });
-    let http = ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1)).unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new((Vec::new(), 0)));
+    let captured = observed.clone();
+    let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_request = sent.clone();
+    let http = ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1))
+        .unwrap()
+        .with_request_observer(std::sync::Arc::new(move |url, bytes| {
+            captured_request
+                .lock()
+                .unwrap()
+                .push((url.to_owned(), bytes.to_vec()));
+            Ok(())
+        }))
+        .with_response_observer(std::sync::Arc::new(move |chunk| {
+            let mut state = captured.lock().unwrap();
+            if let Some(bytes) = chunk {
+                state.0.extend_from_slice(bytes);
+            } else {
+                state.1 += 1;
+            }
+            Ok(())
+        }));
     let (_source, mut cancel) = cancellation();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut response = http
@@ -100,9 +121,22 @@ async fn real_loopback_http_preserves_headers_body_and_fragmented_eof() {
     }
     assert_eq!(body, "data: 🌙\n\n".as_bytes());
     assert!(response.settled());
+    assert!(
+        response
+            .chunk(deadline, &mut cancel)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(*observed.lock().unwrap(), (body.clone(), 1));
     let recorded = String::from_utf8(server.join().unwrap()).unwrap();
     assert!(recorded.contains("authorization: Bearer fixture-token\r\n"));
     assert!(recorded.ends_with("{\"model\":\"fixture\"}"));
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, format!("{origin}/v1/chat/completions"));
+    assert_eq!(sent[0].1, b"{\"model\":\"fixture\"}");
+    assert!(recorded.as_bytes().ends_with(&sent[0].1));
 }
 #[tokio::test]
 async fn redirects_never_forward_credentials_and_unconfigured_origins_fail_before_network() {

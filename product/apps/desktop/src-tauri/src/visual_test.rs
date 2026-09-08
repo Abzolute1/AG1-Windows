@@ -13,7 +13,57 @@ use tauri::Manager;
 use webkit2gtk::WebViewExt;
 pub fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = std::env::var("AG1_FIXTURE_PROVIDER").as_deref() == Ok("1");
-    if let Some(workspace) = std::env::var_os("AG1_CUTOVER_WORKSPACE") {
+    if let Some(workspace) = std::env::var_os("AG1_RELEASE_WORKSPACE") {
+        if fixture || std::env::var_os("AG1_CUTOVER_WORKSPACE").is_some() {
+            return Err("Release visual mode cannot combine fixture or migrated authority".into());
+        }
+        let workspace = std::fs::canonicalize(workspace)?;
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../..")
+            .join(".local/p14-long-horizon")
+            .canonicalize()?;
+        if !workspace.starts_with(&base) {
+            return Err("Release visual mode requires a disposable P14 workspace".into());
+        }
+        let configuration = PathBuf::from(
+            std::env::var_os("AG1_NATIVE_CONFIG")
+                .ok_or("Release visual mode requires explicit native configuration")?,
+        )
+        .canonicalize()?;
+        if !configuration.starts_with(workspace.parent().ok_or("Workspace parent")?) {
+            return Err(
+                "Release visual configuration must belong to the disposable workload".into(),
+            );
+        }
+        let bytes = fs::read(&configuration)?;
+        if bytes.len() > 1024 * 1024 {
+            return Err("Native configuration too large".into());
+        }
+        let config: ag1_platform::client::Config = serde_json::from_slice(&bytes)?;
+        if config.fixture || config.runtime.is_none() {
+            return Err("Release visual mode requires ordinary preserved-runtime admission".into());
+        }
+        let record = ag1_platform::cutover::Registry::for_user()
+            .and_then(|registry| registry.inspect(&workspace))
+            .map_err(|_| "Cannot inspect disposable native authority")?
+            .ok_or("Disposable native authority is absent")?;
+        if !record.isolated
+            || !record.quiescent
+            || record.owner != ag1_platform::cutover::Owner::Native
+            || record.stage != ag1_platform::cutover::Stage::Active
+            || record.transfer.is_some()
+            || record.rollback.is_some()
+            || record
+                .state
+                .as_ref()
+                .is_none_or(|state| !state.starts_with(workspace.parent().unwrap()))
+        {
+            return Err("Release visual mode requires quiescent isolated native state".into());
+        }
+        // The subsequent ordinary Host::open still obtains the workspace/runtime
+        // leases and verifies the full preserved capture. This is test-broker
+        // admission only; no fixture owner or alternative runtime is created.
+    } else if let Some(workspace) = std::env::var_os("AG1_CUTOVER_WORKSPACE") {
         if fixture || std::env::var_os("AG1_NATIVE_CONFIG").is_some() {
             return Err(
                 "Cutover visual mode requires the recorded production configuration".into(),

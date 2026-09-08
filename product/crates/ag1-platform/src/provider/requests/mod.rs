@@ -2,6 +2,8 @@
 //! credential lookup, model startup or scheduler acquisition occurs here.
 mod chat;
 mod options;
+mod session_options;
+pub use session_options::session_options;
 mod structured;
 use ag1_core::{DomainError, provider::ApiFamily};
 use serde_json::{Value, json};

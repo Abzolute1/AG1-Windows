@@ -85,6 +85,19 @@ impl<H: RuntimeHost> RuntimeController<H> {
     pub fn host_mut(&mut self) -> &mut H {
         &mut self.host
     }
+    /// Reconcile an authenticated owned exit before admitting another request.
+    /// Keep the handle until its supervisor/tree has verifiably settled; a dead
+    /// model PID alone does not prove that all owned descendants have exited.
+    pub fn reap_exited_owned_runtime(&mut self) -> Result<bool, DomainError> {
+        let Some(handle) = self.owned.as_ref() else {
+            return Ok(false);
+        };
+        if self.host.owned_alive(handle)? {
+            return Ok(false);
+        }
+        self.stop_owned_runtime()?;
+        Ok(true)
+    }
     pub fn owned_resources(&mut self) -> Result<Option<serde_json::Value>, DomainError> {
         let handle = self.owned.as_ref().ok_or(DomainError::PermissionDenied)?;
         if !self.host.owned_alive(handle)? {
@@ -158,8 +171,7 @@ impl<H: RuntimeHost> RuntimeController<H> {
         match self.host.owned_alive(handle) {
             Ok(true) => (),
             Ok(false) => {
-                self.owned = None;
-                self.plan_hash = None;
+                self.stop_owned_runtime()?;
                 self.state =
                     RuntimeState::Failed("owned runtime exited during load/generation".into());
                 return Err(DomainError::Unavailable("runtime exited".into()));

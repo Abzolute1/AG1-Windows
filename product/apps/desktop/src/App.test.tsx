@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
 import App from "./App";
 import { previewDocument } from "./preview";
 vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
@@ -15,7 +15,20 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
+});
+test("empty home bounds host polling and unmount cancels future requests", async () => {
+  vi.useFakeTimers();
+  const rendered = render(<App />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+  const calls = () => invoke.mock.calls.filter(([name]) => name === "bridge_view").length;
+  expect(calls()).toBeGreaterThan(0);
+  expect(calls()).toBeLessThanOrEqual(3);
+  const before = calls();
+  rendered.unmount();
+  await act(async () => { await vi.advanceTimersByTimeAsync(2500); });
+  expect(calls()).toBe(before);
 });
 test("home opens a keyboard-accessible project dialog without starting a model", async () => {
   render(<App />);

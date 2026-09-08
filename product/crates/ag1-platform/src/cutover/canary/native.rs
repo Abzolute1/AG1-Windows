@@ -108,6 +108,15 @@ where
             verifier: Arc::new(Mutex::new(verifier)),
         })
     }
+    /// Opt-in diagnostic capture for the Rust transport only. The pinned TS
+    /// adapter and request/model settings remain unchanged.
+    pub fn with_response_observer(
+        mut self,
+        observer: crate::provider::http::ResponseObserver,
+    ) -> Self {
+        self.http = self.http.with_response_observer(observer);
+        self
+    }
     async fn execute(&mut self, runner: Runner, request: &Request) -> Result<Answer> {
         self.serial = self.serial.checked_add(1).ok_or(DomainError::QueueFull)?;
         let id = format!("p13-canary-{}", self.serial);
@@ -131,6 +140,13 @@ where
         };
         let http_request =
             generation_http_request(&input, HttpCredential::ApiKey(&key), 4 * 1024 * 1024)?;
+        // The recorded comparator payload must describe the actual Rust body,
+        // not merely a second independently assembled expectation.
+        if serde_json::from_slice::<Value>(&http_request.body).map_err(crate::cutover::json)?
+            != expected
+        {
+            return Err(DomainError::Conflict);
+        }
         // Loading is excluded from provider TTFT for both implementations.
         self.runtime.prepare(&http_request).await?;
         let runtime_before = self.runtime.resources().await?;

@@ -57,6 +57,7 @@ mod tool_inference;
 pub mod tool_journal;
 pub mod tree;
 pub mod verification;
+mod working_set;
 mod xml;
 static NEXT_TURN: AtomicU64 = AtomicU64::new(1);
 
@@ -240,6 +241,7 @@ struct ActiveTurn {
 pub struct NativeSession {
     state: Arc<Mutex<SessionRuntime>>,
     last_context: Mutex<Value>,
+    working_set: Mutex<Option<working_set::WorkingSet>>,
     store: Arc<Store>,
     origin: String,
     workspace: String,
@@ -358,6 +360,7 @@ impl NativeSession {
             .is_empty();
         Ok(Self {
             last_context: Mutex::new(Value::Null),
+            working_set: Mutex::new(None),
             state: Arc::new(Mutex::new(state)),
             store,
             origin,
@@ -1083,7 +1086,7 @@ impl NativeSession {
             let prepared_context = self.prepare_context(&preparation,&operation,&input.timestamp, mode.and_then(|lease| lease.verification_command.as_deref()), mode.and_then(|lease| lease.controlled.as_ref()).cloned(),
                 tools.handles_session_event("context").then(|| (tools.clone(), cancelled.clone()))).await
                 .and_then(|context| {preparation.set_system_prompt(context.system_prompt.clone())?;Ok(context)});
-            let context::PreparedContext {projection,witness,loaded_memory,..} = match prepared_context {
+            let context::PreparedContext {projection,witness,loaded_memory,working_set,..} = match prepared_context {
                 Ok(context) => context,
                 Err(error) => {
                     let _ = self.state()?.admit_request(preparation.into_action(), Err(error.clone()));
@@ -1194,7 +1197,12 @@ impl NativeSession {
                 } else {
                     Ok(projection)
                 };
-                state.admit_request(preparation.into_action(), projection)
+                let mut cache = self.working_set.lock().map_err(|_| DomainError::Conflict)?;
+                let admitted = state.admit_request(preparation.into_action(), projection);
+                if admitted.is_ok() {
+                    *cache = working_set;
+                }
+                admitted
             };
             let generation = match admission {
                 Ok(generation) => generation,

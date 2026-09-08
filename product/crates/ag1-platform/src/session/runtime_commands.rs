@@ -271,8 +271,11 @@ impl RuntimeCommands {
         validate: bool,
     ) -> Result<Option<ag1_storage::CommandResult>, w::ProtocolError> {
         let current = self.current(true).map_err(commands::domain)?;
+        // An old incarnation may inspect an exact completed receipt. Only
+        // current-incarnation envelopes can validate/admit executable intent.
+        // receipt_result and historical_terminal still verify the full scope.
         if envelope.scope.workspace != current.scope().workspace
-            || envelope.scope.instance != self.instance
+            || (validate && envelope.scope.instance != self.instance)
         {
             return Err(w::ProtocolError::StaleContext);
         }

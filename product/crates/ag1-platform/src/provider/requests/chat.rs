@@ -227,6 +227,9 @@ pub(super) fn build(
     }
     option(&mut out, opts, "maxTokens", max_field);
     option(&mut out, opts, "temperature", "temperature");
+    if mistral {
+        option(&mut out, opts, "promptMode", "prompt_mode");
+    }
     if ["llamacpp", "llama.cpp"].contains(&provider) {
         out["cache_prompt"] = json!(true);
         out["temperature"] = opts.get("temperature").cloned().unwrap_or(json!(0.7));

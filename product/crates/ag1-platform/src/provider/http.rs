@@ -97,7 +97,18 @@ pub struct ProviderHttp {
     client: Client,
     origins: BTreeSet<String>,
     runtime: Option<std::sync::Arc<dyn GenerationRuntime>>,
+    response_observer: Option<ResponseObserver>,
+    request_observer: Option<RequestObserver>,
 }
+/// Explicit host-only diagnostic hook. Receives bounded response body bytes before
+/// provider decoding and None at actual EOF; never receives request credentials.
+/// Callers own private storage, bounded buffering and any required redaction.
+pub type ResponseObserver =
+    std::sync::Arc<dyn Fn(Option<&[u8]>) -> Result<(), DomainError> + Send + Sync>;
+/// Host-only diagnostic copy of the validated URL and outgoing body. Headers
+/// and credentials are excluded; callers own private storage and byte limits.
+pub type RequestObserver =
+    std::sync::Arc<dyn Fn(&str, &[u8]) -> Result<(), DomainError> + Send + Sync>;
 /// Host custody preparation, called with an already held generation permit.
 /// It may load the pinned model but must not issue a generation itself.
 pub trait GenerationRuntime: Send + Sync {
@@ -145,7 +156,17 @@ impl ProviderHttp {
             client,
             origins,
             runtime: None,
+            response_observer: None,
+            request_observer: None,
         })
+    }
+    pub fn with_response_observer(mut self, observer: ResponseObserver) -> Self {
+        self.response_observer = Some(observer);
+        self
+    }
+    pub fn with_request_observer(mut self, observer: RequestObserver) -> Self {
+        self.request_observer = Some(observer);
+        self
     }
     pub fn with_runtime(mut self, runtime: std::sync::Arc<dyn GenerationRuntime>) -> Self {
         self.runtime = Some(runtime);
@@ -208,6 +229,9 @@ impl ProviderHttp {
             HttpMethod::Get => reqwest::Method::GET,
             HttpMethod::Post => reqwest::Method::POST,
         };
+        if let Some(observer) = &self.request_observer {
+            observer(&request.url, &request.body)?;
+        }
         let pending = self
             .client
             .request(method, &request.url)
@@ -233,6 +257,7 @@ impl ProviderHttp {
             read: 0,
             max: request.max_response_bytes,
             ended: false,
+            observer: self.response_observer.clone(),
         })
     }
 }
@@ -241,6 +266,7 @@ pub struct HttpResponse {
     read: usize,
     max: usize,
     ended: bool,
+    observer: Option<ResponseObserver>,
 }
 impl HttpResponse {
     pub fn status(&self) -> u16 {
@@ -291,8 +317,14 @@ impl HttpResponse {
                 return Err(DomainError::LimitExceeded("provider response body".into()));
             }
             self.read += bytes.len();
+            if let Some(observer) = &self.observer {
+                observer(Some(&bytes))?;
+            }
             Ok(Some(bytes.to_vec()))
         } else {
+            if let Some(observer) = &self.observer {
+                observer(None)?;
+            }
             self.ended = true;
             Ok(None)
         }

@@ -222,6 +222,10 @@ fn main() {
             quit
         ])
         .on_window_event(|window, event| {
+            // Preview windows close independently; only main owns application shutdown.
+            if window.label() != "main" {
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let state = window.state::<Arc<Desktop>>();
                 let active = state.worker.lock().unwrap().as_ref().is_some_and(|w| {

@@ -145,10 +145,11 @@ impl ProviderResolver for Resolver {
             if !input.configuration.tools.is_empty() {
                 context["tools"] = json!(input.configuration.tools);
             }
-            let options = input
-                .options
-                .cloned()
-                .unwrap_or_else(|| json!({"maxTokens":model["maxTokens"]}));
+            let options = crate::provider::requests::session_options(
+                model,
+                &input.configuration.thinking,
+                input.options,
+            )?;
             let request = generation_http_request(
                 &RequestContext {
                     model,
@@ -334,7 +335,7 @@ impl ServiceFactory for Services {
             if let Some(entry) = branch
                 .iter()
                 .rev()
-                .find(|v| v["customType"] == "ag1_active_tools")
+                .find(|v| v["type"] == "custom" && v["customType"] == "ag1_active_tools")
             {
                 let active = entry["data"].as_array().ok_or(DomainError::Conflict)?;
                 if active.iter().any(|name| !names.iter().any(|n| name == n)) {
@@ -342,7 +343,19 @@ impl ServiceFactory for Services {
                         "A restored tool is not configured on this host".into(),
                     ));
                 }
-                tools.retain(|t| active.iter().any(|n| n == &t["name"]));
+                // Tool order is part of the saved configuration and provider
+                // prompt. Reconstruct it from the branch rather than retaining
+                // the host catalog's order, which would fail strict resume.
+                tools = active
+                    .iter()
+                    .map(|name| {
+                        tools
+                            .iter()
+                            .find(|tool| &tool["name"] == name)
+                            .cloned()
+                            .ok_or(DomainError::Conflict)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
             }
             let prompt = crate::session::NativeSession::client_prompt(
                 self.workspace.root(),
@@ -463,7 +476,26 @@ impl Host {
         config: Config,
         authority_registry: &crate::cutover::Registry,
     ) -> Result<Arc<Self>> {
-        Self::open_composed(workspace, state, config, authority_registry, None).await
+        Self::open_composed(workspace, state, config, authority_registry, None, None).await
+    }
+    /// Host-only evaluation observation. This preserves normal authority and
+    /// runtime admission; no observer configuration is exposed over client RPC.
+    pub async fn open_with_request_observer(
+        workspace: &Path,
+        state: &Path,
+        config: Config,
+        authority_registry: &crate::cutover::Registry,
+        observer: crate::provider::http::RequestObserver,
+    ) -> Result<Arc<Self>> {
+        Self::open_composed(
+            workspace,
+            state,
+            config,
+            authority_registry,
+            None,
+            Some(observer),
+        )
+        .await
     }
     /// Fixture composition exercises the same generation/drain path with an
     /// injected runtime controller. Production cannot select this constructor.
@@ -477,7 +509,15 @@ impl Host {
         if !config.fixture || config.runtime.is_some() {
             return Err(DomainError::PermissionDenied);
         }
-        Self::open_composed(workspace, state, config, authority_registry, Some(runtime)).await
+        Self::open_composed(
+            workspace,
+            state,
+            config,
+            authority_registry,
+            Some(runtime),
+            None,
+        )
+        .await
     }
     async fn open_composed(
         workspace: &Path,
@@ -485,6 +525,7 @@ impl Host {
         config: Config,
         authority_registry: &crate::cutover::Registry,
         injected: Option<Arc<dyn crate::provider::http::GenerationRuntime>>,
+        observer: Option<crate::provider::http::RequestObserver>,
     ) -> Result<Arc<Self>> {
         let workspace = WorkspaceService::new()?.register(workspace)?;
         fs::create_dir_all(state).map_err(crate::io_error)?;
@@ -606,6 +647,9 @@ impl Host {
             config.tooling.as_ref(),
         )?));
         let mut http = ProviderHttp::new(&origins, Duration::from_secs(10))?;
+        if let Some(observer) = observer {
+            http = http.with_request_observer(observer);
+        }
         if let Some(runtime) = &local_runtime {
             http = http.with_runtime(runtime.clone());
         }
@@ -815,7 +859,12 @@ impl Host {
             return Err(DomainError::Unavailable("Client host is stopping".into()));
         }
         let snapshot = self.commands.snapshot()?;
-        if envelope.scope != snapshot.scope {
+        // A retired scope can observe its own durable command receipt, but
+        // cannot submit new work or cross this host's workspace boundary.
+        if envelope.scope != snapshot.scope
+            && !(envelope.scope.workspace == snapshot.scope.workspace
+                && matches!(envelope.command, w::Command::CommandResult { .. }))
+        {
             return Err(DomainError::Conflict);
         }
         if matches!(&envelope.command,w::Command::Files {action,..} if action=="save")
@@ -891,14 +940,20 @@ impl Host {
         }
         let owner = self.clone();
         let query = envelope.command.clone();
-        let data = tokio::task::spawn_blocking(move || {
-            if owner.commands.client_transition_pending()? {
-                return Err(DomainError::Conflict);
-            }
-            owner.query(&query)
-        })
-        .await
-        .map_err(|_| DomainError::DurabilityUnknown)??;
+        let data = if matches!(query, w::Command::CommandResult { .. }) {
+            // Receipt inspection belongs to the command owner, including while
+            // a session transition is pending. It is not a selected-view query.
+            None
+        } else {
+            tokio::task::spawn_blocking(move || {
+                if owner.commands.client_transition_pending()? {
+                    return Err(DomainError::Conflict);
+                }
+                owner.query(&query)
+            })
+            .await
+            .map_err(|_| DomainError::DurabilityUnknown)??
+        };
         if let Some(data) = data {
             if serde_json::to_vec(&data).map_err(json_error)?.len() > 48000 {
                 return Err(DomainError::LimitExceeded(

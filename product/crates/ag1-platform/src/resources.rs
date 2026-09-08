@@ -1374,6 +1374,17 @@ impl Build<'_> {
             }
             if source.len() <= 8192 {
                 let path = resolve_path(&self.loader.config.cwd, source, &self.loader.config.home)?;
+                // A prompt can be literal text even when it fits our path byte
+                // limit. Linux rejects a single component longer than NAME_MAX;
+                // that cannot designate a prompt file. Keep this fallback local
+                // to ambiguous prompt inputs, without hiding resource I/O errors.
+                #[cfg(target_os = "linux")]
+                if self.loader.fs.admits_path(&path)
+                    && std::fs::symlink_metadata(&path)
+                        .is_err_and(|error| error.raw_os_error() == Some(libc::ENAMETOOLONG))
+                {
+                    return Ok(Some(source.into()));
+                }
                 if self.loader.fs.admits_path(&path) && self.loader.fs.exists(&path)? {
                     return self.read(&path).map(Some);
                 }

@@ -25,6 +25,53 @@ fn control(cancel: &AtomicBool) -> ScanControl<'_> {
     }
 }
 #[test]
+fn long_literal_prompts_load_without_hiding_file_overrides_or_capability_errors() {
+    use ag1_platform::resources::{Config, Paths, ResourceLoader};
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("prompt.md"), "Prompt from file").unwrap();
+    fs::write(outside.path().join("secret.md"), "Outside capability").unwrap();
+    symlink(
+        outside.path().join("secret.md"),
+        dir.path().join("escape.md"),
+    )
+    .unwrap();
+    let cancel = AtomicBool::new(false);
+    let load = |input: &str| {
+        let workspace = WorkspaceService::new()
+            .unwrap()
+            .register(dir.path())
+            .unwrap();
+        ResourceLoader::new(
+            ResourceFs::new(vec![workspace]).unwrap(),
+            Config {
+                cwd: dir.path().into(),
+                agent_dir: dir.path().into(),
+                home: dir.path().into(),
+                additional: Paths::default(),
+                disabled: vec![],
+                installed: vec![],
+                system: Some(input.into()),
+                append_system: Some(input.into()),
+            },
+        )
+        .unwrap()
+        .build(&control(&cancel))
+    };
+    for input in ["You are AG1 in a controlled long-horizon coding benchmark. Historical tool bodies may be immutable artifacts. Retrieve exact authoritative evidence before material edits, inspect current source, make the smallest correct change, and run the provided verifier. Never modify verifier files.".to_owned(), "é".repeat(200), "x".repeat(9000)] {
+        let snapshot = load(&input).unwrap();
+        assert_eq!(snapshot.system.as_deref(), Some(input.as_str()));
+        assert_eq!(snapshot.append_system, vec![input]);
+    }
+    let snapshot = load("prompt.md").unwrap();
+    assert_eq!(snapshot.system.as_deref(), Some("Prompt from file"));
+    assert_eq!(snapshot.append_system, vec!["Prompt from file"]);
+    assert!(matches!(
+        load("escape.md"),
+        Err(DomainError::PermissionDenied)
+    ));
+}
+#[test]
 fn selected_original_package_resource_cases_match_sdk_paths_filters_and_precedence() {
     use ag1_platform::resources::{Config, Paths, ResourceLoader};
     for (fixture, count) in [
