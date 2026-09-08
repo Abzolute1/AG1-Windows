@@ -1,5 +1,9 @@
 # P14 handoff — preserve the accepted P13 authority and runtime
 
+> Historical P13-to-P14 entry handoff. P14 has since been implemented in part.
+> **Current stop state and next-model instructions: [P14-RESUME-HANDOFF.md](P14-RESUME-HANDOFF.md).**
+> The historical statements below that P14 has not started describe the original entry only.
+
 This handoff does not start P14. Require `implementation/evidence/P13/completion.json` with status `passed`, no pending gates and a valid complete artifact manifest before beginning any dependent work. The P13 task stops after its completion commit. Read the final P13 REPORT, `product/clients/CUTOVER.md`, compatibility dispositions and all L01–L08 requirements first.
 
 ## Accepted entry and read-only verification

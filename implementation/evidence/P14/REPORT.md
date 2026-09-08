@@ -1,5 +1,13 @@
 # P14 release execution — work in progress
 
+Current execution state is in [CURRENT.md](CURRENT.md). It records the explicit
+user hold on duration runs, current candidate fingerprints, closed live-5 review,
+current Linux validation and the stopped, partial repository matrix. Measurements below
+retain their historical candidate attribution; they are not automatically current
+acceptance after later fixes. See [repository-first-pair-review.json](repository-first-pair-review.json)
+for the first closed current repository comparison and [model-feedback-preparation.json](model-feedback-preparation.json)
+for the separately prepared, user-requested model debrief.
+
 P13 entry was verified read-only before implementation: every prior artifact
 manifest passed, the current product fingerprints matched accepted P13, the profile
 and bound process supervisor hashes matched, and the selected native authority was

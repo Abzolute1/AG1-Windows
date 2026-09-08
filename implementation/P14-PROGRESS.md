@@ -232,3 +232,93 @@ mandatory with failures retained. It removes only the earlier private launcher's
 additional requirement for a flawless legacy explanation/semantic baseline. This
 admits independent native endurance measurement, not overall live/P14 acceptance;
 canonical validators and original fixtures are unchanged. See live5-duration-admission-policy.json.
+
+### User hold — eight-hour startup interrupted before task execution
+
+User explicitly instructed not to start eight-hour work yet. Live-5 had fully closed
+and armed launcher entered 8h-3 admission about 61 seconds before stop handling.
+Exact launcher was frozen, exact duration driver interrupted, launcher terminated;
+all recorded owned identities exited. No task or client protocol command occurred.
+Closing the launch session prevented normal duration-result/drain receipts, retained
+explicitly without a graceful-drain claim. No restart without user instruction.
+Live-5 native source/semantic/final reviews pass 6/6; legacy semantic5/6 and claims4/6
+remain failed baseline observations. Both final preservation/settlement checks pass.
+GitHub private backup cd682ff was remote-verified; token transient only. Source digest
+caac6ad3 remains unchanged. Local private evidence is outside that Git backup.
+
+### Continued non-duration work and model feedback request
+
+The user reaffirmed the eight-hour hold while authorizing other P14 work. The
+original four-case repository matrix is running sequential TS/Rust pairs across
+three models. The first TS export case implemented correct source and passed its
+untouched verifier, but failed the original required-artifact-rehydration gate;
+that distinction is retained in its independent review. No native result inferred.
+
+Current Linux archive recovery passed on disposable state with the installed CLI:
+specific corrupt-database refusal, exact conversation and completed-receipt restore,
+damaged bytes retained, no inference on restore or production authority transfer.
+Initial fixture lacked state/host.json and was refused before corruption; retained.
+The current nine-case Linux report validates 11,997 artifact references. No duration,
+model quality, formal performance or other OS/signing acceptance is inferred.
+
+User requested human-style model feedback. Prepared a neutral, identical same-session
+debrief after a separate fresh matched original task, with task/debrief evidence and
+counts separated. Scripted TS/native rehearsal passed with zero local model calls.
+Live feedback waits for exclusive runtime settlement; every material self-report
+requires trace corroboration. Earlier model-as-inhabitant reports and their
+contradicted complaints were read as methodology, not current product evidence.
+
+User asked about disappearing diffs in Rust. Direct inspection of all 24 live-5
+native provider requests verified all six small edit diffs unchanged in every
+subsequent request through verification/final answers. See
+live5-native-diff-retention.json. Deterministic large-result tests preserve exact
+artifact bytes and executable paging; reliable live large-diff retrieval under
+sustained pressure remains unproven. No eight-hour or 24-hour run has restarted.
+# 2026-09-08 — second repository pair and corrected visibility measurement
+
+The second 35B repository pair repaired both retry-delay production boundaries and
+gave accurate final explanations in TS and Rust. Both pass the original verifier
+and seven valid-domain supplemental checks. Four invalid-input probes fail equally;
+the predeclared ambiguous-scope policy retains these as robustness observations.
+Rust used 11 requests/16 generated task tools; TS used 8/13. No speed inference while
+the user's Steam download is active at 40%.
+
+The native private scoring adapter incorrectly fed immutable raw history to the
+original resident-evidence predicate. Actual outgoing requests retained the full
+exact failure diagnostic throughout. A separate offline adapter uses those compiled
+tool messages for residency and keeps all original criteria and other metrics.
+All four closed-side recalculations passed consistency checks: the first pair keeps
+its original TS failure/Rust pass; the second becomes TS pass/Rust pass. Negative
+controls still reject absent exact evidence. Original failed reports and all active
+matrix inputs remain untouched. Published repository-second-pair-review.json and
+repository-residency-adapter-correction.json bind the findings. No product changes.
+
+Eight-hour and 24-hour workloads remain held pending explicit user direction.
+
+# 2026-09-08 — user-requested stop and next-model handoff
+
+All active comparison work and the waiting functional queue are stopped. Five
+repository pairs are complete; m1-c1 TS finished with custody/preservation verified,
+while native was interrupted during initial admission before any protocol command.
+Its CLI drained with exit code 0 and no cleanup error. No matching workload
+process remains. The final matrix audit was not reached. No further tests were
+started for this handoff.
+
+All four 35B repository source contracts and final behavior explanations pass in
+both adapters. Evidence compliance is TS 3/4, Rust 4/4 after independently controlled
+measurement corrections; Rust used more calls in this suite. The 27B export source
+contract passes in both, but Rust falsely claimed non-string coercion was unchanged;
+null/undefined reproduction contradicts that claim. Do not claim uniform coherence
+improvement. Two original scorer blind spots and their corrections are documented
+in separate immutable reports. Actual model debrief remains unexecuted.
+
+An inherited shell persistence-hint scanner bug mistakes quoted JavaScript arrows
+for redirects. The isolated draft commit 7ec917ba591850d616b7771324cb250c120b63d3
+retains a conservative scanner and regression test: original code fails the new
+case; the isolated tool-contract suite passes 24/24. The draft is not adopted into
+the frozen candidate; further review is pending. A portable patch and both logs
+are versioned under evidence/P14/drafts.
+
+Read [P14-RESUME-HANDOFF.md](P14-RESUME-HANDOFF.md) for evidence, exact next steps,
+remaining gates and preservation boundaries. All work is paused; eight-hour and
+24-hour workloads remain specifically held until explicit user direction.
