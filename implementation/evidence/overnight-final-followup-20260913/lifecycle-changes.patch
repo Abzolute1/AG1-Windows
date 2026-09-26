@@ -1,0 +1,88 @@
+--- before/product/crates/ag1-platform/src/session.rs
++++ after/product/crates/ag1-platform/src/session.rs
+@@ -291,6 +291,7 @@
+ }
+ struct TurnLease<'a> {
+     session: &'a NativeSession,
++    completed: bool,
+ }
+ struct CommitWait {
+     state: Arc<Mutex<SessionRuntime>>,
+@@ -315,7 +316,12 @@
+         if let Ok(mut active) = self.session.active.lock()
+             && let Some(turn) = active.take()
+         {
+-            turn.cancelled.store(true, Ordering::Release);
++            // A command may own several successful turns (print recovery or
++            // planning). Draining this turn must not cancel that parent command.
++            // Failed or abandoned futures still cancel all work sharing its token.
++            if !self.completed {
++                turn.cancelled.store(true, Ordering::Release);
++            }
+             turn.source.cancel();
+         }
+         self.session.changed.notify_waiters();
+@@ -941,7 +947,7 @@
+                 source: Arc::new(source),
+             });
+         }
+-        let _lease = TurnLease { session: self };
++        let mut lease = TurnLease { session: self, completed: false };
+         let serial = NEXT_TURN
+             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+             .map_err(|_| DomainError::Conflict)?;
+@@ -964,11 +970,13 @@
+                 .await?
+                 && callbacks::transform_input(&mut input.message, &result)?
+             {
+-                return Ok(TurnResult {
++                let result = TurnResult {
+                     generations: 0,
+                     journal_revision: self.journal_revision()?,
+                     assistant: Value::Null,
+-                });
++                };
++                lease.completed = true;
++                return Ok(result);
+             }
+         }
+         let mut start = if !continuation && !self.delegated {
+@@ -1689,6 +1697,7 @@
+                 ),
+             );
+         }
++        lease.completed = outcome.is_ok();
+         outcome
+     }
+ }
+--- before/product/crates/ag1-platform/tests/session_commands/mod.rs
++++ after/product/crates/ag1-platform/tests/session_commands/mod.rs
+@@ -14,6 +14,28 @@
+ mod configuration;
+ mod delivery;
+ mod messages;
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn wire_print_continuations_keep_the_command_alive_until_mode_settlement() {
++    let mut promise = stop();
++    promise["choices"][0]["delta"]["content"] = json!("Let me inspect it:");
++    for (text, replies, expected) in [
++        ("Explain the source.", vec![promise, stop()], w::OperationStatus::Completed),
++        ("Fix the source.", vec![stop(); 4], w::OperationStatus::Failed),
++    ] {
++        let count = replies.len();
++        let (endpoint, server) = server(replies);
++        let f = attach(fixture(&endpoint, "disabled"), Arc::new(Resolver::new(false)));
++        let mut envelope = prompt(&f.commands, "print", 0, "");
++        envelope.command = serde_json::from_value(json!({"kind":"session","action":"print","args":{"input":{"kind":"inline","text":text}}})).unwrap();
++        accepted(f.commands.dispatch(envelope).await.result);
++        let terminal = f.commands.run_next(&ignore).await.unwrap().unwrap();
++        assert_eq!(terminal.status, expected);
++        assert_eq!(lookup(&f.commands, "print").await, w::CommandResult::Settled { operation: terminal });
++        assert!(f.host.settled().unwrap());
++        assert_eq!(server.join().unwrap().len(), count);
++    }
++}
+ 
+ struct CommandsFixture {
+     _directory: tempfile::TempDir,

@@ -54,6 +54,21 @@ async fn command(host: &Arc<Host>, id: &str, command: w::Command) {
 }
 
 #[tokio::test]
+async fn maximum_effort_is_accepted_durably_and_survives_reopening_a_subscription_chat() {
+    use std::os::unix::fs::PermissionsExt;
+    let root=tempfile::tempdir().unwrap();let workspace=root.path().join("workspace");let state=root.path().join("state");let authority=root.path().join("authority");
+    std::fs::create_dir(&workspace).unwrap();std::fs::create_dir(&authority).unwrap();std::fs::set_permissions(&authority,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let registry=Registry::at(&authority).unwrap();registry.initialize_isolated(&workspace).unwrap();
+    let config:Config=serde_json::from_value(json!({"models":[{"id":"subscription-fixture","provider":"openai-codex","api":"openai-codex-responses","baseUrl":"https://fixture.invalid","contextWindow":8192,"maxTokens":1024,"thinking":{"modes":["low","medium","high","xhigh","max"],"default":"medium"},"reasoning":true,"input":["text"]}],"selected":"subscription-fixture","credential_env":null,"system_prompt":"Owned fixture","fixture":true})).unwrap();
+    let host=Host::open_with_registry(&workspace,&state,config.clone(),&registry).await.unwrap();
+    command(&host,"select-max",w::Command::Model{action:"thinking".into(),args:json!({"level":"max"})}).await;
+    assert_eq!(host.registry.selected().unwrap().services.runtime().configuration().unwrap().thinking,"max");
+    host.shutdown().await.unwrap();drop(host);
+    let host=Host::open_with_registry(&workspace,&state,config,&registry).await.unwrap();
+    assert_eq!(host.registry.selected().unwrap().services.runtime().configuration().unwrap().thinking,"max");host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn selected_thinking_reaches_actual_http_before_and_after_host_reopen() {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");

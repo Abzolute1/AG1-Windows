@@ -63,9 +63,7 @@ async fn discovered_quoted_node_test_runs_as_one_literal_path_through_normal_too
     assert!(!fixture.root.join("injected").exists());
     let requests = server.join().unwrap();
     assert!(
-        requests[0]["messages"][0]["content"]
-            .as_str()
-            .unwrap()
+        requests[0]["messages"].as_array().unwrap().last().map(|message| ag1_core::context::hygiene::content(message, "\n")).unwrap()
             .contains(command)
     );
 }
@@ -155,14 +153,12 @@ async fn print_discovers_fresh_verifier_after_build_metadata_changes() {
             })
             .unwrap();
         assert!(
-            request["messages"][0]["content"]
-                .as_str()
-                .unwrap()
+            request["messages"].as_array().unwrap().last().map(|message| ag1_core::context::hygiene::content(message, "\n")).unwrap()
                 .contains(&contract)
         );
     }
     assert!(
-        !requests[4]["messages"][0]
+        !requests[4]["messages"].as_array().unwrap().last().unwrap()["content"]
             .to_string()
             .contains("cargo test")
     );
@@ -237,13 +233,91 @@ async fn unavailable_verifier_discovery_keeps_completion_evidence_required() {
     assert!(failed.load(Ordering::Acquire));
     let requests = server.join().unwrap();
     assert!(
-        !requests[0]["messages"][0]
+        !requests[0]["messages"]
             .to_string()
-            .contains("runtime-verification-contract")
+            .contains("<runtime-verification-contract>")
     );
     assert!(
         requests[1]["messages"]
             .to_string()
             .contains("Discover and run the repository's canonical verifier")
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn changing_verifiers_preserve_system_and_history_prefix_without_stale_tail() {
+    let responses = ["node first.mjs", "node second.mjs"].into_iter().flat_map(|command| [
+        calls(vec![("write", "write", json!({"path":"note.txt","content":command}))]),
+        calls(vec![("check", "bash", json!({"command":command}))]), stop(),
+    ]).collect();
+    let (origin, server) = server(responses);
+    let seed = vec![json!({"role":"user","content":"Historical question","timestamp":1}),
+        json!({"role":"assistant","content":[{"type":"text","text":"Historical answer"}],"api":"openai-completions","provider":"owned-fixture","model":"initial","stopReason":"stop","timestamp":1})];
+    let f = fixture_seeded(&origin, "disabled", seed);
+    for name in ["first.mjs", "second.mjs"] {
+        std::fs::write(f.root.join(name), "console.log('original verifier output: passed');").unwrap();
+    }
+    let runner = native_adapters_configured(&f, &["write", "bash"], None, None).await;
+    for (i, verifier) in ["node first.mjs", "node second.mjs"].into_iter().enumerate() {
+        let mut input = input();
+        input.command = format!("repair-{i}");
+        input.message["content"] = json!("Fix the note and verify it.");
+        let result = print::run(&f.host, input, &Resolver::new(false), runner.clone(), &ignore,
+            print::Options { recommended_verifier: Some(verifier.into()), ..Default::default() }).await.unwrap();
+        assert_eq!(result.exit_code, 0);
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(&requests[0]["messages"].as_array().unwrap()[..4],
+        &requests[3]["messages"].as_array().unwrap()[..4]);
+    for (index, request) in requests.iter().enumerate() {
+        let messages = request["messages"].as_array().unwrap();
+        assert!(!messages[0].to_string().contains("<runtime-verification-contract>"));
+        let current = if index < 3 { "node first.mjs" } else { "node second.mjs" };
+        let stale = if index < 3 { "node second.mjs" } else { "node first.mjs" };
+        let tail = messages.last().unwrap();
+        let text = ag1_core::context::hygiene::content(tail, "\n");
+        let contract = text.split("<runtime-verification-contract>").nth(1).unwrap();
+        assert!(contract.contains(current));
+        assert!(!contract.contains(stale));
+        // Exactly one transient contract, even though historical tool arguments
+        // legitimately retain commands executed by the previous turn.
+        assert_eq!(json!(messages).to_string().matches("<runtime-verification-contract>").count(), 1);
+        if index % 3 != 0 {
+            assert_eq!(tail["role"], "tool");
+            assert_eq!(tail["tool_call_id"], if index % 3 == 1 { "write" } else { "check" });
+        }
+        if index % 3 == 2 { assert!(text.contains("original verifier output: passed")); }
+    }
+    let journal = f.store.journal_snapshot(&SessionId::new("session").unwrap()).unwrap();
+    let branch = ag1_core::task::branch_values(&journal).unwrap();
+    assert!(!json!(branch).to_string().contains("<runtime-verification-contract>"));
+    assert!(!json!(branch).to_string().contains("<native-verification-status>"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wrapped_verifier_feedback_explains_missing_receipt_then_expires_after_exact_check() {
+    let (origin, server) = server(vec![
+        calls(vec![("write", "write", json!({"path":"note.txt","content":"fixed"}))]),
+        calls(vec![("wrapped", "bash", json!({"command":"cd . && node verifier.mjs"}))]),
+        calls(vec![("exact", "bash", json!({"command":"node verifier.mjs"}))]),
+        stop(),
+    ]);
+    let f = fixture(&origin, "disabled");
+    std::fs::write(f.root.join("verifier.mjs"), "console.log('original verifier output: passed');").unwrap();
+    let runner = native_adapters_configured(&f, &["write", "bash"], None, None).await;
+    let mut input = input();
+    input.message["content"] = json!("Fix the note and verify it.");
+    let result = print::run(&f.host, input, &Resolver::new(false), runner, &ignore,
+        print::Options { recommended_verifier: Some("node verifier.mjs".into()), ..Default::default() }).await.unwrap();
+    assert_eq!(result.exit_code, 0);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 4);
+    let tail = |i: usize| ag1_core::context::hygiene::content(requests[i]["messages"].as_array().unwrap().last().unwrap(), "\n");
+    assert!(tail(0).contains("Submit its command string unchanged to bash"));
+    assert!(tail(2).contains("original verifier output: passed"));
+    assert!(tail(2).contains("status: verification_required"));
+    assert!(tail(2).contains("The last shell command was not recognized as the recorded verifier"));
+    assert!(tail(3).contains("status: passed_after_latest_observed_mutation"));
+    assert!(!tail(3).contains("The last shell command was not recognized"));
 }

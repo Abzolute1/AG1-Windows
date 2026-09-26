@@ -1,0 +1,82 @@
+--- a/ggml/src/ggml-cpu/arch/x86/quants.c
++++ b/ggml/src/ggml-cpu/arch/x86/quants.c
+@@ -999,6 +999,48 @@
+         sumf += d * (sumi1 + sumi2);
+     }
+     *s = sumf;
++}
++
++// Two output rows share activation loads and scale conversion. Each row keeps
++// the original two accumulators and reduction order; stored weights are unchanged.
++void ggml_vec_dot_mxfp4_q8_0_rows2(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx,
++                                size_t row_stride, const void * GGML_RESTRICT vy) {
++#if defined(__AVX2__)
++    if (n % (2 * QK_MXFP4)) {
++        for (int row=0; row<2; ++row) ggml_vec_dot_mxfp4_q8_0(n,s+row,0,(const char *)vx+row*row_stride,0,vy,0,1);
++        return;
++    }
++    const block_mxfp4 * x0=(const block_mxfp4 *)vx;
++    const block_mxfp4 * x1=(const block_mxfp4 *)((const char *)vx+row_stride);
++    const block_q8_0 * y=(const block_q8_0 *)vy;
++    const __m128i values=_mm_loadu_si128((const __m128i *)kvalues_fp4);
++    const __m128i mask=_mm_set1_epi8(15);
++    const __m256i one=_mm256_set1_epi16(1);
++    __m256 a00=_mm256_setzero_ps(),a01=_mm256_setzero_ps();
++    __m256 a10=_mm256_setzero_ps(),a11=_mm256_setzero_ps();
++    for(int i=0;i<n/QK_MXFP4;i+=2) {
++        const __m256i y0=_mm256_loadu_si256((const __m256i *)y[i].qs);
++        const __m256i y1=_mm256_loadu_si256((const __m256i *)y[i+1].qs);
++        const float d0=GGML_CPU_FP16_TO_FP32(y[i].d),d1=GGML_CPU_FP16_TO_FP32(y[i+1].d);
++#define AG1_MX_ACC(ROW,INDEX,ACT,D,A) do { \
++        const __m128i bits=_mm_loadu_si128((const __m128i *)(ROW)[INDEX].qs); \
++        const __m256i q=MM256_SET_M128I(_mm_shuffle_epi8(values,_mm_and_si128(_mm_srli_epi16(bits,4),mask)), \
++                                      _mm_shuffle_epi8(values,_mm_and_si128(bits,mask))); \
++        const __m256i p=_mm256_madd_epi16(mul_add_epi8(q,ACT),one); \
++        const __m256 scale=_mm256_set1_ps((D)*GGML_CPU_E8M0_TO_FP32_HALF((ROW)[INDEX].e)); \
++        (A)=_mm256_fmadd_ps(scale,_mm256_cvtepi32_ps(p),(A)); \
++    } while(0)
++        AG1_MX_ACC(x0,i,y0,d0,a00);
++        AG1_MX_ACC(x1,i,y0,d0,a10);
++        AG1_MX_ACC(x0,i+1,y1,d1,a01);
++        AG1_MX_ACC(x1,i+1,y1,d1,a11);
++#undef AG1_MX_ACC
++    }
++    s[0]=hsum_float_8(_mm256_add_ps(a00,a01));
++    s[1]=hsum_float_8(_mm256_add_ps(a10,a11));
++#else
++    for (int row=0;row<2;++row) ggml_vec_dot_mxfp4_q8_0(n,s+row,0,(const char *)vx+row*row_stride,0,vy,0,1);
++#endif
+ }
+ 
+ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+--- a/ggml/src/ggml-cpu/quants.h
++++ b/ggml/src/ggml-cpu/quants.h
+@@ -47,6 +47,9 @@
+ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ 
+ void ggml_vec_dot_mxfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++#if defined(__x86_64__)
++void ggml_vec_dot_mxfp4_q8_0_rows2(int n, float * s, const void * vx, size_t row_stride, const void * vy);
++#endif
+ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ 
+ void ggml_vec_dot_q2_K_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1539,7 +1539,15 @@
+ 
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
++                int64_t ir0 = iir0;
++#if defined(__x86_64__)
++                if (type == GGML_TYPE_MXFP4) {
++                    for (; ir0 + 1 < MIN(iir0 + blck_0, ir0_end); ir0 += 2) {
++                        ggml_vec_dot_mxfp4_q8_0_rows2(ne00, &tmp[ir0-iir0], src0_cur+ir0*nb01, nb01, src1_col);
++                    }
++                }
++#endif
++                for (; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
+                 }
+ 

@@ -1,23 +1,24 @@
 use crate::{
     io_error,
-    process::{ProcessSpec, ProcessSupervisor},
+    process::ProcessSupervisor,
     workspace::{MAX_FILES, MAX_READ, Workspace},
 };
 use ag1_core::{DomainError, FileRevision};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
-static SERIAL: AtomicU64 = AtomicU64::new(1);
+#[path = "git_read.rs"]
+pub(crate) mod readonly;
 const MAX_GIT_BYTES: usize = 1024 * 1024;
 pub struct GitService {
     supervisor: ProcessSupervisor,
     executable: PathBuf,
     spools: PathBuf,
+    bwrap: PathBuf,
 }
 #[derive(Clone, Debug)]
 pub struct GitView {
@@ -36,67 +37,32 @@ impl GitService {
             supervisor: ProcessSupervisor::new(helper)?,
             executable: git.canonicalize().map_err(io_error)?,
             spools: spools.canonicalize().map_err(io_error)?,
+            bwrap: "/usr/bin/bwrap".into(),
         })
     }
+    pub fn with_bubblewrap(mut self, path: &Path) -> Self {
+        self.bwrap = path.into();
+        self
+    }
     fn run(&self, workspace: &Workspace, args: &[String]) -> Result<Vec<u8>, DomainError> {
-        let pinned = workspace.pin_directory("")?;
-        let spool = self.spools.join(format!(
-            "git-{}-{}.log",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut argv: Vec<String> = [
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "--no-pager",
-        ]
-        .map(String::from)
-        .to_vec();
-        argv.extend_from_slice(args);
-        let env = BTreeMap::from([
-            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-            ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
-            ("LC_ALL".into(), "C".into()),
-            ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-        ]);
-        let mut child = self.supervisor.spawn(
-            ProcessSpec {
-                resident: false,
-                executable: self.executable.clone(),
-                argv,
-                cwd: pinned.process_cwd(),
-                env,
-                timeout_ms: 10_000,
-                grace_ms: 100,
+        let cancel = AtomicBool::new(false);
+        let (output, ok) = readonly::run(
+            &self.supervisor,
+            &self.executable,
+            &self.bwrap,
+            &self.spools,
+            workspace,
+            args,
+            &crate::resource_fs::ScanControl {
+                cancel: &cancel,
+                deadline: std::time::Instant::now() + Duration::from_secs(10),
             },
-            &spool,
+            MAX_GIT_BYTES,
         )?;
-        let status = child.wait(Duration::from_secs(12));
-        let result = (|| {
-            if !status?.success() {
-                return Err(DomainError::Io(
-                    "Git command failed; isolated spool retained".into(),
-                ));
-            }
-            let view = child.tail(0)?;
-            if view.truncated || view.total_seen > MAX_GIT_BYTES as u64 {
-                return Err(DomainError::LimitExceeded("Git output".into()));
-            }
-            pinned.verify_identity()?;
-            let mut bytes = vec![];
-            while bytes.len() < view.disk_bytes {
-                bytes.extend(child.log_page(bytes.len() as u64, 32 * 1024)?);
-            }
-            Ok(bytes)
-        })();
-        drop(child);
-        if result.is_ok() {
-            std::fs::remove_file(spool).map_err(io_error)?;
+        if !ok {
+            return Err(DomainError::Io("Contained Git command failed".into()));
         }
-        result
+        Ok(output)
     }
     fn head_unlocked(&self, workspace: &Workspace) -> Result<String, DomainError> {
         let bytes = self.run(
@@ -285,98 +251,39 @@ impl GitService {
         max_bytes: usize,
     ) -> Result<(String, bool), DomainError> {
         let _claim = workspace.claim()?;
-        let pinned = workspace.pin_directory("")?;
-        let check = || {
-            if cancel.load(Ordering::Acquire) {
-                Err(DomainError::Cancelled)
-            } else if std::time::Instant::now() >= deadline {
-                Err(DomainError::TimedOut)
-            } else {
-                Ok(())
+        let control = crate::resource_fs::ScanControl { cancel, deadline };
+        control.check()?;
+        // Source/repo orientation also supports ordinary project folders. Do
+        // not let Git discover an ancestor repository outside this capability,
+        // or turn absent metadata into a failed source-context operation.
+        // Invalid or inaccessible .git entries still go through containment's
+        // normal rejection path; only an absent entry is a non-repository.
+        if !workspace.directory_exists(".git")?
+            && matches!(workspace.snapshot(".git", 4096), Err(DomainError::NotFound))
+        {
+            workspace.verify_root()?;
+            control.check()?;
+            let message = "AG1: not a git repository (no metadata in this workspace)\n";
+            if message.len() > max_bytes {
+                return Err(DomainError::LimitExceeded("Git output".into()));
             }
-        };
-        check()?;
-        let mut argv: Vec<String> = [
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-            "--no-pager",
-            "--literal-pathspecs",
-        ]
-        .map(str::to_string)
-        .into();
-        argv.extend_from_slice(args);
-        let spool = self.spools.join(format!(
-            "tool-git-{}-{}.log",
-            std::process::id(),
-            SERIAL.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut child = self.supervisor.spawn_protocol_limited(
-            ProcessSpec {
-                executable: self.executable.clone(),
-                argv,
-                cwd: pinned.process_cwd(),
-                env: BTreeMap::from([
-                    ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-                    ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-                    ("GIT_OPTIONAL_LOCKS".into(), "0".into()),
-                    ("GIT_TERMINAL_PROMPT".into(), "0".into()),
-                    ("LC_ALL".into(), "C".into()),
-                ]),
-                timeout_ms: deadline
-                    .saturating_duration_since(std::time::Instant::now())
-                    .as_millis()
-                    .clamp(1, 86_400_000) as u64,
-                grace_ms: 100,
-                resident: false,
-            },
-            &spool,
-            1024 * 1024 * 1024,
+            return Ok((message.into(), false));
+        }
+        let (output, ok) = readonly::run(
+            &self.supervisor,
+            &self.executable,
+            &self.bwrap,
+            &self.spools,
+            workspace,
+            args,
+            &control,
+            max_bytes,
         )?;
-        // Spool ownership is obtained only after successful create_new/spawn.
-        struct SpoolCleanup(PathBuf);
-        impl Drop for SpoolCleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-        let _cleanup = SpoolCleanup(spool);
-        child.close_input();
-        let mut output = vec![];
-        let status;
-        loop {
-            check()?;
-            let (bytes, complete) = child.poll_stdout(32768)?;
-            let empty = bytes.is_empty();
-            output.extend(bytes);
-            if output.len() > max_bytes {
-                return Err(DomainError::LimitExceeded("Git command output".into()));
-            }
-            if let Some(exit) = complete {
-                status = exit;
-                break;
-            }
-            if empty {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-        pinned.verify_identity()?;
-        check()?;
-        if status.success() {
-            Ok((
-                String::from_utf8(output)
-                    .map_err(|_| DomainError::InvalidInput("UTF-8 Git diff".into()))?,
-                true,
-            ))
-        } else {
-            Ok((
-                String::from_utf8_lossy(&child.tail(65536)?.bytes)
-                    .trim()
-                    .into(),
-                false,
-            ))
-        }
+        Ok((
+            String::from_utf8(output)
+                .map_err(|_| DomainError::InvalidInput("UTF-8 Git output".into()))?,
+            ok,
+        ))
     }
 }
 

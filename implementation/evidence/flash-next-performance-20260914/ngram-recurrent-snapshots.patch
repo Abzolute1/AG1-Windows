@@ -1,0 +1,18 @@
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1722,6 +1722,15 @@
+     cparams.n_ctx             = params.n_ctx;
+     cparams.n_seq_max         = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
++    const char * ngram_rs = std::getenv("AG1_FLASH_NGRAM_RS");
++    if (ngram_rs && ngram_rs[0] == '1' && ngram_rs[1] == '\0' &&
++            std::find(params.speculative.types.begin(), params.speculative.types.end(),
++                COMMON_SPECULATIVE_TYPE_NGRAM_MOD) != params.speculative.types.end()) {
++        if (params.speculative.ngram_mod.n_max < 1 || params.speculative.ngram_mod.n_max > 64) {
++            throw std::runtime_error("experimental ngram rollback depth outside validated bound");
++        }
++        cparams.n_rs_seq = std::max(cparams.n_rs_seq, (uint32_t) params.speculative.ngram_mod.n_max);
++    }
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
+     cparams.n_batch           = params.n_batch;

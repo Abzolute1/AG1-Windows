@@ -1,0 +1,61 @@
+diff --git a/product/clients/cli/src/main.rs b/tmp/ag1-overnight-followup/product/clients/cli/src/main.rs
+index 21266f4..945e177 100644
+--- a/product/clients/cli/src/main.rs
++++ b/tmp/ag1-overnight-followup/product/clients/cli/src/main.rs
+@@ -9,8 +9,11 @@ use std::{
+ };
+ fn write(out: &Arc<Mutex<std::io::Stdout>>, frame: &w::WireMessage) -> Result<()> {
+     let bytes = w::encode(frame).map_err(|e| format!("{e:?}"))?;
++    write_encoded(out, &bytes)
++}
++fn write_encoded(out: &Arc<Mutex<std::io::Stdout>>, bytes: &[u8]) -> Result<()> {
+     let mut out = out.lock().map_err(|_| "stdout unavailable")?;
+-    out.write_all(&bytes)
++    out.write_all(bytes)
+         .and_then(|_| out.write_all(b"\n"))
+         .and_then(|_| out.flush())
+         .map_err(|e| e.to_string())
+@@ -305,7 +308,7 @@ async fn run() -> Result<u8> {
+         }
+     });
+     let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
+-    let mut last = String::new();
++    let mut last = Vec::new();
+     let mut eof = false;
+     loop {
+         tokio::select! {
+@@ -322,8 +325,12 @@ async fn run() -> Result<u8> {
+             },
+             _=tick.tick()=>{
+                 let view=host.settled_view().await.map_err(|e|format!("{e:?}"))?;
+-                let serialized=serde_json::to_string(&view).map_err(|e|e.to_string())?;
+-                if serialized!=last {last=serialized;write(&out,&w::WireMessage::Client(Box::new(view.clone())))?;}
++                // Compare the exact encoded frame and reuse it for output. A
++                // changed view needs neither a second encoding nor a deep clone.
++                let frame = w::WireMessage::Client(Box::new(view));
++                let serialized = w::encode(&frame).map_err(|e| format!("{e:?}"))?;
++                if serialized != last { write_encoded(&out, &serialized)?; last = serialized; }
++                let w::WireMessage::Client(view) = frame else { unreachable!("constructed client frame") };
+                 if eof {
+                     if !view.snapshot.pending.is_empty() {host.shutdown().await.map_err(|e|format!("{e:?}"))?;return Err("Input closed with pending approval; cancelled owned work".into());}
+                     if view.snapshot.status=="idle" {if let Some(error)=view.error {host.shutdown().await.map_err(|e|format!("{e:?}"))?;return Err(error);}break;}
+diff --git a/product/clients/cli/tests/client_contract.rs b/tmp/ag1-overnight-followup/product/clients/cli/tests/client_contract.rs
+index 02dcc66..ae062a2 100644
+--- a/product/clients/cli/tests/client_contract.rs
++++ b/tmp/ag1-overnight-followup/product/clients/cli/tests/client_contract.rs
+@@ -186,6 +186,7 @@ fn config(origin: &str) -> Config {
+         runtime: None,
+         credentials: Default::default(),
+         system_prompt: "Isolated fixture".into(),
++        prompt_append: None,
+         fixture: true,
+     }
+ }
+@@ -334,6 +335,7 @@ async fn export_escapes_untrusted_blocks_and_never_embeds_invoke() {
+     view.details.messages.push(w::ClientMessage {
+         id: "x".into(),
+         role: "assistant".into(),
++        tool: None,
+         blocks: vec![w::MessageBlock::Text {
+             text: "<script>__TAURI_INTERNALS__.invoke('quit')</script>".into(),
+         }],

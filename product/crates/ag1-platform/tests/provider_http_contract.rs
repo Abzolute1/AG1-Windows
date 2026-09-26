@@ -274,6 +274,26 @@ fn origin_identity_and_header_validation_prevent_alias_and_injection_errors() {
 }
 
 #[tokio::test]
+async fn subscription_stream_without_content_type_still_requires_valid_events_and_eof() {
+    for valid in [true, false] {
+        let body = if valid {
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
+        } else { "<html>not an event stream</html>" };
+        let (origin, server) = fixture(move |mut socket| {
+            let input=read_request(&mut socket);
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();input
+        });
+        let http=ProviderHttp::new(std::slice::from_ref(&origin),Duration::from_secs(1)).unwrap();
+        let scheduler=Scheduler::default();scheduler.register(&origin,EndpointKind::Remote).unwrap();
+        let ticket=scheduler.submit(&origin,OperationId::new("subscription").unwrap()).unwrap();let permit=scheduler.start(&ticket).unwrap().unwrap();
+        let (_source,mut cancel)=cancellation();
+        let result=request_generation(&http,GenerationRequest{request_id:"subscription".into(),tool_names:vec![],family:ApiFamily::CodexResponses,request:request(&origin,8192),limits:GenerationLimits{max_output_bytes:4096,prefill_ms:3000,idle_ms:3000,overall_ms:3000}},permit,&mut cancel,|_|Ok(())).await;
+        if valid { let response=result.unwrap();assert_eq!(response.stop_reason,Some(StopReason::Stop));assert_eq!(response.content[0].text,"OK"); } else { assert!(result.is_err()); }
+        server.join().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn generation_pipeline_holds_one_permit_through_stop_usage_and_transport_eof() {
     for (reason, watchdog) in [("stop", 0), ("stop", 3000), ("length", 0), ("length", 3000)] {
         let body = format!(
@@ -604,5 +624,157 @@ async fn upstream_errors_cannot_echo_request_credentials_into_provider_events() 
         .unwrap();
         assert!(!result.error.unwrap().contains("fixture-token"));
         server.join().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_generation_releases_permit_only_after_positive_owned_stop_proof() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct OwnedProof {
+        stopped: Arc<AtomicBool>,
+        origin: String,
+    }
+    impl GenerationRuntime for OwnedProof {
+        fn prepare<'a>(&'a self, _: &'a HttpRequest) -> ag1_core::PortFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn shutdown(&self) -> ag1_core::PortFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+        fn cancel_generation<'a>(&'a self, url: &'a str) -> ag1_core::PortFuture<'a, ()> {
+            Box::pin(async move {
+                assert_eq!(endpoint_origin(url).unwrap(), self.origin);
+                self.stopped.store(true, Ordering::Release);
+                Ok(())
+            })
+        }
+    }
+    let stopped = Arc::new(AtomicBool::new(false));
+    let server_stopped = stopped.clone();
+    let (origin, server) = fixture(move |mut socket| {
+        let input = read_request(&mut socket);
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()+10).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while !server_stopped.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < until);
+            thread::sleep(Duration::from_millis(5));
+        }
+        input
+    });
+    let http = ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1))
+        .unwrap()
+        .with_runtime(Arc::new(OwnedProof {
+            stopped: stopped.clone(),
+            origin: origin.clone(),
+        }));
+    let scheduler = Scheduler::default();
+    scheduler.register(&origin, EndpointKind::Local).unwrap();
+    let first = scheduler
+        .submit(&origin, OperationId::new("cancel-owned").unwrap())
+        .unwrap();
+    let permit = scheduler.start(&first).unwrap().unwrap();
+    let (source, mut cancel) = cancellation();
+    let result = request_generation(
+        &http,
+        GenerationRequest {
+            tool_names: vec![],
+            request_id: "owned".into(),
+            family: ApiFamily::Completions,
+            request: request(&origin, 8192),
+            limits: GenerationLimits {
+                max_output_bytes: 4096,
+                prefill_ms: 1000,
+                idle_ms: 1000,
+                overall_ms: 3000,
+            },
+        },
+        permit,
+        &mut cancel,
+        |event| {
+            if matches!(event, ProviderEvent::Delta { .. }) {
+                source.cancel();
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(result.error, DomainError::Cancelled);
+    assert_eq!(result.partial.unwrap().content[0].text, "partial");
+    assert!(stopped.load(Ordering::Acquire));
+    assert_eq!(scheduler.status(&origin).unwrap().quarantined, 0);
+    let next = scheduler
+        .submit(&origin, OperationId::new("after-cancel").unwrap())
+        .unwrap();
+    scheduler.start(&next).unwrap().unwrap().terminal().unwrap();
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn remote_generation_abort_and_unexpected_eof_release_client_capacity_without_success() {
+    for (aborted, watchdog) in [(false, 0), (false, 3000), (true, 0), (true, 3000)] {
+        let (done_tx, done_rx) = mpsc::channel();
+        let (origin, server) = fixture(move |mut socket| {
+            let input = read_request(&mut socket);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            let length = body.len() + if aborted { 10 } else { 0 };
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").unwrap();
+            if aborted {
+                let _ = done_rx.recv_timeout(Duration::from_secs(3));
+            }
+            input
+        });
+        let http =
+            ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1)).unwrap();
+        let (source, mut cancel) = cancellation();
+        let scheduler = Scheduler::default();
+        scheduler.register(&origin, EndpointKind::Remote).unwrap();
+        let first = scheduler
+            .submit(&origin, OperationId::new("first").unwrap())
+            .unwrap();
+        let permit = scheduler.start(&first).unwrap().unwrap();
+        let next = scheduler
+            .submit(&origin, OperationId::new("next").unwrap())
+            .unwrap();
+        let failure = request_generation(
+            &http,
+            GenerationRequest {
+                tool_names: vec!["read".into()],
+                request_id: "fixture-operation".into(),
+                family: ApiFamily::Completions,
+                request: request(&origin, 8192),
+                limits: GenerationLimits {
+                    max_output_bytes: 4096,
+                    prefill_ms: watchdog,
+                    idle_ms: watchdog,
+                    overall_ms: watchdog,
+                },
+            },
+            permit,
+            &mut cancel,
+            |event| {
+                if aborted && matches!(event, ProviderEvent::Delta { .. }) {
+                    source.cancel();
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.partial.unwrap().content[0].text, "partial");
+        if aborted {
+            assert_eq!(failure.error, DomainError::Cancelled);
+        }
+        assert_eq!(scheduler.status(&origin).unwrap().quarantined, 0);
+        assert!(scheduler.ticket_settled(&first).unwrap());
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        // The fixture task has now actually exited, supplying reconciliation evidence.
+        assert_eq!(scheduler.reconcile(&first), Err(DomainError::NotFound));
+        scheduler.start(&next).unwrap().unwrap().terminal().unwrap();
     }
 }

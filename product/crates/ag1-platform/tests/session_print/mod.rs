@@ -160,12 +160,12 @@ async fn print_completion_waits_for_actual_mutation_and_verifier_then_returns_su
     ));
     assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0]);
     assert!(
-        requests[0]["messages"][0]
+        requests[0]["messages"]
             .to_string()
-            .contains("runtime-verification-contract")
+            .contains("<runtime-verification-contract>")
     );
     assert!(
-        requests[0]["messages"][0]
+        requests[0]["messages"]
             .to_string()
             .contains("node --test verifier.test.js")
     );
@@ -489,16 +489,14 @@ async fn print_verifier_contract_is_request_local_and_expires_with_the_mode() {
         .unwrap();
     for request in &requests[..4] {
         assert!(
-            request["messages"][0]["content"]
-                .as_str()
-                .unwrap()
+            request["messages"].as_array().unwrap().last().map(|message| ag1_core::context::hygiene::content(message, "\n")).unwrap()
                 .contains(&contract)
         );
     }
     assert!(
-        !requests[4]["messages"][0]
+        !requests[4]["messages"]
             .to_string()
-            .contains("runtime-verification-contract")
+            .contains("<runtime-verification-contract>")
     );
     let journal = fixture
         .store
@@ -508,7 +506,7 @@ async fn print_verifier_contract_is_request_local_and_expires_with_the_mode() {
     assert!(
         !json!(branch)
             .to_string()
-            .contains("runtime-verification-contract")
+            .contains("<runtime-verification-contract>")
     );
     let users: Vec<&Value> = branch
         .iter()

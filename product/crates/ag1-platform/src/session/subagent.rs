@@ -56,6 +56,8 @@ pub struct ResultView {
     pub unavailable_tools: Vec<String>,
     pub settled: bool,
     pub result_set: Value,
+    /// Revision references from the child's recorded read results, not summary prose.
+    pub source_references: Vec<String>,
 }
 pub struct Delegation {
     cancel: Arc<Control>,
@@ -503,6 +505,10 @@ impl NativeSession {
         .ok_or_else(|| DomainError::InvalidInput("subagent clock".into()))?
         .to_rfc3339();
         let mut adapters = services.tools.adapters.clone();
+        // Parent MCP leases belong to its session epoch. Child profiles do not
+        // inherit them, and child cleanup must never close a parent's lease.
+        #[cfg(target_os = "linux")]
+        { adapters.mcp=None; adapters.mcp_discovery=None; adapters.mcp_management=None; }
         adapters.delegation = None;
         adapters.extensions = None;
         // Share host launch configuration, with an isolated durable job book
@@ -556,14 +562,14 @@ impl NativeSession {
         let mut registry = ag1_core::tools::registry::Registry::builtins()?;
         registry.activate(&names, &available)?;
         configuration.tools = registry
-            .public_tools()
+            .native_tools()
             .into_iter()
             .filter(|tool| names.iter().any(|name| tool["name"] == *name))
             .collect();
         configuration.prompt = None;
         configuration.system_prompt = registry.build_prompt(&ag1_core::context::prompt::PromptInput {
             date:timestamp[..10].into(),cwd:self.root.root().to_str().ok_or(DomainError::PermissionDenied)?.into(),
-            custom_prompt:Some(format!("A parent agent delegated a self-contained task to you. It sees only your final result, so include everything needed to assess your findings. {}",request.profile.instructions())),
+            custom_prompt:Some(format!("A parent agent delegated a self-contained task to you. It sees only your final result, so include everything needed to assess your findings. MCP connections and private server capabilities belong to the parent session and are unavailable here. If the task needs them, report the required operation to the parent; do not recreate connections or seek credentials. {}",request.profile.instructions())),
             selected_tools:Some(names),model_provider:configuration.model["provider"].as_str().map(str::to_owned),context_window:configuration.model["contextWindow"].as_u64(),..Default::default()
         })?;
         configuration.validate()?;
@@ -711,7 +717,18 @@ impl NativeSession {
             let mut checkpoints = checkpoints_copy.lock().map_err(|_| DomainError::Conflict)?;
             checkpoints.capture(&child_copy,Some(state))?;
             let checkpoint = checkpoints.manager.acknowledged();
-            let result = ResultView { result_set:domain::tool::result_set(checkpoint),state,profile:request.profile,description:request.description,model:format!("{}/{}",child_copy.configuration()?.model["provider"].as_str().unwrap(),child_copy.configuration()?.model["id"].as_str().unwrap()),summary:checkpoints.tracking.summary.clone(),partial:state != State::Completed && (!checkpoints.tracking.summary.is_empty() || !checkpoint.evidence.is_empty()),evidence:checkpoint.evidence.iter().rev().take(20).rev().map(|entry| entry.evidence.clone()).collect(),usage:json!({"input":checkpoint.usage.input,"output":checkpoint.usage.output,"totalTokens":checkpoint.usage.total_tokens,"cost":checkpoint.usage.cost,"cacheRead":checkpoints.tracking.cache_read,"cacheWrite":checkpoints.tracking.cache_write}),turns:checkpoint.last_turn,duration_ms:start.elapsed().as_millis().min(u64::MAX as u128) as u64,error,checkpoint_id:checkpoint.id.clone(),child_session:session,unavailable_tools,settled:child_copy.settled()? };
+            let mut source_references = Vec::new();
+            let branch = ag1_core::task::branch_values(&child_copy.store.journal_snapshot(&SessionId::new(&session)?)?)?;
+            for entry in branch.iter().rev().take(128) {
+                let message = &entry["message"];
+                if message["role"] == "toolResult" && ag1_core::tools::surface::message_tool(message) == "read" && message["isError"] != true {
+                    if let Some(reference) = message["details"]["sourceReference"].as_str() {
+                        if ag1_core::evidence::SourceReference::parse(reference).is_ok() && !source_references.contains(&reference.to_owned()) { source_references.push(reference.to_owned()); }
+                    }
+                }
+                if source_references.len() == 8 { break; }
+            }
+            let result = ResultView { source_references, result_set:domain::tool::result_set(checkpoint),state,profile:request.profile,description:request.description,model:format!("{}/{}",child_copy.configuration()?.model["provider"].as_str().unwrap(),child_copy.configuration()?.model["id"].as_str().unwrap()),summary:checkpoints.tracking.summary.clone(),partial:state != State::Completed && (!checkpoints.tracking.summary.is_empty() || !checkpoint.evidence.is_empty()),evidence:checkpoint.evidence.iter().rev().take(20).rev().map(|entry| entry.evidence.clone()).collect(),usage:json!({"input":checkpoint.usage.input,"output":checkpoint.usage.output,"totalTokens":checkpoint.usage.total_tokens,"cost":checkpoint.usage.cost,"cacheRead":checkpoints.tracking.cache_read,"cacheWrite":checkpoints.tracking.cache_write}),turns:checkpoint.last_turn,duration_ms:start.elapsed().as_millis().min(u64::MAX as u128) as u64,error,checkpoint_id:checkpoint.id.clone(),child_session:session,unavailable_tools,settled:child_copy.settled()? };
             let intent = store.load_metadata("subagent_run",&operation_key)?.ok_or(DomainError::DurabilityUnknown)?;
             let mut record:Value = serde_json::from_slice(&intent.bytes).map_err(|_| DomainError::DurabilityUnknown)?;
             record["state"] = json!("completed");

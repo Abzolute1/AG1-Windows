@@ -616,12 +616,21 @@ fn working_state_assembly_and_user_insertion_match_the_pinned_agent_session() {
             })
         });
         assert_eq!(json!(tail), row["tail"], "{} tail", row["id"]);
-        assert_eq!(
-            json!(context::append_working_state(messages, tail.as_deref()).unwrap()),
-            row["output"],
-            "{} output",
-            row["id"]
-        );
+        let output = context::append_working_state(messages, tail.as_deref()).unwrap();
+        // Intentional native correction to the retained SDK oracle: changing
+        // working state belongs at the request tail, rather than rewriting an
+        // earlier user message ahead of all subsequent assistant/tool rounds.
+        // The legacy tail text is still checked exactly above.
+        if let Some(tail) = tail {
+            assert_eq!(&output[..messages.len()], messages);
+            assert_eq!(output.len(), messages.len() + 1);
+            assert_eq!(
+                output.last().unwrap(),
+                &json!({"role":"custom","customType":"ag1-working-state","content":tail,"display":false,"timestamp":0})
+            );
+        } else {
+            assert_eq!(json!(output), row["output"], "{} output", row["id"]);
+        }
         assert_eq!(*messages, before);
     }
 }
@@ -808,7 +817,7 @@ fn task_state_tool_actions_match_twelve_unchanged_sdk_reductions_and_write_decis
 }
 
 #[test]
-fn todo_tool_actions_match_sdk_preflight_presentation_and_journal_transitions() {
+fn todo_tool_preserves_sdk_transitions_and_exposes_current_query_ids() {
     use serde_json::{Value, json};
     let oracle: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/runtime/todo-tool-oracle.json"
@@ -832,13 +841,25 @@ fn todo_tool_actions_match_sdk_preflight_presentation_and_journal_transitions() 
             continue;
         }
         let plan = result.unwrap();
-        assert_eq!(plan.result, row["output"], "{} output", row["id"]);
+        if matches!(row["id"].as_str(), Some("query" | "query-phase")) {
+            // Native queries intentionally expose reusable IDs; the frozen SDK
+            // oracle returned only a generic acknowledgement and null todos.
+            let items = row.get("state").map(|state| state["items"].clone()).unwrap_or_else(|| json!([]));
+            assert_eq!(plan.result["details"], json!({
+                "todos": items, "planId": row["state"]["planId"], "phase": row["state"]["phase"],
+            }));
+            assert_eq!(plan.result["content"], json!([{"type":"text","text":format!(
+                "Current todo list (reuse these IDs when updating): {items}"
+            )}]));
+        } else {
+            assert_eq!(plan.result, row["output"], "{} output", row["id"]);
+        }
         assert_eq!(json!(plan.records), row["records"], "{} records", row["id"]);
     }
 }
 
 #[test]
-fn runtime_observation_matches_sdk_feedback_and_related_task_reopening() {
+fn runtime_observation_preserves_sdk_reopening_and_labels_unverified_claims() {
     use serde_json::{Value, json};
     let oracle: Value = serde_json::from_str(include_str!(
         "../../../../fixtures/runtime/observation-tool-oracle.json"
@@ -867,7 +888,16 @@ fn runtime_observation_matches_sdk_feedback_and_related_task_reopening() {
             continue;
         }
         let plan = result.unwrap();
-        assert_eq!(plan.result, row["output"], "{} result", row["id"]);
+        // Preserve the frozen source oracle while checking the intentional
+        // native distinction between recording a claim and verifying it.
+        let mut expected = row["output"].clone();
+        expected["details"]["verification"] = json!("recorded_claim");
+        expected["details"]["sourceReference"] = json!("session-entry:observation-entry");
+        expected["content"][0]["text"] = json!(format!(
+            "{}. Recording this claim does not independently verify its result; cite a matching check receipt for verification.",
+            row["output"]["content"][0]["text"].as_str().unwrap(),
+        ));
+        assert_eq!(plan.result, expected, "{} result", row["id"]);
         assert_eq!(json!(plan.records), row["records"], "{} records", row["id"]);
     }
 }
@@ -1002,3 +1032,44 @@ fn runtime_episode_matches_sdk_branch_queries_completion_gates_and_metadata() {
 mod completion;
 #[path = "runtime_planning/mod.rs"]
 mod planning_workflow;
+
+#[test]
+fn deeper_observation_explicit_task_scope_projects_once_and_rejects_changed_objective() {
+    use ag1_core::{task::TaskState, tools::observation::{prepare, ObservationIdentity}};
+    use serde_json::json;
+    let task = TaskState::empty("2026-09-11T12:00:00.000Z").set(&json!({"objective":"Investigate rendering"}), "2026-09-11T12:00:00.000Z").unwrap();
+    let branch = vec![json!({"type":"custom","customType":"task_state","data":task.value()})];
+    let ids = || ObservationIdentity { observation:"obs_000000000001", entry:"observation-entry", task_entry:"ts_00000001", call:"call" };
+    let mut args = json!({"feature":"GPU surface","result":"fail","environment":"owned fixture","revision":"r1","reporter":"user","reproduction":"open window","notes":"blank","taskObjective":"Investigate rendering"});
+    let plan = prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).unwrap();
+    assert_eq!(plan.records.len(), 2);
+    assert_eq!(plan.result["details"]["verification"], "recorded_claim");
+    assert!(plan.result["details"]["taskStateEntryId"].is_string());
+    args["updateTaskState"] = json!(false);
+    assert_eq!(prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).unwrap().records.len(), 1);
+    args["taskObjective"] = json!("A different task");
+    assert!(prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).is_err());
+}
+
+#[test]
+fn deeper_exploration_prior_marks_age_missing_provenance_and_stale_sources_without_verifying_claims() {
+    use ag1_core::runtime::subagent::explore::prior_with_freshness;
+    let board = serde_json::json!({"version":1,"findings":[{"question":"old","summary":"historical","at":10},{"question":"new","summary":"claim","at":20,"childSession":"child","sourceReferences":["file:changed@sha256:fixture"]}]});
+    let text = prior_with_freshness(&board, 30, |_| "stale".into()).unwrap();
+    assert!(text.contains("unknown; inspect current source"));
+    assert!(text.contains("stale"));
+    assert!(text.contains("not independently verified"));
+    assert!(text.contains("\"ageMs\":\"10\""));
+}
+
+#[test]
+fn npm_version_headers_are_not_zero_test_summaries() {
+    use ag1_core::runtime::completion::{classify, Status};
+    let output = "> owned-interface-probe@1.0.0 test\n> node --test verify.test.cjs\n✔ fixture value was updated\nℹ tests 1\nℹ pass 1\nℹ fail 0\n";
+    assert_eq!(classify("npm test", output, false).unwrap().status, Status::Passed);
+    for output in ["0 tests", "Collected: 0 tests", "running 0 tests", "=== 0 tests ran ===", "no tests ran", "collected 0 items"] {
+        assert_eq!(classify("npm test", output, false).unwrap().status, Status::NoTests, "{output}");
+    }
+    assert_eq!(classify("npm test", "1 failed", false).unwrap().status, Status::Failed);
+    assert_eq!(classify("npm test", output, true).unwrap().status, Status::Failed);
+}

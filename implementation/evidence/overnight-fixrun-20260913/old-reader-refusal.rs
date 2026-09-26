@@ -1,0 +1,1 @@
+fn main() { let p=std::env::args().nth(1).unwrap(); match ag1_storage::Store::open(std::path::Path::new(&p)) { Err(ag1_storage::StorageError::Unsupported(_)) => println!("schema-2-refused"), _ => panic!("Old reader must refuse schema 2") } }

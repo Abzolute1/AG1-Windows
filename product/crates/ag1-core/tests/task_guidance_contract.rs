@@ -57,5 +57,15 @@ fn clipped_task_state_cannot_instruct_an_unavailable_show_action() {
     );
     assert!(!readonly.contains("taskState show"));
     let editable = projections::task(&task, |_| None, |_| false).unwrap();
-    assert!(editable.ends_with("[task state clipped; use taskState show for the complete state]"));
+    assert!(editable.ends_with("[task state clipped; use the current task-state tool with action=show for the complete state]"));
+}
+
+#[test]
+fn preferred_task_projection_names_the_selected_work_tool() {
+    let task = TaskState::reset("Current work", "2026-09-13T00:00:00Z").unwrap();
+    let preferred = projections::task_with_control_tool(&task, |_| None, |_| false,
+        Some(projections::TaskControlTool::Work)).unwrap();
+    assert!(preferred.contains("update with work"));
+    assert!(!preferred.contains("taskState"));
+    assert!(projections::task(&task, |_| None, |_| false).unwrap().contains("update with taskState"));
 }

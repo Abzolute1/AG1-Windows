@@ -113,7 +113,11 @@ impl<P: Port> Service<P> {
         }
         registry.validate_current(&call)?;
         let request = Request::from_call(&call)?;
-        let plan = self.port.prepare(&request, control)?;
+        let plan = self.port.prepare(&request, control).map_err(|error| {
+            if error == DomainError::NotFound && matches!(request.name(), "screenshot_url" | "interact_then_screenshot" | "verify_ui") {
+                DomainError::Unavailable("For a local image or SVG, call ui with {path: \"image.svg\"} (or inspect with its path) to receive a visible image without a server. No ready AG1-owned web preview target. Use preview status to discover an eligible target, preview start to launch its installed root Vite dev script, then preview status for the exact ready URL. If preview is unavailable, use the host Runtime UI. Editor Preview and bash/job servers do not grant browser access.".into())
+            } else { error }
+        })?;
         let binding = self.port.binding(&plan);
         binding.admits(&request)?;
         if binding.workspace != scope.workspace {

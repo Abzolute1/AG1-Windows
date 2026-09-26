@@ -312,8 +312,18 @@ impl Registry {
         Ok(Some(e.record))
     }
     pub fn initialize_isolated(&self, workspace: &Path) -> Result<()> {
+        self.initialize_native_record(workspace, true)
+    }
+    /// Start fresh native agent state for a user-selected project. Existing
+    /// ownership always requires its normal reopen or migration path.
+    pub fn initialize_native(&self, workspace: &Path) -> Result<()> {
+        self.initialize_native_record(workspace, false)
+    }
+    fn initialize_native_record(&self, workspace: &Path, isolated: bool) -> Result<()> {
         let mut lease = self.locked(workspace)?;
-        if lease.record.is_some() || fs::read_dir(workspace).map_err(io)?.next().is_some() {
+        if lease.record.is_some()
+            || (isolated && fs::read_dir(workspace).map_err(io)?.next().is_some())
+        {
             return Err(DomainError::Conflict);
         }
         lease.save(Record {
@@ -325,7 +335,7 @@ impl Registry {
             owner: Owner::Native,
             stage: Stage::Active,
             state: None,
-            isolated: true,
+            isolated,
             quiescent: true,
             transfer: None,
             rollback: None,

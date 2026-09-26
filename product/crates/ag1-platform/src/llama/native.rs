@@ -33,14 +33,32 @@ fn signature(m: &fs::Metadata) -> Signature {
 #[derive(Default)]
 pub struct MaterialVerifier {
     cache: BTreeMap<PathBuf, (Signature, String)>,
+    #[cfg(test)]
+    pub(crate) bytes_hashed: u64,
 }
 impl MaterialVerifier {
     pub fn verify(&mut self, materials: &[Material]) -> Result<(), DomainError> {
+        self.verify_progress(materials, &mut |_| {})
+    }
+    pub fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
         if materials.is_empty() || materials.len() > 1024 {
             return Err(DomainError::InvalidInput(
                 "runtime material manifest".into(),
             ));
         }
+        let total: u128 = materials.iter().map(|m| {
+            if !Path::new(&m.path).is_absolute() || m.sha256.len() != 64 || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(DomainError::InvalidInput("runtime material identity".into()));
+            }
+            fs::metadata(&m.path).map(|m| m.len() as u128).map_err(io_error)
+        }).collect::<Result<Vec<_>, _>>()?.into_iter().sum();
+        let mut done = 0u128;
+        let mut last = 0u8;
+        progress(0);
+        let mut report = |done: u128| {
+            let percent = (done.saturating_mul(100) / total.max(1)).min(99) as u8;
+            if percent != last { progress(percent); last = percent; }
+        };
         let mut unique = BTreeMap::new();
         for material in materials {
             if !Path::new(&material.path).is_absolute()
@@ -67,6 +85,8 @@ impl MaterialVerifier {
                 .get(&path)
                 .is_some_and(|(saved, digest)| saved == &stamp && digest == &material.sha256)
             {
+                done += before.len() as u128;
+                report(done);
                 continue;
             }
             let mut file = File::open(&path).map_err(io_error)?;
@@ -81,6 +101,12 @@ impl MaterialVerifier {
                     break;
                 }
                 hash.update(&buffer[..size]);
+                done += size as u128;
+                report(done);
+                #[cfg(test)]
+                {
+                    self.bytes_hashed += size as u64;
+                }
             }
             if signature(&file.metadata().map_err(io_error)?) != stamp
                 || signature(&fs::metadata(&path).map_err(io_error)?) != stamp
@@ -97,6 +123,7 @@ impl MaterialVerifier {
             }
             self.cache.insert(path, (stamp, digest));
         }
+        progress(100);
         Ok(())
     }
 }
@@ -124,6 +151,14 @@ impl<O> NativeRuntimeHost<O> {
         self
     }
     pub fn new(helper: &Path, private_dir: &Path, observer: O) -> Result<Self, DomainError> {
+        Self::with_verifier(helper, private_dir, observer, MaterialVerifier::default())
+    }
+    pub(crate) fn with_verifier(
+        helper: &Path,
+        private_dir: &Path,
+        observer: O,
+        verifier: MaterialVerifier,
+    ) -> Result<Self, DomainError> {
         let directory = private_dir.canonicalize().map_err(io_error)?;
         let meta = fs::metadata(&directory).map_err(io_error)?;
         if !meta.is_dir() || meta.mode() & 0o077 != 0 {
@@ -133,7 +168,7 @@ impl<O> NativeRuntimeHost<O> {
             supervisor: ProcessSupervisor::new(helper)?,
             observer,
             private_dir: directory,
-            verifier: MaterialVerifier::default(),
+            verifier,
             serial: 0,
             exclusive_gpu: false,
             owned_pid: None,
@@ -147,6 +182,17 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError> {
         self.verifier.verify(materials)
     }
+    fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+        self.verifier.verify_progress(materials, progress)
+    }
+    fn loading_phase(&mut self, handle: &Self::Handle) -> Option<&'static str> {
+        let process = handle.process.lock().ok()?;
+        let log = process.tail(8192).ok()?;
+        let text = String::from_utf8_lossy(&log.bytes);
+        if text.contains("warming up") { Some("warming") }
+        else if text.contains("load_model: initializing") || text.contains("loaded multimodal model") { Some("initializing") }
+        else { None }
+    }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError> {
         if self.exclusive_gpu && self.owned_pid.is_none() {
             super::window::verify(None)?;
@@ -158,7 +204,7 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             super::window::verify(None)?;
         }
         // Reverify after health observation, immediately before creating the child.
-        self.verifier.verify(&plan.materials)?;
+        self.verifier.verify(&plan.runtime_materials()?)?;
         self.serial = self.serial.checked_add(1).ok_or(DomainError::QueueFull)?;
         let spool = self.private_dir.join(format!(
             "runtime-{}-{}.log",
@@ -201,7 +247,7 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
                     "model process exited or executable identity differs".into(),
                 ));
             }
-            self.verifier.verify(&plan.materials)?;
+            self.verifier.verify(&plan.runtime_materials()?)?;
             Ok(candidates.remove(0))
         })();
         match result {
@@ -274,5 +320,101 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
         Ok(Some(
             serde_json::json!({"owned_pid":handle.target.pid,"resident_kib":rss,"gpu":gpu}),
         ))
+    }
+}
+
+#[cfg(test)]
+mod verifier_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn transferred_cache_avoids_rehash_but_invalidates_changed_identity_and_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.path().join("model");
+        fs::write(&path, b"pinned").unwrap();
+        let original_times = fs::metadata(&path).unwrap();
+        let material = Material {
+            path: path.display().to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"pinned")),
+            kind: "weight".into(),
+        };
+        let mut verifier = MaterialVerifier::default();
+        verifier.verify(std::slice::from_ref(&material)).unwrap();
+        assert_eq!(verifier.bytes_hashed, 6);
+        let mut host = NativeRuntimeHost::with_verifier(
+            &std::env::current_exe().unwrap(),
+            dir.path(),
+            |_: &LaunchPlan| Ok(Observation::Vacant),
+            verifier,
+        )
+        .unwrap();
+        host.verify_materials(std::slice::from_ref(&material))
+            .unwrap();
+        assert_eq!(host.verifier.bytes_hashed, 6);
+
+        let mut wrong_digest = material.clone();
+        wrong_digest.sha256 = "0".repeat(64);
+        assert_eq!(
+            host.verify_materials(&[wrong_digest]),
+            Err(DomainError::Conflict)
+        );
+        assert_eq!(host.verifier.bytes_hashed, 12);
+
+        // Same bytes with a different inode must be hashed again.
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"pinned").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        host.verify_materials(std::slice::from_ref(&material))
+            .unwrap();
+        assert_eq!(host.verifier.bytes_hashed, 18);
+
+        // Restoring mtime after a same-size write cannot restore ctime/inode.
+        fs::write(&path, b"tamper").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_times.modified().unwrap()))
+            .unwrap();
+        assert_eq!(
+            host.verify_materials(std::slice::from_ref(&material)),
+            Err(DomainError::Conflict)
+        );
+        assert_eq!(host.verifier.bytes_hashed, 24);
+
+        fs::remove_file(&path).unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"pinned").unwrap();
+        symlink(&target, &path).unwrap();
+        host.verify_materials(std::slice::from_ref(&material))
+            .unwrap();
+        assert_eq!(host.verifier.bytes_hashed, 30);
+        let bad_target = dir.path().join("bad-target");
+        fs::write(&bad_target, b"tamper").unwrap();
+        fs::remove_file(&path).unwrap();
+        symlink(&bad_target, &path).unwrap();
+        assert_eq!(
+            host.verify_materials(std::slice::from_ref(&material)),
+            Err(DomainError::Conflict)
+        );
+        assert_eq!(host.verifier.bytes_hashed, 36);
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            host.verify_materials(std::slice::from_ref(&material)),
+            Err(DomainError::NotFound)
+        );
+        fs::write(&path, b"pinned").unwrap();
+        let mut fresh = NativeRuntimeHost::new(
+            &std::env::current_exe().unwrap(),
+            dir.path(),
+            |_: &LaunchPlan| Ok(Observation::Vacant),
+        )
+        .unwrap();
+        assert_eq!(fresh.verifier.bytes_hashed, 0);
+        fresh.verify_materials(&[material]).unwrap();
+        assert_eq!(fresh.verifier.bytes_hashed, 6);
     }
 }

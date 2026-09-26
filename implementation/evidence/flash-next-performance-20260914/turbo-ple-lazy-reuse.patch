@@ -1,0 +1,43 @@
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -5,6 +5,13 @@
+ 
+ #include <algorithm>
+ #include <cinttypes>
++#include <cstdlib>
++
++// Isolated Flash-Next experiment: no change unless explicitly enabled.
++static bool flash_ple_experiment(const char * name) {
++    const char * value = std::getenv(name);
++    return value && value[0] == '1' && value[1] == '\0';
++}
+ 
+ // bad metadata must be catchable: GGML_ASSERT aborts the whole process
+ static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+@@ -178,7 +185,7 @@
+         }
+ 
+         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+-                                           { hparams.ple_head_dim, ple_rows }, 0);
++                                           { hparams.ple_head_dim, ple_rows }, flash_ple_experiment("AG1_FLASH_PLE_LAZY") ? TENSOR_READ_LAZY : 0);
+     }
+ 
+     // MTP tensors sit in the trailing blocks; skip them entirely unless a draft head was asked for
+@@ -1287,6 +1294,17 @@
+ 
+     void set_input(const llama_ubatch * ubatch) override;
+ 
++    bool can_reuse(const llm_graph_params & params) override {
++        if (!flash_ple_experiment("AG1_FLASH_PLE_REUSE")) {
++            return false;
++        }
++        // Refresh the current memory-context pointer on every reuse check,
++        // matching the lifetime contract of the other graph inputs.
++        mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx);
++        return rows->ne[0] == (int64_t) pmodel.hparams.ple_n_heads * params.ubatch.n_tokens;
++    }
++
++
+     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+ 
+     const llama_model_qwen4exp & pmodel;

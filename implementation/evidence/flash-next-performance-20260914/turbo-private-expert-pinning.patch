@@ -1,0 +1,117 @@
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -25,6 +25,13 @@
+ #include "ggml-cpp.h"
+ 
+ #include <algorithm>
++#include <thread>
++#include <cstdlib>
++#ifdef __linux__
++#include <dlfcn.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#endif
+ #include <cassert>
+ #include <cfloat>
+ #include <cstdint>
+@@ -1141,7 +1148,17 @@
+ 
+ struct llama_model::impl {
+     impl() = default;
+-    ~impl() = default;
++    ~impl() {
++#ifdef __linux__
++        if (flash_unregister) {
++            for (void * address : flash_pinned_experts) flash_unregister(address);
++        }
++        if (flash_driver) dlclose(flash_driver);
++#endif
++    }
++    void * flash_driver = nullptr;
++    int (*flash_unregister)(void *) = nullptr;
++    std::vector<void *> flash_pinned_experts;
+ 
+     uint64_t n_elements = 0;
+ 
+@@ -1807,6 +1824,70 @@
+             return false;
+         }
+     }
++
++#ifdef __linux__
++    const char * flash_cow = std::getenv("AG1_FLASH_TURBO_COW");
++    if (flash_cow && flash_cow[0] == '1' && flash_cow[1] == '\0') {
++        if (!ml.use_mmap || !use_mmap_buffer) throw std::runtime_error("private expert pinning requires mmap buffers");
++        const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
++        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
++        for (const auto & entry : ctx_buf_maps) {
++            ggml_context * ctx = entry.first;
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                const std::string name(t->name);
++                if (name.find("ffn_") == std::string::npos || name.find("_exps.weight") == std::string::npos ||
++                        !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) continue;
++                const uintptr_t begin = (uintptr_t) t->data;
++                const uintptr_t end = begin + ggml_nbytes(t);
++                bool in_mapping = false;
++                for (const auto & mapping : ml.mappings) {
++                    const uintptr_t a = (uintptr_t) mapping->addr();
++                    if (begin >= a && end >= begin && end <= a + mapping->size()) { in_mapping = true; break; }
++                }
++                if (!in_mapping) throw std::runtime_error("CPU expert tensor is not backed by the private GGUF mapping");
++                ranges.emplace_back(begin & ~(page - 1), (end + page - 1) & ~(page - 1));
++            }
++        }
++        if (ranges.empty()) throw std::runtime_error("no mapped CPU experts found for private pinning");
++        std::sort(ranges.begin(), ranges.end());
++        std::vector<std::pair<uintptr_t, uintptr_t>> merged;
++        for (const auto & range : ranges) {
++            if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
++            else merged.push_back(range);
++        }
++        pimpl->flash_driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
++        auto register_host = pimpl->flash_driver ? reinterpret_cast<int (*)(void *, size_t, unsigned)>(dlsym(pimpl->flash_driver, "cuMemHostRegister_v2")) : nullptr;
++        pimpl->flash_unregister = pimpl->flash_driver ? reinterpret_cast<int (*)(void *)>(dlsym(pimpl->flash_driver, "cuMemHostUnregister")) : nullptr;
++        if (!register_host || !pimpl->flash_unregister) throw std::runtime_error("CUDA driver pinning entry points unavailable");
++        const char * workers_env = std::getenv("AG1_FLASH_COW_PREFAULT_THREADS");
++        const int workers_n = workers_env ? std::max(0, std::min(24, std::atoi(workers_env))) : 0;
++        pimpl->flash_pinned_experts.reserve(merged.size());
++        size_t total = 0;
++        const int64_t start_us = ggml_time_us();
++        for (const auto & range : merged) {
++            const uintptr_t first = range.first, last = range.second;
++            if (mprotect((void *) first, last - first, PROT_READ | PROT_WRITE)) throw std::runtime_error("private expert mapping mprotect failed");
++            if (workers_n) {
++                const size_t pages = (last - first) / page;
++                std::vector<std::thread> workers;
++                for (int worker = 0; worker < workers_n; ++worker) {
++                    workers.emplace_back([=]() {
++                        for (size_t i = pages * worker / workers_n; i < pages * (worker + 1) / workers_n; ++i) {
++                            volatile unsigned char * address = reinterpret_cast<volatile unsigned char *>(first + i * page);
++                            const unsigned char value = *address; *address = value;
++                        }
++                    });
++                }
++                for (auto & worker : workers) worker.join();
++            }
++            const int rc = register_host((void *) first, last - first, 1u);
++            if (rc) throw std::runtime_error(format("private expert registration failed: %d", rc));
++            pimpl->flash_pinned_experts.push_back((void *) first); total += last - first;
++        }
++        LLAMA_LOG_INFO("%s: pinned %.2f MiB private CPU expert weights in %.3f s, workers=%d, ranges=%zu\n",
++                __func__, total / 1048576.0, (ggml_time_us() - start_us) / 1e6, workers_n, merged.size());
++    }
++#endif
+ 
+     if (use_mmap_buffer) {
+         for (auto & mapping : ml.mappings) {
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -469,6 +469,8 @@
+         size = file->size();
+         int fd = file->file_id();
+         int flags = MAP_SHARED;
++        const char * private_env = getenv("AG1_FLASH_TURBO_COW");
++        if (private_env && private_env[0] == '1' && private_env[1] == '\0') flags = MAP_PRIVATE;
+         if (numa) { prefetch = 0; }
+ #ifdef __linux__
+         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {

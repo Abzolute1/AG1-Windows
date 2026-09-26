@@ -24,6 +24,9 @@ pattern!(
     NO_TESTS,
     r"(?i)\b(?:no tests? (?:ran|collected)|collected 0 items?|0 tests?)\b"
 );
+// npm's script banner can end in `@1.0.0 test`; that is package
+// metadata, not a "0 test" count. Preserve all other no-test detection.
+pattern!(NPM_SCRIPT_HEADER, r"(?m)^[ \t]*(?:#[ \t]*)?>[ \t]+\S+@\S+[ \t]+test(?:[ \t][^\r\n]*)?$");
 pattern!(
     ONLY_SKIPPED,
     r"(?i)\bcollected 0 items?\s*/\s*[1-9]\d* skipped\b"
@@ -153,9 +156,11 @@ pub fn classify(command: &str, output: &str, is_error: bool) -> Result<Verificat
     let passed_checks = checks(output, &[&PASSED_SUFFIX])?;
     let prefix = &command[..TEST.find(command).map_or(0, |m| m.start())];
     let failed_before = INSTALL.is_match(prefix) && INSTALL_ERROR.is_match(output);
-    let status = if NO_TESTS.is_match(output) && ONLY_SKIPPED.is_match(output) {
+    let diagnostic = NPM_SCRIPT_HEADER.replace_all(output, "");
+    let no_tests = NO_TESTS.is_match(&diagnostic);
+    let status = if no_tests && ONLY_SKIPPED.is_match(output) {
         Status::Inconclusive
-    } else if NO_TESTS.is_match(output) {
+    } else if no_tests {
         Status::NoTests
     } else if SAFETY.is_match(output)
         || USAGE.is_match(output)

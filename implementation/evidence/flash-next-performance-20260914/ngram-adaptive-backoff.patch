@@ -1,0 +1,86 @@
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1874,6 +1874,8 @@
+ 
+     // enable trace logging if LLAMA_TRACE is set
+     const bool verbose;
++    const bool adaptive;
++    const size_t cooldown_tokens;
+ 
+     struct seq_info {
+         // the last position in the prompt that was added to the ngram container
+@@ -1884,6 +1886,10 @@
+ 
+         // consecutive accept rounds with low acceptance fraction (< 0.5)
+         int n_low = 0;
++        size_t observed_prompt_len = 0;
++        size_t cooldown_until = 0;
++        size_t proposed_window = 0;
++        size_t accepted_window = 0;
+     };
+ 
+     std::vector<seq_info> sinfos;
+@@ -1894,7 +1900,9 @@
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_MOD, n_seq, params.ngram_mod.n_max)
+         , params(params.ngram_mod)
+         , mod(params.ngram_mod.n_match, 4*1024*1024)
+-        , verbose(std::getenv("LLAMA_TRACE") != nullptr) {
++        , verbose(std::getenv("LLAMA_TRACE") != nullptr)
++        , adaptive([]() { const char * v = std::getenv("AG1_FLASH_NGRAM_ADAPTIVE"); return v && v[0] == '1' && v[1] == '\0'; }())
++        , cooldown_tokens([]() { const char * v = std::getenv("AG1_FLASH_NGRAM_COOLDOWN"); return (size_t) (v ? std::max(32, std::min(8192, std::atoi(v))) : 1024); }()) {
+         static_assert(sizeof(llama_token) == sizeof(common_ngram_mod::entry_t));
+ 
+         SPC_TRC("%s", "adding speculative implementation 'ngram-mod'\n");
+@@ -1916,6 +1924,10 @@
+ 
+         sinfo.i_last = 0;
+         sinfo.n_draft_last = 0;
++        sinfo.observed_prompt_len = prompt.size();
++        sinfo.cooldown_until = 0;
++        sinfo.proposed_window = sinfo.accepted_window = 0;
++        if (adaptive) sinfo.n_low = 0;
+ 
+         const size_t n = mod.get_n();
+         if (prompt.size() < n) {
+@@ -1950,6 +1962,7 @@
+         sinfo.n_draft_last = 0;
+ 
+         const size_t cur_len = prompt.size();
++        sinfo.observed_prompt_len = cur_len;
+         if (cur_len < mod.get_n()) {
+             return;
+         }
+@@ -1963,6 +1976,12 @@
+             }
+ 
+             sinfo.i_last = cur_len - n;
++        }
++
++        // Keep learning the accepted prompt during cooldown; omit only drafting.
++        if (adaptive && cur_len < sinfo.cooldown_until) {
++            result.clear();
++            return;
+         }
+ 
+         result.resize(n + params.n_max);
+@@ -2019,6 +2038,20 @@
+         }
+ 
+         auto & sinfo = sinfos[seq_id];
++
++        if (adaptive && sinfo.n_draft_last > 0) {
++            sinfo.proposed_window += sinfo.n_draft_last;
++            sinfo.accepted_window += std::min<size_t>(n_accepted, sinfo.n_draft_last);
++            if (sinfo.proposed_window >= 32) {
++                const double rate = (double) sinfo.accepted_window / sinfo.proposed_window;
++                if (rate < 0.85) {
++                    sinfo.cooldown_until = sinfo.observed_prompt_len + cooldown_tokens;
++                    SPC_INF("ngram adaptive pause: seq=%d accepted=%zu proposed=%zu until=%zu\n",
++                            seq_id, sinfo.accepted_window, sinfo.proposed_window, sinfo.cooldown_until);
++                }
++                sinfo.proposed_window = sinfo.accepted_window = 0;
++            }
++        }
+ 
+         // compute acceptance fraction if we have a recorded draft length
+         if (sinfo.n_draft_last > 0) {

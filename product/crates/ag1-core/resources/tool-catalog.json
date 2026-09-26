@@ -104,6 +104,19 @@
         "allowFuzzyMatch": {
           "description": "Allow matching after quote/space normalization when exact matching fails (default false).",
           "type": "boolean"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "preview",
+            "apply"
+          ],
+          "description": "Default apply. Preview computes the same replacements without writing and returns the source SHA-256."
+        },
+        "expectedSha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "When applying a preview, pass its sourceSha256 here with the same edits; reject if the file changed."
         }
       }
     },
@@ -122,7 +135,8 @@
       "type": "object",
       "required": [
         "path",
-        "oldText"
+        "oldText",
+        "newText"
       ],
       "properties": {
         "path": {
@@ -134,7 +148,7 @@
           "type": "string"
         },
         "newText": {
-          "default": "",
+          "description": "Required replacement text. Use an explicit empty string only for intentional deletion.",
           "type": "string"
         }
       }
@@ -142,14 +156,14 @@
     "promptSnippet": "Preview a change as a unified diff without touching any files",
     "promptGuidelines": [
       "Use editPreview to see a unified diff before committing changes",
-      "After approving the diff, use editApply to commit the changes",
+      "To apply, call editApply with path and ordered edits containing oldText and newText; there is no preview ID. Preview does not authorize writes.",
       "If oldText matches multiple times, add more context to make it unique"
     ]
   },
   {
     "name": "editApply",
     "label": "edit_apply",
-    "description": "Apply pre-approved edits to a file. This commits changes that were previously inspected via editPreview. Returns a confirmation with the count of applied edits.",
+    "description": "Apply exact edits using path and an ordered edits array of oldText/newText pairs. A preview ID is not accepted. Normal write approval still applies; preview is optional.",
     "parameters": {
       "additionalProperties": false,
       "type": "object",
@@ -186,9 +200,9 @@
         }
       }
     },
-    "promptSnippet": "Apply pre-approved edits to a file",
+    "promptSnippet": "Apply exact ordered edits to a file, subject to write approval",
     "promptGuidelines": [
-      "Use editApply only after reviewing the diff from editPreview",
+      "An optional editPreview can show the diff; it does not grant write authorization",
       "Each edit.oldText must match exactly; add more context if needed",
       "Edits are applied in order within a single call"
     ]
@@ -924,6 +938,11 @@
           "description": "List/search/recover immutable artifacts or manage bounded evidence leases.",
           "anyOf": [
             {
+              "type": "string",
+              "const": "retrieve",
+              "description": "Preferred evidence recovery: pass query, id or cursor; returns exact text and provenance directly under maxBytes, plus a ready continuation when needed."
+            },
+            {
               "description": "List recent artifacts.",
               "const": "list",
               "type": "string"
@@ -982,7 +1001,7 @@
         "maxBytes": {
           "minimum": 1,
           "maximum": 32768,
-          "description": "Maximum bytes returned by read (default 8192, hard limit 32768).",
+          "description": "For retrieve: total serialized result budget, 2048–32768 bytes (default 8192). For read: text bytes.",
           "type": "integer"
         },
         "query": {
@@ -1361,6 +1380,16 @@
           "items": {
             "type": "string"
           }
+        },
+        "taskObjective": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 8192,
+          "description": "Exact current task objective from taskState show. Associates this event explicitly with that task; a changed objective rejects the event."
+        },
+        "updateTaskState": {
+          "type": "boolean",
+          "description": "False records evidence only. With taskObjective, true (default) projects the observation into task state atomically; no duplicate taskState call is needed."
         }
       }
     },

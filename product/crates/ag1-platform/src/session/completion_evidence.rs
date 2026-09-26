@@ -19,6 +19,7 @@ pub(super) struct Evidence {
     canonical: Option<String>,
     pub mutation_seen: bool,
     checks: BTreeMap<String, Status>,
+    unrecognized_shell: bool,
 }
 impl Evidence {
     pub fn new(canonical: Option<String>) -> Shared {
@@ -26,6 +27,7 @@ impl Evidence {
             canonical,
             mutation_seen: false,
             checks: BTreeMap::new(),
+            unrecognized_shell: false,
         }))
     }
     pub fn verified(&self) -> bool {
@@ -35,6 +37,29 @@ impl Evidence {
                 .checks
                 .values()
                 .any(|s| matches!(s, Status::Failed | Status::NoTests | Status::Inconclusive))
+    }
+    pub fn counts(&self) -> (usize, usize, usize) {
+        let count = |status| self.checks.values().filter(|value| **value == status).count();
+        (count(Status::Passed), count(Status::Failed), count(Status::NoTests))
+    }
+    /// Compact execution facts for this mode lease; never persisted as history.
+    pub fn guidance(&self) -> String {
+        let canonical = self.canonical.as_deref().and_then(|command| {
+            self.checks.iter().find(|(key, _)| key.trim() == command.trim()).map(|(_, status)| *status)
+        });
+        let status = if !self.mutation_seen {
+            "no_mutation_observed"
+        } else if self.checks.values().any(|s| matches!(s, Status::Failed | Status::NoTests | Status::Inconclusive)) {
+            "unresolved_check"
+        } else if canonical == Some(Status::Passed) || self.canonical.is_none() && self.verified() {
+            "passed_after_latest_observed_mutation"
+        } else {
+            "verification_required"
+        };
+        let mismatch = if self.mutation_seen && self.unrecognized_shell && self.canonical.is_some() {
+            "The last shell command was not recognized as the recorded verifier. A successful wrapped command does not establish that receipt. Submit the contract's command string unchanged to bash; do not add cd, shell composition or redirection. Bash already starts in the workspace.\n"
+        } else { "" };
+        format!("<native-verification-status>\nstatus: {status}\n{mismatch}Only acknowledged checks since the latest observed mutation count. A passing check need not be repeated solely because an older inspection index is stale; repeat when new changes, failures, uncovered cases or external changes warrant it. Passing proves only the executed checks, not semantic correctness or full coverage.\n</native-verification-status>")
     }
     fn recognizes(&self, command: &str) -> bool {
         self.canonical
@@ -86,6 +111,7 @@ pub(super) fn observe(
     if mutation {
         evidence.mutation_seen = true;
         evidence.checks.clear();
+        evidence.unrecognized_shell = false;
         return Ok(());
     }
     let args = artifacts.read_json(&outcome.record.arguments)?;
@@ -93,6 +119,7 @@ pub(super) fn observe(
         && let Some(command) = args["command"].as_str()
         && evidence.recognizes(command)
     {
+        evidence.unrecognized_shell = false;
         if !evidence.checks.contains_key(command) && evidence.checks.len() >= 256 {
             return Err(DomainError::LimitExceeded(
                 "native completion checks".into(),
@@ -109,8 +136,13 @@ pub(super) fn observe(
         if evidence.mutation_seen {
             evidence.checks.insert(command.into(), verification.status);
         }
-    } else if outcome.record.effect == Effect::Unknown {
-        evidence.checks.clear();
+    } else {
+        if outcome.record.tool == "bash" {
+            evidence.unrecognized_shell = true;
+        }
+        if outcome.record.effect == Effect::Unknown {
+            evidence.checks.clear();
+        }
     }
     Ok(())
 }

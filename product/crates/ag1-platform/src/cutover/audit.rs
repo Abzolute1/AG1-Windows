@@ -19,7 +19,7 @@ fn verify_export(path: &Path, expected: &str) -> Result<()> {
     let manifest: Value = serde_json::from_slice(&raw).map_err(json)?;
     if digest(&serde_json::to_vec(&manifest).map_err(json)?) != expected
         || manifest["version"] != 1
-        || manifest["schema"] != 1
+        || !matches!(manifest["schema"].as_u64(), Some(1 | 2))
         || manifest["kind"] != "ag1-shadow-lossless-export"
         || manifest["runtime_authority"] != "historical-only"
         || manifest["bridge_compatible_resume"] != true

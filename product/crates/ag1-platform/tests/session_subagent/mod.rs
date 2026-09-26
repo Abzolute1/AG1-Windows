@@ -5,6 +5,63 @@ use ag1_core::runtime::subagent::{
 };
 use ag1_platform::session::subagent::{Request, Services};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_all_failed_exploration_pauses_without_losing_worker_outcomes() {
+    struct FailedWorkers;
+    impl ProviderResolver for FailedWorkers {
+        fn resolve<'a>(&'a self,_:ProviderInput<'a>,_:&'a AtomicBool)->PortFuture<'a,ResolvedRequest> {
+            Box::pin(async {Err(DomainError::Unavailable("controlled same worker failure".into()))})
+        }
+    }
+    let responses = (0..3).map(|i|calls(vec![(&format!("explore-{i}"),"explore",json!({"questions":["Locate parser","Locate tests"]}))])).collect();
+    let (endpoint,server) = server(responses);
+    let mut f = fixture(&endpoint,"disabled");
+    enable_task(&mut f,Arc::new(FailedWorkers)).await;
+    let tool = Registry::builtins().unwrap().public_tools().into_iter().find(|t| t["name"]=="explore").unwrap();
+    f.host.select_tools("explore-retry-tools","explore-retry-tools",NOW,vec![tool],&ignore).await.unwrap();
+    let result = f.host.run(input(),&Resolver::new(false),f.files.clone(),&ignore).await.unwrap();
+    assert_eq!(result.generations,3);
+    assert_eq!(result.assistant["nativePolicy"],"repetition_guard");
+    let results = session_tool_results(&f);
+    assert_eq!(results.len(),3);
+    for result in results {
+        assert_eq!(result["isError"],true);
+        assert_eq!(result["details"]["failed"],2);
+        assert_eq!(result["details"]["recoveryFailures"].as_array().unwrap().len(),2);
+        for failure in result["details"]["recoveryFailures"].as_array().unwrap() {
+            assert_eq!(failure["errorDigest"].as_str().unwrap().len(), 64);
+            assert!(failure.get("error").is_none());
+            assert!(failure.get("summary").is_none());
+        }
+        assert!(result["details"]["resultArtifact"]["id"].is_string());
+    }
+    assert!(f.host.settled().unwrap());
+    assert_eq!(server.join().unwrap().len(),3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_failed_task_with_changed_labels_pauses_and_retains_children() {
+    struct FailedChild;
+    impl ProviderResolver for FailedChild {
+        fn resolve<'a>(&'a self, _: ProviderInput<'a>, _: &'a AtomicBool) -> PortFuture<'a,ResolvedRequest> {
+            Box::pin(async { Err(DomainError::Unavailable("controlled child fixture failure".into())) })
+        }
+    }
+    let responses = (0..3).map(|i| calls(vec![(&format!("delegate-{i}"),"task",json!({"description":format!("New label {i}"),"type":"explore","prompt":"Inspect the same source","timeout":5}))])).collect();
+    let (endpoint, server) = server(responses);
+    let mut f = fixture(&endpoint,"disabled");
+    enable_task(&mut f,Arc::new(FailedChild)).await;
+    let result = f.host.run(input(),&Resolver::new(false),f.files.clone(),&ignore).await.unwrap();
+    assert_eq!(result.generations,3);
+    assert_eq!(result.assistant["nativePolicy"],"repetition_guard");
+    assert!(result.assistant.to_string().contains("retained child error/checkpoint"));
+    let results = session_tool_results(&f);
+    assert_eq!(results.len(),3);
+    assert!(results.iter().all(|result| result["isError"]==true));
+    assert!(f.host.settled().unwrap());
+    assert_eq!(server.join().unwrap().len(),3);
+}
+
 fn request(profile: Profile, operation: &str) -> Request {
     Request {
         operation: operation.into(),
@@ -64,7 +121,8 @@ async fn explore_runs_native_readonly_children_and_imports_board_without_origina
         stop(),
     ]);
     let mut f = fixture_configured(&endpoint, "disabled", vec![], None, None, 1);
-    let original=json!({"version":1,"updatedAt":1,"findings":[{"question":"Prior question","summary":"Preserved finding","state":"completed","evidence":[],"at":1}]}).to_string();
+    std::fs::write(f.root.join("board-source.txt"), "changed source").unwrap();
+    let original=json!({"version":1,"updatedAt":1,"findings":[{"question":"Prior question","summary":"Preserved finding","state":"completed","evidence":[],"at":1,"sourceReferences":[format!("file:board-source.txt@sha256:{}",ag1_storage::digest(b"old source"))]}]}).to_string();
     std::fs::create_dir_all(f.root.join(".ag1")).unwrap();
     std::fs::write(f.root.join(".ag1/explore-board.json"), &original).unwrap();
     let child_resolver = Arc::new(Resolver::new(false));
@@ -127,6 +185,10 @@ async fn explore_runs_native_readonly_children_and_imports_board_without_origina
     assert_eq!(requests.len(), 4);
     for request in &requests[1..3] {
         assert!(request.to_string().contains("Preserved finding"));
+        assert!(request.to_string().contains("Historical workspace-board summaries"));
+        assert!(request.to_string().contains("stale"));
+        assert!(request.to_string().contains("ageMs"));
+        assert!(request.to_string().contains("not independently verified"));
         assert!(!request["tools"].as_array().unwrap().iter().any(|t| {
             ["write", "edit", "bash", "task", "explore"]
                 .contains(&t["function"]["name"].as_str().unwrap())
@@ -184,7 +246,7 @@ async fn explore_cancellation_settles_all_admitted_children_before_parent_comple
             .await
     });
     tokio::time::timeout(Duration::from_secs(3), async {
-        while resolver.calls.load(Ordering::SeqCst) < 2 {
+        while resolver.calls.load(Ordering::SeqCst) < 1 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -201,9 +263,37 @@ async fn explore_cancellation_settles_all_admitted_children_before_parent_comple
         outcome.as_ref().err()
     );
     assert!(f.host.settled().unwrap());
-    assert_eq!(resolver.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "Queued local workers must not start their child deadlines");
     assert!(!f.root.join(".ag1/explore-board.json").exists());
     assert_eq!(server.join().unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explore_reports_all_failed_mixed_and_completed_outcomes() {
+    struct SelectiveResolver { calls: AtomicUsize, successes: usize, inner: Resolver }
+    impl ProviderResolver for SelectiveResolver {
+        fn resolve<'a>(&'a self, input: ProviderInput<'a>, cancel: &'a AtomicBool) -> PortFuture<'a, ResolvedRequest> {
+            if self.calls.fetch_add(1,Ordering::SeqCst) < self.successes { self.inner.resolve(input,cancel) }
+            else { Box::pin(async {Err(DomainError::Unavailable("Controlled worker failure".into()))}) }
+        }
+    }
+    for successes in 0..=2 {
+        let mut responses=vec![calls(vec![("explore-status","explore",json!({"questions":["One","Two"]}))])];
+        responses.extend((0..=successes).map(|_|stop()));
+        let (endpoint,server)=server(responses);
+        let mut f=fixture_configured(&endpoint,"disabled",vec![],None,None,1);
+        enable_task(&mut f,Arc::new(SelectiveResolver {calls:AtomicUsize::new(0),successes,inner:Resolver::new(false)})).await;
+        let tool=Registry::builtins().unwrap().public_tools().into_iter().find(|t|t["name"]=="explore").unwrap();
+        f.host.select_tools("explore-tools","explore-tools",NOW,vec![tool],&ignore).await.unwrap();
+        f.host.run(input(),&Resolver::new(false),f.files.clone(),&ignore).await.unwrap();
+        let records=f.host.client_records().unwrap();
+        let result=&records.iter().find(|r|r["message"]["toolName"]=="explore").unwrap()["message"];
+        assert_eq!(result["isError"],successes==0,"{result}");
+        assert_eq!(result["details"]["completed"],successes,"{result}");
+        assert_eq!(result["details"]["status"],if successes==0 {"failed"} else if successes==1 {"partial"} else {"completed"});
+        assert!(f.host.settled().unwrap());
+        assert_eq!(server.join().unwrap().len(),successes+2);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

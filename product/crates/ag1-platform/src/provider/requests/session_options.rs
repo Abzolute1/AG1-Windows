@@ -21,6 +21,20 @@ pub fn session_options(
     if out.get("maxTokens").is_none() {
         out["maxTokens"] = model["maxTokens"].clone();
     }
+    // Account/provider-declared capabilities outrank legacy name heuristics.
+    // A model with a known effort menu must never silently downgrade a choice.
+    if matches!(family, ApiFamily::Responses | ApiFamily::AzureResponses | ApiFamily::CodexResponses)
+        && let Some(modes) = model["thinking"]["modes"].as_array()
+    {
+        let selected = modes.iter().find(|m| m.as_str().or_else(|| m["id"].as_str()) == Some(thinking))
+            .ok_or_else(|| invalid("Requested reasoning level is not supported by this model"))?;
+        let native = selected.get("nativeValue").and_then(Value::as_str).unwrap_or(if thinking == "off" { "none" } else { thinking });
+        if !["none","minimal","low","medium","high","xhigh","max"].contains(&native) {
+            return Err(invalid("Unsupported native reasoning effort"));
+        }
+        out["reasoningEffort"] = json!(native);
+        return Ok(out);
+    }
     let enabled = thinking != "off";
     let level = if ["xhigh", "max"].contains(&thinking) {
         "high"
@@ -35,9 +49,11 @@ pub fn session_options(
             .iter()
             .any(|s| id.contains(s))
         || model["thinking"]["modes"].as_array().is_some_and(|modes| {
-            modes
-                .iter()
-                .any(|m| m.as_str().is_some_and(|s| s.eq_ignore_ascii_case("xhigh")))
+            modes.iter().any(|m| {
+                m.as_str()
+                    .or_else(|| m["id"].as_str())
+                    .is_some_and(|s| s.eq_ignore_ascii_case("xhigh"))
+            })
         });
     let effort = match thinking {
         "minimal" => "low",
@@ -51,17 +67,25 @@ pub fn session_options(
         | ApiFamily::AzureResponses
         | ApiFamily::CodexResponses => {
             if enabled {
-                out["reasoningEffort"] = json!(if xhigh {
-                    if thinking == "max"
-                        && matches!(family, ApiFamily::Responses | ApiFamily::AzureResponses)
+                out["reasoningEffort"] =
+                    json!(if model["thinking"]["modes"]
+                        .as_array()
+                        .is_some_and(|modes| modes
+                            .iter()
+                            .any(|m| m.as_str().or_else(|| m["id"].as_str()) == Some(thinking)))
                     {
-                        "xhigh"
-                    } else {
                         thinking
-                    }
-                } else {
-                    level
-                });
+                    } else if xhigh {
+                        if thinking == "max"
+                            && matches!(family, ApiFamily::Responses | ApiFamily::AzureResponses)
+                        {
+                            "xhigh"
+                        } else {
+                            thinking
+                        }
+                    } else {
+                        level
+                    });
             }
         }
         ApiFamily::Anthropic => {

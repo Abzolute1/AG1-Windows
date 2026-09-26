@@ -287,10 +287,11 @@ impl Store {
                 ));
             }
         }
-        let hash = self.publish(&input.bytes)?;
+        let (hash, compressed) = self.publish_custody(&input.bytes, v["kind"].as_str().unwrap_or(""))?;
         let record_hash = self.publish(&input.record)?;
         self.hit(Boundary::BeforeTransaction)?;
         let tx = db.transaction()?;
+        if compressed { tx.execute_batch("PRAGMA user_version=2;")?; }
         insert_artifact(
             &tx,
             &input.origin,
@@ -664,7 +665,7 @@ impl Store {
         ttl_ms: u64,
         release_on_verification: bool,
     ) -> StorageResult<Lease> {
-        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification)
+        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, None)
             .map(|(lease, _)| lease)
     }
     /// Returns the exact record captured in the acknowledged transaction, not a
@@ -678,7 +679,14 @@ impl Store {
         ttl_ms: u64,
         release_on_verification: bool,
     ) -> StorageResult<Value> {
-        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification)
+        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, None)
+            .map(|(_, record)| record)
+    }
+    pub fn scoped_lease_record(
+        &self, session: &str, origin: &str, id: &str, reason: &str,
+        ttl_ms: u64, release_on_verification: bool, verification_scope: Option<&str>,
+    ) -> StorageResult<Value> {
+        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, verification_scope)
             .map(|(_, record)| record)
     }
     fn write_lease(
@@ -689,7 +697,12 @@ impl Store {
         reason: &str,
         ttl_ms: u64,
         release_on_verification: bool,
+        verification_scope: Option<&str>,
     ) -> StorageResult<(Lease, Value)> {
+        if let Some(scope) = verification_scope {
+            ag1_core::tools::verification::scope(&serde_json::json!({"verificationScope":scope}))
+                .map_err(|_| StorageError::Invalid("Verification scope".into()))?;
+        }
         let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
         if reason.is_empty() || reason.encode_utf16().count() > 240 {
             return Err(StorageError::Invalid("Lease reason".into()));
@@ -717,9 +730,9 @@ impl Store {
                 .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
                 .ok_or_else(|| StorageError::Limit("Lease timestamp".into()))
         };
-        let raw = serde_json::to_vec(
-            &serde_json::json!({"version":1,"id":format!("lease_{}",&digest(format!("{session}:{origin}:{id}:{now}:{reason}").as_bytes())[..32]),"artifactId":id,"reason":reason,"createdAt":stamp(now)?,"expiresAt":stamp(expires)?,"releaseOnVerification":release_on_verification}),
-        )?;
+        let mut record = serde_json::json!({"version":1,"id":format!("lease_{}",&digest(format!("{session}:{origin}:{id}:{now}:{reason}").as_bytes())[..32]),"artifactId":id,"reason":reason,"createdAt":stamp(now)?,"expiresAt":stamp(expires)?,"releaseOnVerification":release_on_verification,"verificationScope":verification_scope});
+        if verification_scope.is_none() { record.as_object_mut().unwrap().remove("verificationScope"); }
+        let raw = serde_json::to_vec(&record)?;
         tx.execute(
             "INSERT OR REPLACE INTO leases VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![
@@ -764,15 +777,13 @@ impl Store {
         })?
         .collect::<Result<_, _>>()?)
     }
-    pub fn release_verified_leases(&self, session: &str) -> StorageResult<usize> {
+    /// Explicit scoped settlement. Unscoped historical leases are never swept.
+    pub fn release_verified_leases(&self, session: &str, scope: &str, started_ms: u64) -> StorageResult<usize> {
         let mut db = self.conn()?;
         Self::ready(&db)?;
         active_session(&db, session)?;
         let tx = db.transaction()?;
-        let n = tx.execute(
-            "DELETE FROM leases WHERE session=?1 AND release_on_verification=1",
-            [session],
-        )?;
+        let n = release_scoped_leases(&tx, session, Some(scope), started_ms)?;
         Self::next_sequence(&tx)?;
         tx.commit()?;
         Ok(n)
@@ -785,7 +796,7 @@ impl Store {
         for e in fs::read_dir(self.root.join("blobs"))? {
             let e = e?;
             let name = e.file_name().to_string_lossy().into_owned();
-            if valid_digest(&name) && !roots.contains(&name) {
+            if crate::blob_codec::physical_hash(&name).is_some_and(|hash| !roots.contains(hash)) {
                 fs::remove_file(e.path())?;
                 removed += 1;
             }
@@ -824,4 +835,25 @@ impl ag1_core::ArtifactPort for Store {
                 .map_err(super::persistence::domain_error)
         })
     }
+}
+
+/// Called inside the same transaction as the native verification receipt.
+pub(crate) fn release_scoped_leases(tx: &rusqlite::Transaction<'_>, session: &str, scope: Option<&str>, started_ms: u64) -> StorageResult<usize> {
+    let Some(scope) = scope else { return Ok(0); };
+    ag1_core::tools::verification::scope(&serde_json::json!({"verificationScope":scope}))
+        .map_err(|_| StorageError::Invalid("Verification scope".into()))?;
+    let rows = {
+        let mut query = tx.prepare("SELECT origin,artifact,raw FROM leases WHERE session=?1 AND release_on_verification=1")?;
+        query.query_map([session], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<Result<Vec<_>,_>>()?
+    };
+    let mut released = 0;
+    for (origin, artifact, raw) in rows {
+        let lease: Value = serde_json::from_slice(&raw)?;
+        if lease["verificationScope"].as_str() != Some(scope) { continue; }
+        let created = lease["createdAt"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_millis());
+        // Timestamp ties are retained conservatively: evidence must predate the check.
+        if created.is_none_or(|n| n < 0 || n as u64 >= started_ms) { continue; }
+        released += tx.execute("DELETE FROM leases WHERE session=?1 AND origin=?2 AND artifact=?3 AND raw=?4",params![session,origin,artifact,raw])?;
+    }
+    Ok(released)
 }

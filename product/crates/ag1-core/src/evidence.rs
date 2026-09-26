@@ -47,7 +47,7 @@ impl SourceReference {
         let (path, digest) = value
             .strip_prefix("file:")
             .and_then(|s| s.rsplit_once("@sha256:"))
-            .ok_or_else(|| invalid("canonical source reference"))?;
+            .ok_or_else(|| invalid("Expected file:relative/path@sha256:<64 lowercase hex digits>. Reuse read details.sourceReference; a formatted tool-output artifact hash is not the source file revision."))?;
         let path = path.replace('\\', "/");
         if path.is_empty()
             || path.contains(['\r', '\n', '\0'])

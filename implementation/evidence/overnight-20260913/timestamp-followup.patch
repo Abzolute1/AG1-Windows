@@ -1,0 +1,55 @@
+--- a/product/crates/ag1-platform/src/session/files.rs
++++ b/product/crates/ag1-platform/src/session/files.rs
+@@ -362,7 +362,8 @@
+             SessionId::new(&scope.session)?,
+             &self.origin,
+             &work.operation,
+-            &self.timestamp,
++            current.selection.journal.as_ref()
++                .map_or(self.timestamp.as_str(), |journal| journal.timestamp()),
+             Features::default(),
+         )?;
+         let shell = matches!(&work.prepared, Prepared::Ready {plan,..} if matches!(plan.as_ref(),PreparedAdapter::Shell {..}));
+--- a/product/crates/ag1-platform/tests/session_contract.rs
++++ b/product/crates/ag1-platform/tests/session_contract.rs
+@@ -2,6 +2,40 @@
+ //! Real native loop, SQL/context custody, HTTP codec and file effects. The only
+ //! simulated component is the owned loopback model endpoint.
+ include!("support/session_fixture.rs");
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn shared_native_runner_dates_tool_artifacts_by_their_actual_turn() {
++    let (origin, server) = server(vec![
++        calls(vec![("first-clock-call", "bash", json!({"command":"printf first-turn-output"}))]),
++        stop(),
++        calls(vec![("second-clock-call", "bash", json!({"command":"printf second-turn-output"}))]),
++        stop(),
++    ]);
++    let fixture = fixture(&origin, "disabled");
++    let runner = native_adapters_configured(&fixture, &["bash"], None, None).await;
++    let first_time = "2026-09-13T12:00:00Z";
++    let second_time = "2026-09-13T13:00:00Z";
++    let mut first = input();
++    first.command = "first-clock-turn".into();
++    first.timestamp = first_time.into();
++    fixture.host.run(first, &Resolver::new(false), runner.clone(), &ignore).await.unwrap();
++    let first_catalog = fixture.store.artifact_catalog("session", None, 128, Some("terminal-raw-output")).unwrap();
++    assert_eq!(first_catalog.len(), 1);
++    let original = first_catalog[0].record.clone();
++    let mut second = input();
++    second.command = "second-clock-turn".into();
++    second.timestamp = second_time.into();
++    fixture.host.run(second, &Resolver::new(false), runner, &ignore).await.unwrap();
++    assert_eq!(server.join().unwrap().len(), 4);
++    let catalog = fixture.store.artifact_catalog("session", None, 128, Some("terminal-raw-output")).unwrap();
++    assert_eq!(catalog.len(), 2);
++    let older = catalog.iter().find(|r| r.record["producer"]["callId"] == "first-clock-call").unwrap();
++    let newer = catalog.iter().find(|r| r.record["producer"]["callId"] == "second-clock-call").unwrap();
++    assert_eq!(older.record, original, "later turns must not rewrite immutable metadata");
++    assert_eq!(older.record["createdAt"], first_time);
++    assert_eq!(newer.record["createdAt"], second_time);
++    assert_eq!(catalog[0].record, newer.record, "catalog remains newest first");
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn composite_provider_call_ids_execute_and_reject_with_durable_results() {
+     let (origin, server) = server(vec![

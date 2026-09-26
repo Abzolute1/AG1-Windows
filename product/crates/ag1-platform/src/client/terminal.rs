@@ -19,7 +19,8 @@ impl Host {
                         "Configure the native process helper to open a terminal".into(),
                     )
                 })?;
-                self.workspace.verify_root()?;
+                let workspace = self.working_folder(false)?;
+                workspace.verify_root()?;
                 let state = self.state.join("terminal");
                 fs::create_dir_all(&state).map_err(crate::io_error)?;
                 let home = self.state.join("home");
@@ -28,7 +29,7 @@ impl Host {
                         crate::process::ProcessSpec {
                             executable: "/bin/bash".into(),
                             argv: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
-                            cwd: self.workspace.root().into(),
+                            cwd: workspace.root().into(),
                             env: std::collections::BTreeMap::from([
                                 ("PATH".into(), "/usr/bin:/bin".into()),
                                 ("HOME".into(), home.display().to_string()),

@@ -1,0 +1,107 @@
+--- a/product/crates/ag1-core/tests/tool_contract.rs
++++ b/product/crates/ag1-core/tests/tool_contract.rs
+@@ -241,6 +241,12 @@
+         let name = i["name"].as_str().unwrap();
+         assert_eq!(arguments::prepare(name, &i["args"]), row["prepared"], "{i}");
+         let result = registry.prepare("operation", "call", name, &i["args"], true);
++        // The SDK inferred deletion from an omitted replacement. Native edits
++        // require an explicit string, including an explicit empty deletion.
++        if i == &json!({"name":"editPreview","args":{"path":"fixture","oldText":"fixture"}}) {
++            assert!(matches!(result, Err(DomainError::InvalidInput(ref error)) if error.contains("requires newText as a string")));
++            continue;
++        }
+         assert_eq!(result.is_ok(), row["output"]["valid"], "{i}: {result:?}");
+         if let Ok(call) = result {
+             assert_eq!(call.args(), &row["output"]["args"], "{i}");
+@@ -593,6 +599,37 @@
+     assert_eq!(count, 12);
+ }
+ 
++// The immutable SDK captures predate native target ownership and the separation
++// of source coverage from task completion. Pin only these deliberate wording
++// changes; all other result fields and transcript bytes still match the capture.
++fn native_guidance_expectation(value: &Value) -> Value {
++    const CHANGES: &[(&str, &str)] = &[
++        ("Continue pricing research only if model, input price, output price, or currency is missing. Prefer an official pricing page for any missing price.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Continue release research only for missing version, date, change summary, or migration notes. Migration notes are required only when the user asks about upgrading or breaking changes.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Coverage complete for a brief current-events answer.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Coverage complete for a concise docs/API answer.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Coverage complete for a pricing answer. Reuse this source unless the user requested corroboration.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Coverage complete for a release/changelog answer.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Coverage complete for an error-cause-and-fix answer.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++
++        ("Only continue docs research for the missing API slot. If signature, parameter, and behavior are present, answer now; examples or version notes are optional unless requested.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("Only continue web research for the missing coverage items, not by repeating the same broad query.", "Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."),
++        ("This authoritative current-events source is likely sufficient for a brief summary. Answer from it now unless the user explicitly asked for corroboration or a key fact is still missing.", "This extract is from an authoritative source; verify that its facts address the active task."),
++        ("If the user asked for the strongest source, this fetch is enough. Reuse this source directly instead of fetching another article first.", "Source classification and coverage describe this extract, not completion of the active task."),
++        ("This authoritative docs page is likely sufficient for a brief API or parameter answer. Do not refetch the same URL unless the requested concept is still missing.", "This extract is from an authoritative documentation page; its applicability depends on the active task and version."),
++        ("This source summary is likely sufficient to answer or cite without refetching.", "This source extract is available as evidence for the active task."),
++        ("Refused: do not start a static file server to take verification screenshots. For static HTML/CSS/JS, pass the file path (e.g. index.html). Do not start a Python, Node, or PHP server just to take a screenshot. Use screenshot_url or verify_ui with the HTML path. Start a server only for apps that actually need one (Vite, Next, an API).", "Refused: do not start a static file server just to take screenshots. Browser verification requires a ready AG1-owned web target started through preview start or the host Runtime UI; bash/job servers and local HTML paths do not grant browser access. Use read to preview local images, including simple vector SVG. Use the editor Preview for static HTML. Start a server only for apps that actually need one (Vite, Next, an API)."),
++    ];
++    match value {
++        Value::String(text) => Value::String(text.split('\n').map(|line| {
++            CHANGES.iter().find(|(old, _)| *old == line).map_or(line, |(_, new)| *new)
++        }).collect::<Vec<_>>().join("\n")),
++        Value::Array(rows) => Value::Array(rows.iter().map(native_guidance_expectation).collect()),
++        Value::Object(fields) => Value::Object(fields.iter().map(|(key, value)| (key.clone(), native_guidance_expectation(value))).collect()),
++        _ => value.clone(),
++    }
++}
++
+ #[test]
+ fn shell_guards_outputs_and_templates_match_the_executable_reference() {
+     use ag1_core::tools::shell;
+@@ -638,7 +675,7 @@
+         let command = row["command"].as_str().unwrap();
+         assert_eq!(
+             json!(shell::static_guard(command)),
+-            row["static"],
++            native_guidance_expectation(&row["static"]),
+             "static {i}"
+         );
+         assert_eq!(
+@@ -865,7 +902,7 @@
+         let name = row["name"].as_str().unwrap();
+         let value = research_case_value(row);
+         assert_eq!(
+-            value, row["result"],
++            value, if name == "formatFetchTranscriptContent" { native_guidance_expectation(&row["result"]) } else { row["result"].clone() },
+             "research case {index} {name}: {}",
+             row["args"]
+         );
+@@ -883,7 +920,7 @@
+         for call in row["calls"].as_array().unwrap() {
+             assert_eq!(
+                 research_case_value(call),
+-                call["result"],
++                if call["name"] == "formatFetchTranscriptContent" { native_guidance_expectation(&call["result"]) } else { call["result"].clone() },
+                 "{}: {}",
+                 row["name"],
+                 call["name"]
+@@ -935,8 +972,10 @@
+             hint.as_ref(),
+         )
+         .unwrap();
+-        assert_eq!(
+-            projection.result, row["output"],
++        let mut expected = row["output"].clone();
++        expected["content"] = native_guidance_expectation(&expected["content"]);
++        assert_eq!(
++            projection.result, expected,
+             "webfetch projection {index}"
+         );
+     }
+@@ -1287,7 +1326,12 @@
+     .unwrap();
+     let mut registry = Registry::builtins().unwrap();
+     targets::register_visual_tools(&mut registry).unwrap();
+-    assert_eq!(registry.definitions().count(), 31);
++    assert_eq!(registry.definitions().count(), 38);
++    let facades: Vec<_> = registry.definitions().filter_map(|d| {
++        let name = d.metadata["name"].as_str().unwrap();
++        ag1_core::tools::surface::is_facade(name).then_some(name)
++    }).collect();
++    assert_eq!(facades, ["capability", "evidence", "inspect", "releaseEvidence", "retainEvidence", "ui", "work"]);
+     assert!(registry.active_names().is_empty());
+     for row in oracle["catalog"].as_array().unwrap() {
+         assert_eq!(

@@ -25,6 +25,7 @@ pub mod web_presentation;
 pub mod websearch;
 
 pub mod targets;
+pub mod verification;
 
 pub mod memory;
 pub mod repo;
@@ -43,3 +44,9 @@ pub struct JournalToolPlan {
 }
 
 pub mod episode;
+
+mod native_prompt;
+
+pub mod surface;
+
+pub mod mcp;

@@ -48,7 +48,7 @@ pub trait StoragePort: Send + Sync {
         bytes: &[u8],
     ) -> Result<String, DomainError>;
     /// Atomically acknowledge a native successful check and release this
-    /// session's verification leases. The executor supplies the completion
+    /// session's matching explicit verification-scope leases created before the check started. The executor supplies the completion
     /// record only after retaining the native result; hooks cannot authorize it.
     fn commit_verified_tool(
         &self,

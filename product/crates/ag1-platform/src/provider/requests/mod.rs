@@ -170,14 +170,15 @@ fn transform(input: &RequestContext<'_>, family: ApiFamily) -> Result<Vec<Value>
         if !["user", "assistant", "toolResult"].contains(&role.as_str()) {
             return Err(invalid("message role"));
         }
-        let content = blocks(&m["content"]);
+        let mut content = blocks(&m["content"]);
         if !m["content"].is_array() && !m["content"].is_string() {
             return Err(invalid("message content"));
         }
         if content.len() > 4096 {
             return Err(DomainError::LimitExceeded("message blocks".into()));
         }
-        for b in &content {
+        let mut image_replaced = false;
+        for b in &mut content {
             if !["text", "thinking", "toolCall", "image"].contains(&string(b, "type")) {
                 return Err(invalid("content block type"));
             }
@@ -186,9 +187,14 @@ fn transform(input: &RequestContext<'_>, family: ApiFamily) -> Result<Vec<Value>
                     .as_array()
                     .is_some_and(|a| a.iter().any(|v| v == "image"))
             {
-                return Err(DomainError::Unavailable(
-                    "selected model does not support images".into(),
-                ));
+                if role == "toolResult" {
+                    *b = json!({"type":"text","text":"[The tool returned an image attachment, available for display in the chat. This model does not support image input and has not visually inspected it. Do not claim visual verification.]"});
+                    image_replaced = true;
+                } else {
+                    return Err(DomainError::Unavailable(
+                        "selected model does not support images".into(),
+                    ));
+                }
             }
             if b["type"] == "toolCall"
                 && (!b["arguments"].is_object()
@@ -198,6 +204,7 @@ fn transform(input: &RequestContext<'_>, family: ApiFamily) -> Result<Vec<Value>
                 return Err(invalid("tool call"));
             }
         }
+        if image_replaced { m["content"] = json!(content); }
         if role == "assistant" {
             let same_model = same(&m, input.model);
             let mut out = vec![];

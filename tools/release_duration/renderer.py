@@ -18,7 +18,33 @@ sys.path.insert(0, str(ROOT / 'tools/probes'))
 import desktop_visual as ui
 
 
-def run(binary, workspace, config, output, task, fixture, sampler=None, heap_library=None):
+def visible_excerpt(markdown):
+    # Use the renderer's Markdown parser. Literal source backticks/emphasis do
+    # not occur in DOM innerText, and regex stripping corrupts links/code.
+    script = '''
+import {unified} from 'unified';
+import parse from 'remark-parse';
+import {toString} from 'mdast-util-to-string';
+import fs from 'node:fs';
+const tree = unified().use(parse).parse(fs.readFileSync(0, 'utf8'));
+const candidates = [];
+function visit(node) {
+  if (['paragraph', 'heading', 'code'].includes(node.type)) {
+    const text = toString(node).replace(/\\s+/g, ' ').trim();
+    if (text.length >= 20 && !JSON.stringify(node).includes('"type":"image"')) candidates.push(text);
+  } else for (const child of node.children ?? []) visit(child);
+}
+visit(tree);
+if (!candidates.length) throw Error('No meaningful rendered text excerpt');
+process.stdout.write(candidates[0].slice(0, 100));
+'''
+    result = subprocess.run(['node', '--input-type=module', '-e', script],
+                            input=markdown, text=True, capture_output=True, check=True,
+                            cwd=ROOT / 'product/apps/desktop', timeout=30)
+    return result.stdout
+
+
+def run(binary, workspace, config, output, task, fixture, sampler=None, heap_library=None, after_task=None):
     output = Path(output)
     output.mkdir(mode=0o700)
     display = next(n for n in range(100, 500) if not Path(f'/tmp/.X{n}-lock').exists()
@@ -51,8 +77,8 @@ def run(binary, workspace, config, output, task, fixture, sampler=None, heap_lib
         return ui.async_js('return await window.__TAURI_INTERNALS__.invoke("bridge_command",{envelope:'
                            + json.dumps(envelope) + '});')
     def open_project():
-        ui.wait('!!document.querySelector("button.open-card")', 30)
-        ui.js('document.querySelector("button.open-card").click();true')
+        ui.wait('!!document.querySelector(".workspace-pill")', 30)
+        ui.js('document.dispatchEvent(new KeyboardEvent("keydown",{key:"o",ctrlKey:true,bubbles:true}));true')
         ui.wait('!!document.querySelector(".dialog input")')
         ui.text('input[aria-label="Project folder"]', str(workspace))
         ui.js('document.querySelector(".dialog form").requestSubmit();true')
@@ -101,7 +127,7 @@ def run(binary, workspace, config, output, task, fixture, sampler=None, heap_lib
         report['before_detach'] = active
         report['detach_monotonic_ns'] = time.monotonic_ns()
         ui.js('setTimeout(()=>location.reload(),0);true')
-        ui.wait('!!document.querySelector("button.open-card")', 30)
+        ui.wait('document.querySelector(".workspace-pill")?.textContent.trim()==="Attach project"', 30)
         report['detached_home_visible'] = True
         # Keep the fresh page at home while the same native operation settles.
         while True:
@@ -151,7 +177,7 @@ def run(binary, workspace, config, output, task, fixture, sampler=None, heap_lib
         report['full_context_sha256'] = context_sha
         report['reattach_started_monotonic_ns'] = time.monotonic_ns()
         open_project()
-        ui.wait('document.querySelectorAll(".message").length>0', 30)
+        ui.wait('document.querySelectorAll(".chat-turn").length>0', 30)
         after = view()
         if after['snapshot']['scope'] != current['snapshot']['scope']:
             raise RuntimeError('Renderer reattachment selected a different session')
@@ -163,12 +189,16 @@ def run(binary, workspace, config, output, task, fixture, sampler=None, heap_lib
         texts = [b['text'] for b in assistants[-1]['blocks'] if b['kind'] == 'text' and b['text'].strip()]
         if not texts:
             raise RuntimeError('No completed assistant text is available for renderer verification')
-        expected_text = texts[-1].strip()[:100]
-        ui.js('(()=>{const list=document.querySelector(".messages");list.scrollTop=list.scrollHeight;return true;})()')
-        ui.wait('document.body.innerText.includes('+json.dumps(expected_text)+')', 30)
+        expected_text = visible_excerpt(texts[-1])
+        ui.js('(()=>{const list=document.querySelector(".conversation-scroll");list.scrollTop=list.scrollHeight;return true;})()')
+        ui.wait('(()=>{const answers=[...document.querySelectorAll(".final-answer")];'
+                'return !!answers.length && answers.at(-1).innerText.replace(/\\s+/g," ").includes('
+                +json.dumps(expected_text)+');})()', 30)
         report['rendered_assistant_text_prefix'] = expected_text
         report['dom_text'] = ui.js('document.body.innerText')
         ui.screenshot('reattached')
+        if after_task:
+            report['navigation_probe'] = after_task(ui, view, desktop)
         root = identity(desktop.pid)
         if root: owned.update({r['pid']: r for r in descendants(root) if r['pid'] != desktop.pid})
         ui.js('setTimeout(()=>window.__TAURI_INTERNALS__.invoke("quit",{}),0);true')

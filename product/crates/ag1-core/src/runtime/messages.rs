@@ -5,8 +5,27 @@ use serde_json::{Value, json};
 
 pub fn to_provider(messages: &[Value]) -> Result<Vec<Value>, DomainError> {
     validate_history(messages)?;
-    let mut output = Vec::with_capacity(messages.len());
-    for message in messages {
+    let mut output: Vec<Value> = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        // A host context refresh is not another user turn. In particular, a
+        // user-role tail after tool results can restart the model's task/think
+        // boundary and revive an old recorded objective. Keep this request-only
+        // metadata after the latest result without changing tool identity or
+        // any durable message. Earlier completed rounds remain an exact prefix.
+        if index + 1 == messages.len()
+            && message["role"] == "custom"
+            && message["customType"] == "ag1-working-state"
+            && let Some(previous) = output.last_mut()
+            && previous["role"] == "toolResult"
+            && let Some(blocks) = previous["content"].as_array_mut()
+        {
+            match &message["content"] {
+                Value::String(text) => blocks.push(json!({"type":"text","text":text})),
+                Value::Array(content) => blocks.extend(content.iter().cloned()),
+                _ => return Err(DomainError::InvalidInput("working state content".into())),
+            }
+            continue;
+        }
         let text = |key: &str| message[key].as_str().unwrap_or("");
         let content = match text("role") {
             "user" | "assistant" | "toolResult" => {

@@ -64,14 +64,27 @@ fn member(v: &Value, choices: &[&str]) -> bool {
     v.as_str().is_some_and(|s| choices.contains(&s))
 }
 pub(crate) fn bounded_json(v: &Value) -> Result<(), DomainError> {
-    struct Counter(usize);
+    bounded_json_with_limit(v, 4 * 1024 * 1024)
+}
+
+/// Validate a runtime record against an explicit byte budget. Most state
+/// documents intentionally remain small; long local-model assistant messages
+/// are retained losslessly and need a larger, still bounded journal envelope.
+pub(crate) fn bounded_json_with_limit(v: &Value, limit: usize) -> Result<(), DomainError> {
+    if limit < 1024 {
+        return Err(DomainError::InvalidInput("state document limit".into()));
+    }
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self
-                .0
+            self.bytes = self
+                .bytes
                 .checked_add(bytes.len())
                 .ok_or_else(|| std::io::Error::other("state size"))?;
-            if self.0 > 4 * 1024 * 1024 {
+            if self.bytes > self.limit {
                 return Err(std::io::Error::other("state size"));
             }
             Ok(bytes.len())
@@ -80,7 +93,7 @@ pub(crate) fn bounded_json(v: &Value) -> Result<(), DomainError> {
             Ok(())
         }
     }
-    serde_json::to_writer(Counter(0), v)
+    serde_json::to_writer(Counter { bytes: 0, limit }, v)
         .map_err(|_| DomainError::LimitExceeded("state document".into()))
 }
 fn id_valid(id: &str) -> bool {

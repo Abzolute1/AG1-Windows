@@ -1,7 +1,9 @@
 //! Wire adapters for the ten API families registered by the pinned reference.
 //! Credentials and HTTP live in the host; these decoders only consume bounded frames.
 pub mod auth;
+pub mod codex_subscription;
 pub mod capability;
+pub mod reasoning_controls;
 pub mod credential_storage;
 pub mod framing;
 pub mod generation;
@@ -460,6 +462,7 @@ impl WireDecoder {
             }
             "response.output_text.delta"
             | "response.reasoning_summary_text.delta"
+            | "response.reasoning_text.delta"
             | "response.refusal.delta"
             | "response.function_call_arguments.delta" => {
                 let resolved = self
@@ -477,7 +480,7 @@ impl WireDecoder {
                     .cloned()
                     .unwrap_or(key);
                 if str_at(item, "type") == "reasoning" {
-                    if let Some(summary) = item["summary"].as_array() {
+                    if let Some(summary) = item["summary"].as_array().filter(|summary| !summary.is_empty()) {
                         out.push(ProviderEvent::Replace {
                             key: resolved.clone(),
                             text: summary
@@ -542,7 +545,7 @@ impl WireDecoder {
                 }));
                 out.push(ProviderEvent::Stop(stop(str_at(response, "status"))));
             }
-            "response.failed" | "error" => out.push(ProviderEvent::Fail(v.to_string())),
+            "response.failed" | "response.cancelled" | "error" => out.push(ProviderEvent::Fail(v.to_string())),
             "response.in_progress"
             | "response.queued"
             | "response.content_part.added"
@@ -551,13 +554,16 @@ impl WireDecoder {
             | "response.reasoning_summary_part.added"
             | "response.reasoning_summary_part.done"
             | "response.reasoning_summary_text.done"
+            | "response.reasoning_text.done"
             | "response.function_call_arguments.done"
             | "response.refusal.done" => (),
-            _ => {
-                return Err(DomainError::Unavailable(
-                    "unknown Responses stream event".into(),
-                ));
-            }
+            "" => return Err(DomainError::InvalidInput("Responses stream event requires a type".into())),
+            // Responses streams may add informational events. Only the known
+            // output-item and terminal branches can produce content, execute
+            // tools or finish a response; additional events carry no authority.
+            // Malformed JSON, unsupported output items and missing terminal
+            // evidence still fail through their existing validation paths.
+            _ => (),
         }
         Ok(())
     }

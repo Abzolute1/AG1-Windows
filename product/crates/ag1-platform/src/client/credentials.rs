@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Auth {
+    /// Reuse the user's explicitly connected subscription session. The native
+    /// host reads current credentials; renderer/model metadata only hold a path.
+    CodexSubscription { session_file: PathBuf, #[serde(default)] codex_cli: Option<PathBuf> },
     ApiKey {
         env: String,
     },
@@ -49,6 +52,10 @@ fn secret(name: &str) -> Result<SecretBytes> {
 }
 impl HostCredentials {
     pub(super) async fn resolve_async(&self, model: &Value) -> Result<Credential> {
+        if let Some(Auth::CodexSubscription { session_file, codex_cli }) = self.providers.get(model["provider"].as_str().unwrap_or("")) {
+            let (path, cli, model)=(session_file.clone(),codex_cli.clone(),model.clone());
+            return tokio::task::spawn_blocking(move || crate::provider::codex_subscription::credential_with_refresh(&path,cli.as_deref(),&model).map(Credential::Bearer)).await.map_err(|_|DomainError::Unavailable("ChatGPT sign-in worker failed".into()))?;
+        }
         if !self
             .providers
             .contains_key(model["provider"].as_str().unwrap_or(""))
@@ -76,6 +83,7 @@ impl HostCredentials {
                 .providers
                 .get(model["provider"].as_str().ok_or(DomainError::NotFound)?)
             {
+                Some(Auth::CodexSubscription { session_file, codex_cli }) => Credential::Bearer(crate::provider::codex_subscription::credential_with_refresh(session_file, codex_cli.as_deref(), model)?),
                 Some(Auth::ApiKey { env }) => Credential::ApiKey(secret(env)?),
                 Some(Auth::Bearer { env, .. }) => Credential::Bearer(secret(env)?),
                 Some(Auth::GeminiCli { env }) => Credential::GeminiCli(secret(env)?),

@@ -1,6 +1,8 @@
 //! Native file tools. Preparation captures bytes; publication consumes an approval capability.
 //! Construct one service per registered workspace. All writes also take P03's workspace/Git claim.
 use crate::workspace::{MAX_READ, Workspace};
+#[path = "file_tools/edit_recovery.rs"]
+mod edit_recovery;
 use ag1_core::{
     DomainError, FileRevision,
     tools::{
@@ -83,6 +85,7 @@ struct PreviewRecord {
 }
 pub struct FileService {
     workspace: Arc<Workspace>,
+    review_store: Option<Arc<ag1_storage::Store>>,
     read_roots: RwLock<ReadRoots>,
     queues: Mutex<BTreeMap<String, Weak<Queue>>>,
     previews: Mutex<BTreeMap<(String, u64, String), PreviewRecord>>,
@@ -141,10 +144,16 @@ impl FileService {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self {
             workspace,
+            review_store: None,
             read_roots: RwLock::new(ReadRoots::default()),
             queues: Mutex::new(BTreeMap::new()),
             previews: Mutex::new(BTreeMap::new()),
         }
+    }
+    /// Native host opt-in. Extensions and tool arguments cannot supply this store.
+    pub fn with_reviews(mut self, store: Arc<ag1_storage::Store>) -> Self {
+        self.review_store = Some(store);
+        self
     }
     /// Host-only read capabilities for explicitly loaded skill/resource roots.
     /// Model paths cannot register a root. Replacing this set invalidates pending
@@ -260,7 +269,7 @@ impl FileService {
             .map(str::to_owned)
             .ok_or_else(|| DomainError::InvalidInput("UTF-8 file path".into()))
     }
-    fn absolute_path(&self, input: &str) -> Result<PathBuf, DomainError> {
+    pub(crate) fn absolute_path(&self, input: &str) -> Result<PathBuf, DomainError> {
         let home = std::env::var("HOME").ok();
         let mut value = ag1_core::tools::path::expand(input, home.as_deref())?;
         // Repair only the exact workspace prefix, not arbitrary guessed roots.
@@ -332,15 +341,37 @@ impl FileService {
         } else {
             None
         };
-        let mut prepared = self.prepare_with_control(call, scope, &mut || {
-            if cancel.load(Ordering::Acquire) {
-                Err(DomainError::Cancelled)
-            } else if Instant::now() >= deadline {
-                Err(DomainError::TimedOut)
-            } else {
-                Ok(())
-            }
-        })?;
+        let mut prepared = self
+            .prepare_with_control(call, scope, &mut || {
+                if cancel.load(Ordering::Acquire) {
+                    Err(DomainError::Cancelled)
+                } else if Instant::now() >= deadline {
+                    Err(DomainError::TimedOut)
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|error| {
+                if !matches!(call.name(), "edit" | "editApply" | "editPreview") {
+                    return error;
+                }
+                let DomainError::InvalidInput(message) = &error else {
+                    return error;
+                };
+                let Some(raw) = call.args()["path"].as_str() else {
+                    return error;
+                };
+                let Ok(path) = self.relative_path(raw) else {
+                    return error;
+                };
+                let Ok(source) = self.workspace.snapshot(&path, 1024 * 1024) else {
+                    return error;
+                };
+                let Ok(text) = std::str::from_utf8(&source.bytes) else {
+                    return error;
+                };
+                DomainError::InvalidInput(edit_recovery::explain(message, raw, text, call.args()))
+            })?;
         prepared.queue_permit = permit;
         Ok(prepared)
     }
@@ -386,7 +417,7 @@ impl FileService {
         };
         check()?;
         let expected = snapshot.as_ref().map(|s| s.revision.clone());
-        if call.name() == "editApply" {
+        if call.name() == "editApply" || (call.name() == "edit" && call.args()["mode"] != "preview") {
             let records = self.previews.lock().unwrap();
             if let Some(prior) = records.get(&(scope.session.clone(), scope.epoch, path.clone()))
                 && Some(&prior.revision) != expected.as_ref()
@@ -398,10 +429,15 @@ impl FileService {
         let transformation = if call.name() == "read" {
             let snapshot = snapshot.as_ref().ok_or_else(|| DomainError::InvalidInput(format!("Path not found: {raw}. Use find to locate files or ls to inspect directories before retrying read.")))?;
             let mut result =
-                match crate::image_tools::read_with_control(&snapshot.bytes, true, check)? {
+                match crate::image_tools::read_file_with_control(&path, call.args(), &snapshot.bytes, check)? {
                     Some(image) => image,
                     None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
                 };
+            let reference = ag1_core::evidence::SourceReference::new(&path, &snapshot.revision.sha256)?;
+            if result.get("details").is_none() { result["details"] = serde_json::json!({}); }
+            result["details"]["sourceReference"] = serde_json::json!(reference.reference());
+            result["details"]["sourceSha256"] = serde_json::json!(snapshot.revision.sha256);
+            result["details"]["sourceKind"] = serde_json::json!("file_revision");
             if result["details"]["progress"].is_object()
                 && result["details"]["progress"]["reason"] != "line_too_large"
             {
@@ -422,7 +458,9 @@ impl FileService {
                 call.args()["oldText"]
                     .as_str()
                     .ok_or_else(|| DomainError::InvalidInput("oldText".into()))?,
-                call.args()["newText"].as_str().unwrap_or(""),
+                call.args()["newText"].as_str().ok_or_else(|| {
+                    DomainError::InvalidInput("editPreview requires newText as a string; use an explicit empty string for intentional deletion".into())
+                })?,
             )?;
             preview_success = p.error.is_none();
             file::Transformation {
@@ -450,9 +488,10 @@ impl FileService {
             file::Transformation {
                 bytes: None,
                 create_parents: false,
-                result: serde_json::json!({"content":[{"type":"text","text":serde_json::json!({"error":format!("parent directory does not exist: {parent}")}).to_string()}],"details":{"totalLines":0,"bytesAppended":0,"wasCreated":true}}),
+                result: serde_json::json!({"isError":true,"content":[{"type":"text","text":serde_json::json!({"error":format!("parent directory does not exist: {parent}")}).to_string()}],"details":{"totalLines":0,"bytesAppended":0,"wasCreated":true}}),
             }
         } else {
+            preview_success = call.name() == "edit" && call.args()["mode"] == "preview";
             file::transform(
                 call.name(),
                 call.args(),
@@ -567,7 +606,7 @@ impl FileService {
             Ok(snapshot) => {
                 check()?;
                 let result =
-                    match crate::image_tools::read_with_control(&snapshot.bytes, true, check)? {
+                    match crate::image_tools::read_file_with_control(&path, call.args(), &snapshot.bytes, check)? {
                         Some(image) => image,
                         None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
                     };
@@ -629,6 +668,23 @@ impl FileService {
         queues.insert(path.into(), Arc::downgrade(&queue));
         Ok(queue)
     }
+    /// Host supplies the current parent scope/policy and clock, not values echoed by an approval client.
+    pub fn revalidate_review(&self, prepared: &PreparedFile) -> Result<(), DomainError> {
+        if !Arc::ptr_eq(&prepared.workspace, &self.workspace) {
+            return Err(DomainError::PermissionDenied);
+        }
+        if !prepared.will_mutate() { return Ok(()); }
+        let current = match self.workspace.snapshot(&prepared.path, MAX_READ) {
+            Ok(snapshot) => Some(snapshot.revision),
+            Err(DomainError::NotFound) => None,
+            Err(error) => return Err(error),
+        };
+        if current != prepared.expected {
+            return Err(DomainError::InvalidInput("File changed during approval review. No edit was applied. Read the current file and propose a fresh exact edit for review.".into()));
+        }
+        Ok(())
+    }
+
     /// Host supplies the current parent scope/policy and clock, not values echoed by an approval client.
     /// Call from a bounded blocking worker. A successful publication remains successful after cancellation.
     pub fn execute<F: Fn() -> u64>(
@@ -725,18 +781,31 @@ impl FileService {
         }
         let key = (scope.session.clone(), scope.epoch, prepared.path.clone());
         let published = if let Some(bytes) = &prepared.transformation.bytes {
+            let receipt = self.review_store.as_ref().map(|store|
+                crate::change_receipts::PendingChange::prepare(store, &self.workspace, scope,
+                    &call, &prepared.path, prepared.expected.as_ref(), bytes, now())
+            ).transpose()?.flatten();
             let revision = match &prepared.expected {
                 Some(expected) => {
                     self.workspace
-                        .replace_checked(&prepared.path, expected, bytes, check)?
+                        .replace_checked(&prepared.path, expected, bytes, check)
                 }
                 None => self.workspace.create_checked(
                     &prepared.path,
                     bytes,
                     prepared.transformation.create_parents,
                     check,
-                )?,
+                ),
             };
+            if let Some(receipt) = receipt {
+                let id = receipt.record.id.clone();
+                if receipt.settle(self.review_store.as_ref().unwrap(), &revision).is_err() && revision.is_ok() {
+                    // A committed write must never be reported as failed/retryable
+                    // merely because its review acknowledgement was interrupted.
+                    prepared.transformation.result["details"]["reviewWarning"] = serde_json::json!(format!("The file was written, but change record {id} is unconfirmed. Review the file; do not repeat the write automatically."));
+                }
+            }
+            let revision = revision?;
             self.previews.lock().unwrap().remove(&key);
             Some(revision)
         } else {

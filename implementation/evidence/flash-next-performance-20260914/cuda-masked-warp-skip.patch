@@ -1,0 +1,23 @@
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -255,6 +255,20 @@
+              // Increment pointers after each loop:
+              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+ 
++        // A warp owns the same 32 KV rows throughout this iteration. For a
++        // fully masked warp, the stock recurrence only adds zero and scales
++        // the existing accumulator by one. Skip its K/V reads and arithmetic.
++        // No CTA barrier occurs inside this loop; the decision is warp-uniform.
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if constexpr (D == 256 && ncols == 1 &&
++                      type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
++            if (ne11 >= 4096 && mask && max_bias == 0.0f &&
++                __all_sync(0xFFFFFFFF, __half2float(maskh[tid]) == -INFINITY)) {
++                continue;
++            }
++        }
++#endif
++
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+ 

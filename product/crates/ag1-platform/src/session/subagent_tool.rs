@@ -224,7 +224,7 @@ impl DelegationService {
             } else {
                 Effect::Unknown
             },
-            result: json!({"content":[{"type":"text","text":domain::tool::render(&raw)?}],"details":raw,"isError":result.state==domain::checkpoint::State::Failed}),
+            result: json!({"content":[{"type":"text","text":domain::tool::render(&raw)?}],"details":raw,"isError":result.state!=domain::checkpoint::State::Completed}),
             artifact_page: false,
         })
     }

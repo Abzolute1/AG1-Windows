@@ -302,7 +302,7 @@ fn wrong_model_context_load_failure_and_deadline_are_visible() {
     for identity in [
         ModelIdentity {
             path: Some("/wrong".into()),
-            alias: None,
+            alias: Some(p.model_id.clone()),
             model: None,
             context_window: Some(p.requested_context),
             vision: false,

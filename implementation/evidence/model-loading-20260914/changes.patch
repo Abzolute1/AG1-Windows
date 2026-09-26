@@ -1,0 +1,685 @@
+--- before/product/apps/desktop/src/App.tsx
++++ after/product/apps/desktop/src/App.tsx
+@@ -18,6 +18,7 @@
+ import { RecoveryPanel, type Recovery } from "./RecoveryPanel";
+ import { applyTheme, type Theme } from "./themes";
+ import { previewDocument } from "./preview";
++import { ModelLoadControl, modelPreparing, type ModelPreparation, type PendingModelLoad } from "./ModelLoadControl";
+ import { ModelPicker } from "./ModelPicker";
+ import { Settings } from "./Settings";
+ import { observeScrollTiming } from "./scrollTiming";
+@@ -62,6 +63,7 @@
+   const [recovery, setRecovery] = useState<Recovery | null>(null), [answer, setAnswer] = useState("");
+   const [requestPage, setRequestPage] = useState<{ id: string; text: string; next: string | null } | null>(null), [reviewed, setReviewed] = useState<string | null>(null);
+   const [files, setFiles] = useState<string[]>([]), [file, setFile] = useState<FileView | null>(null), [edit, setEdit] = useState(""), [preview, setPreview] = useState(false), [editorReset, setEditorReset] = useState(0);
++  const [modelLoad, setModelLoad] = useState<PendingModelLoad | null>(null);
+   const [stopping, setStopping] = useState(false);
+   const [review, setReview] = useState<{ scope: string; tab: ReviewTab; open: boolean; turn?: string; artifactTurn?: string; github?: GitHubReviewTarget } | null>(null);
+   const reviewOpener = useRef<HTMLElement | null>(null);
+@@ -87,13 +89,13 @@
+   const currentChat = catalog.chats?.find(c => c.workspace === active?.workspace_path && c.session === active?.scope.session);
+   const observation = (view.details?.activity as any)?.observations;
+   const usage = (view.details?.activity as any)?.latest_assistant_usage?.usage;
+-  const preparation = (view.details?.activity as any)?.runtime_preparation;
++  const preparation = (view.details?.activity as any)?.runtime_preparation as ModelPreparation | undefined;
+   const status = stopping ? "Stopping response…" : active?.pending.length ? "Waiting for you" : !executing ? "" : (view.details?.activity as any)?.inference_waiting ? "Queued · waiting for model" : observation?.phase === "thinking" ? "Thinking" : observation?.phase === "generating" ? "Generating" : observation?.phase === "tool" ? "Generating operation" : observation?.phase === "executing" ? "Running tools" : preparation?.phase === "verifying" ? `Verifying ${preparation.model} files` : preparation?.phase === "loading" ? `Loading ${preparation.model}` : observation?.phase === "preparing" ? "Preparing request" : observation?.phase === "waiting" ? "Waiting for model" : observation?.phase === "text" ? "Generating" : "Processing prompt";
+   useEffect(() => { const generation = themeVersion.current; void api.catalog().then(next => setCatalog(old => ({ ...next, theme: generation === themeVersion.current ? next.theme : old.theme }))).catch(e => setError(errorMessage(e))); void api.preferences().then(p => { if (p?.approval_mode) setDefaultApproval(p.approval_mode); }).catch(() => {}); void api.models().then(next => { if (Array.isArray(next)) setModels(next); }).catch(e => setError(errorMessage(e))); }, []);
+   useEffect(() => { applyTheme(catalog.theme, preferences.chatSize, catalog.themes); applyPreferences(preferences); const media = matchMedia("(prefers-color-scheme: dark)"); const update = () => { applyTheme(catalog.theme, preferences.chatSize, catalog.themes); applyPreferences(preferences); }; media.addEventListener?.("change", update); return () => media.removeEventListener?.("change", update); }, [catalog.theme, catalog.themes, preferences]);
+   useEffect(() => {
+     let stopped = false; let timer: ReturnType<typeof setTimeout>; let viewFrame = 0;
+-    const poll = async () => { let delay = 1000; try { if (!changing.current) { const epoch = viewEpoch.current; const next = await api.view(); delay = document.hidden ? 3000 : next.snapshot && ["streaming", "running", "awaiting_input"].includes(next.snapshot.status) ? 400 : next.snapshot ? 1500 : 1000; if (!stopped && !changing.current && epoch === viewEpoch.current) { cancelAnimationFrame(viewFrame); viewFrame = requestAnimationFrame(() => { if (!stopped && !changing.current && epoch === viewEpoch.current) setView(old => mergeView(old, next)); }); } } } catch (e) { if (!stopped) setError(errorMessage(e)); } finally { if (!stopped) timer = setTimeout(poll, delay); } };
++    const poll = async () => { let delay = 1000; try { if (!changing.current) { const epoch = viewEpoch.current; const next = await api.view(); delay = document.hidden ? 3000 : modelPreparing((next.details?.activity as any)?.runtime_preparation) ? 400 : next.snapshot && ["streaming", "running", "awaiting_input"].includes(next.snapshot.status) ? 400 : next.snapshot ? 1500 : 1000; if (!stopped && !changing.current && epoch === viewEpoch.current) { cancelAnimationFrame(viewFrame); viewFrame = requestAnimationFrame(() => { if (!stopped && !changing.current && epoch === viewEpoch.current) setView(old => mergeView(old, next)); }); } } } catch (e) { if (!stopped) setError(errorMessage(e)); } finally { if (!stopped) timer = setTimeout(poll, delay); } };
+     void poll(); return () => { stopped = true; clearTimeout(timer); cancelAnimationFrame(viewFrame); };
+   }, []);
+   useEffect(() => {
+@@ -227,6 +229,15 @@
+       if (requestedEffort) await run({ kind: "model", action: "reasoning", args: { provider: pick.provider, model_id: pick.id, mode: requestedEffort } });
+       await run({ kind: "runtime", action: "approval_policy", args: { mode: approvalValue } });
+     }
++  }
++  async function loadModel() {
++    const pick = chosenModel;
++    if (!pick || pick.provider !== "llamacpp") return;
++    setModelLoad({ model: pick.id, started_at: Date.now() });
++    try {
++      await ensureChat(pick);
++      await run({ kind: "runtime", action: "load_model", args: { provider: pick.provider, model_id: pick.id } });
++    } finally { setModelLoad(null); }
+   }
+   async function newChat() {
+     const previousDraft = draft, previousAttachments = attachments; preserveDraft(); setNavigating("New chat");
+@@ -323,7 +334,7 @@
+   return <GitHubReviewContext.Provider value={{ open: openGitHubReview, clear: clearGitHubReview }}><div className="shell redesigned">
+     {sidebar && page !== "settings" && <aside className="chat-sidebar"><div className="sidebar-brand"><span>AG1</span><button aria-label="Hide sidebar" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></button></div><button className="new-chat" disabled={busy} onClick={() => void action(newChat)}><Plus size={17} />New chat</button><label className="chat-search"><Search size={15} /><input aria-label="Search chats" placeholder="Search chats" value={search} onChange={e => setSearch(e.target.value)} /></label><div className="sidebar-scroll"><div className="sidebar-section-title">Projects<button aria-label="Add project" disabled={busy} onClick={browseProject}><Plus size={15} /></button></div>{catalog.projects.map(p => <details className="project-chats" key={p} open><summary><FolderOpen size={14} /><span>{basename(p)}</span></summary><button className="project-open" title={p} disabled={busy} onClick={() => void action(() => openWorkspace(p))}>Open project</button>{chats.filter(c => c.workspace.replace(/\/+$/, "") === p.replace(/\/+$/, "")).map(chatRow)}</details>)}{!catalog.projects.length && <p className="sidebar-empty">Attach a project when you need one.</p>}<div className="sidebar-section-title">{archived ? "Archived chats" : "Chats"}</div>{chats.filter(c => c.general || !catalog.projects.some(p => p.replace(/\/+$/, "") === c.workspace.replace(/\/+$/, ""))).map(chatRow)}{!chats.length && <p className="sidebar-empty">Your conversations will appear here.</p>}</div><div className="sidebar-bottom"><button onClick={() => setArchived(!archived)}>{archived ? "Back to chats" : "Archived chats"}</button><button onClick={() => { setSettingsSection("github"); setPage("settings"); }}><Github size={16} />GitHub</button><button disabled={busy} onClick={() => void action(async () => { if (!activeRef.current) await openWorkspace(undefined, true); setPage("mcp"); })}>MCP</button><button aria-label="Settings" onClick={() => { setSettingsSection("appearance"); setPage("settings"); }}><Settings2 size={16} />Settings</button></div></aside>}
+     <main className="main"><header className="chat-header">{!sidebar && <button aria-label="Show sidebar" onClick={() => setSidebar(true)}><PanelLeftClose size={18} /></button>}<button className="chat-heading" onClick={() => setPage("chat")}>{page === "settings" ? "Settings" : page === "mcp" ? "MCP" : navigating || currentChat?.title || "New chat"}</button><div className="header-actions"><button className="workspace-pill" aria-label={folderSelection ? "Chat folders" : undefined} title={folderSelection ? workingFolder : undefined} disabled={busy} onClick={() => folderSelection ? setFoldersDialog(true) : setProjectDialog(true)}><FolderOpen size={15} />{folderSelection ? normalizedPath(workingFolder || "").endsWith("/general-chat") ? "Chat folders" : basename(workingFolder || "") : active && !general ? basename(active.workspace_path) : "Attach project"}</button>{active && <><button aria-label="Files" title="Files" onClick={() => void action(() => navigate("files"))}><FileCode2 size={17} /></button><button aria-label="Changes" title="Review changes" aria-expanded={review?.scope === scope && review.open && review.tab === "changes"} onClick={() => openReview("changes")}><GitCompareArrows size={17} /></button><button aria-label="Artifacts" title="Artifacts" aria-expanded={review?.scope === scope && review.open && review.tab === "artifacts"} onClick={() => openReview("artifacts")}><PanelRightOpen size={17} /></button><button aria-label="Task and activity" title="Task and activity" onClick={() => { setReview(old => old ? { ...old, open: false } : null); setDetailsOpen(!detailsOpen); }}><MoreHorizontal size={18} /></button></>}</div></header>
+-      {((stoppable && page !== "chat") || busy && !executing) && <div className="operation-banner" role="status"><span><LoaderCircle size={14} className="spin" />{executing ? `${status} · ${formatTime(elapsed)}` : "Recovering the stopped response…"}{executing && active?.model && <small> · {active.model}</small>}</span>{stoppable && <button aria-label="Stop current response" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={13} />Stop</button>}</div>}
++      {((stoppable && page !== "chat") || busy && !executing && !modelLoad) && <div className="operation-banner" role="status"><span><LoaderCircle size={14} className="spin" />{executing ? `${status} · ${formatTime(elapsed)}` : "Recovering the stopped response…"}{executing && active?.model && <small> · {active.model}</small>}</span>{stoppable && <button aria-label="Stop current response" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={13} />Stop</button>}</div>}
+       {(error || view.error) && <div className="error" role="alert"><span>{error || view.error}</span><button aria-label="Dismiss error" onClick={() => { setError(""); setView(v => ({ ...v, error: null })); }}><X size={16} /></button></div>}
+       {recovery && <RecoveryPanel record={recovery} onClose={() => setRecovery(null)} />}
+       {view.details && <><ExtensionShortcuts key={scope} run={query} /><ExtensionUI key={`ui/${scope}`} activity={view.details.activity} run={run} onEditor={(text, paste) => setDraft(old => paste ? old + text : text)} /></>}
+@@ -333,7 +344,8 @@
+       <div className="composer-shell" ref={menus}>{addMenu && <div className="composer-menu menu" aria-label="Add to chat"><div className="menu-heading">Add</div><button onClick={() => { fileInput.current?.click(); setAddMenu(false); }}><Plus size={16} />Files</button><button onClick={() => { folderInput.current?.click(); setAddMenu(false); }}><FolderOpen size={16} />Folder contents</button><button aria-pressed={plan} onClick={() => { setPlan(!plan); setAddMenu(false); }}><MessageSquare size={16} />Plan mode <small>{plan ? "On" : "Plan before making changes"}</small>{plan && <Check size={14} />}</button><div className="menu-heading">Plugins</div><button onClick={() => { setPlugins(true); setAddMenu(false); }}>Browse plugins and skills</button><button onClick={() => { folderSelection ? setFoldersDialog(true) : setProjectDialog(true); setAddMenu(false); }}><FolderOpen size={16} />{folderSelection ? "Chat folders" : "Attach project"}</button></div>}
+       <input hidden type="file" multiple ref={fileInput} aria-label="Attach files" onChange={e => { addAttachments(Array.from(e.target.files ?? [])); e.target.value = ""; }} /><input hidden type="file" multiple ref={folderInput} aria-label="Attach folder contents" onChange={e => { addAttachments(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+       <form className={`composer${plan ? " is-planning" : ""}`} onSubmit={e => { e.preventDefault(); if (!actions.current && (!executing || !plan)) void action(send); }}>{(plan || attachments.length > 0) && <div className="composer-chips">{plan && <button type="button" onClick={() => setPlan(false)}>Plan mode <X size={12} /></button>}{attachments.map((f, i) => <DraftAttachment key={`${f.name}/${f.lastModified}/${i}`} file={f} remove={() => setAttachments(old => old.filter((_, n) => n !== i))} />)}</div>}<textarea onPaste={e => { const files = Array.from(e.clipboardData.files).filter(f => f.type.startsWith("image/")); if (!files.length) return; e.preventDefault(); addAttachments(files); const text = e.clipboardData.getData("text/plain"); if (text) { const { selectionStart: start, selectionEnd: end } = e.currentTarget; setDraft(old => old.slice(0, start) + text + old.slice(end)); } }} aria-label="Message AG1" placeholder={executing ? "Add a direction…" : plan ? "What would you like to plan?" : "Ask anything"} value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && (preferences.sendKey === "enter" || e.ctrlKey || e.metaKey)) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+-      <div className="composer-toolbar"><div className="composer-left"><button type="button" aria-label="Add to chat" aria-expanded={addMenu} onClick={() => { setAddMenu(!addMenu); setModelMenu(false); setApprovalMenu(false); }}><Plus size={19} /></button><div className="approval-anchor"><button type="button" className="permission-label" aria-label="Tool approvals" aria-expanded={approvalMenu} title={`Next response: ${approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}`} onClick={() => { setApprovalMenu(!approvalMenu); setAddMenu(false); setModelMenu(false); }}><ApprovalIcon value={approvalValue} /><span>{approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}{(view.details?.context as any)?.approval_policy?.mode !== approvalValue ? " · next response" : ""}</span></button>{approvalMenu && <div className="approval-menu menu"><div className="menu-heading">Tool approvals</div><ApprovalChoices value={approvalValue} onChange={chooseApproval} /><p>{plan ? "Plan mode keeps its read-only restrictions." : `Selected for your next response. Current policy: ${(view.details?.context as any)?.approval_policy?.mode || "not yet confirmed"}.`}</p></div>}</div></div><div className="composer-right"><div className="model-anchor"><button type="button" className="model-picker" aria-label="Choose model" aria-expanded={modelMenu} onClick={() => { setModelMenu(!modelMenu); setAddMenu(false); setApprovalMenu(false); }}><span>{modelName}</span><ChevronDown size={13} /></button>{modelMenu && <ModelPicker key={chosenModel ? `${chosenModel.provider}/${chosenModel.id}` : "none"} models={available} selected={chosenModel} choose={m => void chooseModel(m)} mode={chosenModel ? reasoning[`${chosenModel.provider}/${chosenModel.id}`] : undefined} setMode={mode => { if (chosenModel) setReasoning(old => ({...old, [`${chosenModel.provider}/${chosenModel.id}`]:mode})); }} activeLevel={(view.details?.context as any)?.selected_model?.provider === chosenModel?.provider && (view.details?.context as any)?.selected_model?.id === chosenModel?.id ? (view.details?.context as any)?.thinking : undefined} />}</div>{stoppable ? <button type="button" className="send-button" aria-label="Stop generation" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={16} /></button> : <button type="submit" className="send-button" aria-label="Send message" disabled={busy || !draft.trim() && !attachments.length}><ArrowUp size={18} /></button>}{executing && !!draft.trim() && <button type="submit" aria-label="Send steering" disabled={busy || plan}><ArrowUp size={18} /></button>}</div></div></form></div><div className="composer-note">{requestModel && requestModel !== modelName ? `This request uses ${requestModel}. ${modelName} is selected for your next message.` : busy && !executing ? "Preparing your request…" : (preferences.sendKey === "enter" ? "Enter to send · Shift Enter for a new line" : "Ctrl / ⌘ Enter to send · Enter for a new line")}</div></div></section>{page === "settings" ? <Settings gitRun={query} gitEffect={reviewEffect} changes={() => { setPage("chat"); openReview("changes"); }} key={`${settingsSection}/${scope}/${active?.scope.epoch ?? 0}`} initialSection={settingsSection} discuss={text => { setDraft(old => old ? `${old}\n\n${text}` : text); setPage("chat"); }} theme={catalog.theme} setTheme={theme} plugins={catalog.themes ?? []} refreshThemes={async () => { const c = await api.catalog(); setCatalog(old => ({ ...old, themes: c.themes ?? [] })); }} preferences={preferences} update={updatePreferences} models={available} modelName={modelName} chooseModel={m => void chooseModel(m)} runningModel={requestModel} approval={approvalValue} setApproval={chooseApproval} back={() => setPage("chat")} quit={() => setQuitDialog(true)} chats={catalog.chats ?? []} restore={c => void action(() => saveChat({ ...c, archived: false, deleted: false }))} workspace={workingFolder && !normalizedPath(workingFolder).endsWith("/general-chat") ? workingFolder : undefined} attach={path => void action(() => openWorkspace(path))} /> : page === "mcp" ? <MCPManager key={`${scope}/${active?.scope.epoch ?? 0}`} scope={queryScope} run={mcpRun} back={() => setPage("chat")} /> : page === "files" ? <div className="files-layout"><aside className="file-tree"><button onClick={() => void action(refreshFiles)}>Refresh files</button>{files.map(name => <button key={name} onClick={() => void action(() => readFile(name))}>{name}</button>)}</aside><section className="editor-panel file-pane"><header className="file-toolbar"><span><span className="file-name" title={file?.path}>{file?.path || "Project files"}</span>{dirty && <span className="dirty" aria-label="Unsaved changes">●</span>}</span><div><button disabled={!dirty || busy} onClick={() => void action(save)}>Save</button><button disabled={!file} onClick={() => { if (file) { setEdit(file.text); setEditorReset(v => v + 1); } }}>Discard</button><button disabled={!file} onClick={() => setPreview(!preview)}>Preview</button></div></header>{file ? preview ? <iframe title="Isolated static preview" sandbox="" referrerPolicy="no-referrer" srcDoc={previewDocument(edit)} /> : <Suspense fallback={<p>Loading editor…</p>}><Editor path={file.path} text={edit} theme={catalog.theme} fontSize={preferences.codeSize} fontFamily={preferences.codeFont} wordWrap={preferences.codeWrap} resetKey={`${file.path}/${editorReset}`} onChange={setEdit} /></Suspense> : <div className="empty"><h2>Your project files</h2><p>Select a file from the sidebar.</p></div>}</section></div> : null}
++      <ModelLoadControl model={chosenModel} progress={preparation} pending={modelLoad} disabled={busy || executing} load={() => { if (!actions.current) void action(loadModel); }} />
++      <div className="composer-toolbar"><div className="composer-left"><button type="button" aria-label="Add to chat" aria-expanded={addMenu} onClick={() => { setAddMenu(!addMenu); setModelMenu(false); setApprovalMenu(false); }}><Plus size={19} /></button><div className="approval-anchor"><button type="button" className="permission-label" aria-label="Tool approvals" aria-expanded={approvalMenu} title={`Next response: ${approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}`} onClick={() => { setApprovalMenu(!approvalMenu); setAddMenu(false); setModelMenu(false); }}><ApprovalIcon value={approvalValue} /><span>{approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}{(view.details?.context as any)?.approval_policy?.mode !== approvalValue ? " · next response" : ""}</span></button>{approvalMenu && <div className="approval-menu menu"><div className="menu-heading">Tool approvals</div><ApprovalChoices value={approvalValue} onChange={chooseApproval} /><p>{plan ? "Plan mode keeps its read-only restrictions." : `Selected for your next response. Current policy: ${(view.details?.context as any)?.approval_policy?.mode || "not yet confirmed"}.`}</p></div>}</div></div><div className="composer-right"><div className="model-anchor"><button type="button" className="model-picker" aria-label="Choose model" aria-expanded={modelMenu} onClick={() => { setModelMenu(!modelMenu); setAddMenu(false); setApprovalMenu(false); }}><span>{modelName}</span><ChevronDown size={13} /></button>{modelMenu && <ModelPicker key={chosenModel ? `${chosenModel.provider}/${chosenModel.id}` : "none"} models={available} selected={chosenModel} choose={m => void chooseModel(m)} mode={chosenModel ? reasoning[`${chosenModel.provider}/${chosenModel.id}`] : undefined} setMode={mode => { if (chosenModel) setReasoning(old => ({...old, [`${chosenModel.provider}/${chosenModel.id}`]:mode})); }} activeLevel={(view.details?.context as any)?.selected_model?.provider === chosenModel?.provider && (view.details?.context as any)?.selected_model?.id === chosenModel?.id ? (view.details?.context as any)?.thinking : undefined} />}</div>{stoppable ? <button type="button" className="send-button" aria-label="Stop generation" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={16} /></button> : <button type="submit" className="send-button" aria-label="Send message" disabled={busy || !draft.trim() && !attachments.length}><ArrowUp size={18} /></button>}{executing && !!draft.trim() && <button type="submit" aria-label="Send steering" disabled={busy || plan}><ArrowUp size={18} /></button>}</div></div></form></div><div className="composer-note">{requestModel && requestModel !== modelName ? `This request uses ${requestModel}. ${modelName} is selected for your next message.` : busy && !executing && !modelLoad ? "Preparing your request…" : (preferences.sendKey === "enter" ? "Enter to send · Shift Enter for a new line" : "Ctrl / ⌘ Enter to send · Enter for a new line")}</div></div></section>{page === "settings" ? <Settings gitRun={query} gitEffect={reviewEffect} changes={() => { setPage("chat"); openReview("changes"); }} key={`${settingsSection}/${scope}/${active?.scope.epoch ?? 0}`} initialSection={settingsSection} discuss={text => { setDraft(old => old ? `${old}\n\n${text}` : text); setPage("chat"); }} theme={catalog.theme} setTheme={theme} plugins={catalog.themes ?? []} refreshThemes={async () => { const c = await api.catalog(); setCatalog(old => ({ ...old, themes: c.themes ?? [] })); }} preferences={preferences} update={updatePreferences} models={available} modelName={modelName} chooseModel={m => void chooseModel(m)} runningModel={requestModel} approval={approvalValue} setApproval={chooseApproval} back={() => setPage("chat")} quit={() => setQuitDialog(true)} chats={catalog.chats ?? []} restore={c => void action(() => saveChat({ ...c, archived: false, deleted: false }))} workspace={workingFolder && !normalizedPath(workingFolder).endsWith("/general-chat") ? workingFolder : undefined} attach={path => void action(() => openWorkspace(path))} /> : page === "mcp" ? <MCPManager key={`${scope}/${active?.scope.epoch ?? 0}`} scope={queryScope} run={mcpRun} back={() => setPage("chat")} /> : page === "files" ? <div className="files-layout"><aside className="file-tree"><button onClick={() => void action(refreshFiles)}>Refresh files</button>{files.map(name => <button key={name} onClick={() => void action(() => readFile(name))}>{name}</button>)}</aside><section className="editor-panel file-pane"><header className="file-toolbar"><span><span className="file-name" title={file?.path}>{file?.path || "Project files"}</span>{dirty && <span className="dirty" aria-label="Unsaved changes">●</span>}</span><div><button disabled={!dirty || busy} onClick={() => void action(save)}>Save</button><button disabled={!file} onClick={() => { if (file) { setEdit(file.text); setEditorReset(v => v + 1); } }}>Discard</button><button disabled={!file} onClick={() => setPreview(!preview)}>Preview</button></div></header>{file ? preview ? <iframe title="Isolated static preview" sandbox="" referrerPolicy="no-referrer" srcDoc={previewDocument(edit)} /> : <Suspense fallback={<p>Loading editor…</p>}><Editor path={file.path} text={edit} theme={catalog.theme} fontSize={preferences.codeSize} fontFamily={preferences.codeFont} wordWrap={preferences.codeWrap} resetKey={`${file.path}/${editorReset}`} onChange={setEdit} /></Suspense> : <div className="empty"><h2>Your project files</h2><p>Select a file from the sidebar.</p></div>}</section></div> : null}
+     </main>
+     {(active || review?.github) && review?.scope === scope && <ReviewPanel key={`${scope}/${workingFolder}`} open={review.open && (page !== "settings" || review.tab === "github")} tab={review.tab} turn={review.turn} artifactTurn={review.artifactTurn} github={review.github} localAvailable={!!active} onTab={tab => { if (tab !== "github") setPage("chat"); setReview(old => old ? { ...old, tab } : null); }} run={query} effect={reviewEffect} onClose={closeReview} />}
+     <Modal open={foldersDialog} close={() => setFoldersDialog(false)} title="Chat folders"><ChatFolders key={scope} selection={folderSelection} blocked={executing ? "Finish or stop the current response to change folders." : dirty ? "Save or discard your editor changes before changing folders." : undefined} change={changeFolder} /></Modal>
+--- before/product/crates/ag1-platform/src/client/mod.rs
++++ after/product/crates/ag1-platform/src/client/mod.rs
+@@ -47,6 +47,7 @@
+ pub mod credentials;
+ mod details;
+ mod effects;
++mod model_loading;
+ pub mod export;
+ pub mod extensions;
+ mod factory;
+@@ -1240,6 +1241,9 @@
+             let folders = self.folder_selection()?;
+             if !folders.primary_available() { return Err(DomainError::Unavailable("Choose an available working folder in Chat folders before continuing".into())); }
+         }
++        if matches!(&envelope.command, w::Command::Runtime { action, .. } if action == "load_model") {
++            return self.load_local_model(envelope).await;
++        }
+         if effects::is_effect(&envelope.command) {
+             if let w::Command::Files {action,args}=&envelope.command && action=="git_confirm" {self.ensure_local_git_idle(args).await?;}
+             if let w::Command::Files {action,args} = &envelope.command && (action == "change_undo" || action == "change_undo_recover") { self.ensure_undo_idle(args).await?; }
+--- before/product/crates/ag1-platform/src/provider/http.rs
++++ after/product/crates/ag1-platform/src/provider/http.rs
+@@ -112,6 +112,11 @@
+ /// Host custody preparation, called with an already held generation permit.
+ /// It may load the pinned model but must not issue a generation itself.
+ pub trait GenerationRuntime: Send + Sync {
++    /// Explicit host request: prepare resident weights without generating a message.
++    /// The caller must hold the shared local endpoint scheduler permit.
++    fn load_model<'a>(&'a self, _model: &'a str) -> ag1_core::PortFuture<'a, ()> {
++        Box::pin(async { Err(DomainError::Unavailable("Manual model loading is unavailable".into())) })
++    }
+     /// Advisory UI phase, independent of the blocking model-loading lock.
+     fn progress(&self) -> Option<serde_json::Value> {
+         None
+--- before/product/crates/ag1-platform/src/llama/native.rs
++++ after/product/crates/ag1-platform/src/llama/native.rs
+@@ -38,11 +38,27 @@
+ }
+ impl MaterialVerifier {
+     pub fn verify(&mut self, materials: &[Material]) -> Result<(), DomainError> {
++        self.verify_progress(materials, &mut |_| {})
++    }
++    pub fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+         if materials.is_empty() || materials.len() > 1024 {
+             return Err(DomainError::InvalidInput(
+                 "runtime material manifest".into(),
+             ));
+         }
++        let total: u128 = materials.iter().map(|m| {
++            if !Path::new(&m.path).is_absolute() || m.sha256.len() != 64 || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
++                return Err(DomainError::InvalidInput("runtime material identity".into()));
++            }
++            fs::metadata(&m.path).map(|m| m.len() as u128).map_err(io_error)
++        }).collect::<Result<Vec<_>, _>>()?.into_iter().sum();
++        let mut done = 0u128;
++        let mut last = 0u8;
++        progress(0);
++        let mut report = |done: u128| {
++            let percent = (done.saturating_mul(100) / total.max(1)).min(99) as u8;
++            if percent != last { progress(percent); last = percent; }
++        };
+         let mut unique = BTreeMap::new();
+         for material in materials {
+             if !Path::new(&material.path).is_absolute()
+@@ -69,6 +85,8 @@
+                 .get(&path)
+                 .is_some_and(|(saved, digest)| saved == &stamp && digest == &material.sha256)
+             {
++                done += before.len() as u128;
++                report(done);
+                 continue;
+             }
+             let mut file = File::open(&path).map_err(io_error)?;
+@@ -83,6 +101,8 @@
+                     break;
+                 }
+                 hash.update(&buffer[..size]);
++                done += size as u128;
++                report(done);
+                 #[cfg(test)]
+                 {
+                     self.bytes_hashed += size as u64;
+@@ -103,6 +123,7 @@
+             }
+             self.cache.insert(path, (stamp, digest));
+         }
++        progress(100);
+         Ok(())
+     }
+ }
+@@ -160,6 +181,17 @@
+     type Handle = NativeOwnedRuntime;
+     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError> {
+         self.verifier.verify(materials)
++    }
++    fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
++        self.verifier.verify_progress(materials, progress)
++    }
++    fn loading_phase(&mut self, handle: &Self::Handle) -> Option<&'static str> {
++        let process = handle.process.lock().ok()?;
++        let log = process.tail(8192).ok()?;
++        let text = String::from_utf8_lossy(&log.bytes);
++        if text.contains("warming up") { Some("warming") }
++        else if text.contains("load_model: initializing") || text.contains("loaded multimodal model") { Some("initializing") }
++        else { None }
+     }
+     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError> {
+         if self.exclusive_gpu && self.owned_pid.is_none() {
+--- before/product/crates/ag1-platform/src/llama/lifecycle.rs
++++ after/product/crates/ag1-platform/src/llama/lifecycle.rs
+@@ -51,6 +51,10 @@
+ pub trait RuntimeHost {
+     type Handle;
+     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError>;
++    fn verify_progress(&mut self, materials: &[Material], _progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
++        self.verify_materials(materials)
++    }
++    fn loading_phase(&mut self, _handle: &Self::Handle) -> Option<&'static str> { None }
+     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError>;
+     fn spawn(&mut self, plan: &LaunchPlan) -> Result<Self::Handle, DomainError>;
+     /// Verifies both process lifetime and executable identity; false means exited.
+@@ -85,6 +89,15 @@
+     }
+     pub fn owns_process(&self) -> bool {
+         self.owned.is_some()
++    }
++    pub fn loading_phase(&mut self) -> Option<&'static str> {
++        self.host.loading_phase(self.owned.as_ref()?)
++    }
++    pub fn owned_alive(&mut self) -> Result<bool, DomainError> {
++        match self.owned.as_ref() {
++            Some(handle) => self.host.owned_alive(handle),
++            None => Ok(false),
++        }
+     }
+     pub fn host(&self) -> &H {
+         &self.host
+--- before/product/crates/ag1-platform/src/llama/custody.rs
++++ after/product/crates/ag1-platform/src/llama/custody.rs
+@@ -171,9 +171,10 @@
+                     return Err(DomainError::PermissionDenied);
+                 }
+                 let plan = &plans[&model];
++                let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                 let phase = |name: &str| {
+                     if let Ok(mut value) = progress.lock() {
+-                        *value = Some(serde_json::json!({"model":model,"phase":name}));
++                        *value = Some(serde_json::json!({"model":model,"phase":name,"started_at":started_at}));
+                     }
+                 };
+                 let started = Instant::now();
+@@ -186,7 +187,11 @@
+                     phase("verifying");
+                     s.controller
+                         .host_mut()
+-                        .verify_materials(&plan.runtime_materials()?)?;
++                        .verify_progress(&plan.runtime_materials()?, &mut |percent| {
++                            if let Ok(mut value) = progress.lock() {
++                                *value = Some(serde_json::json!({"model":model,"phase":"verifying","percent":percent,"started_at":started_at}));
++                            }
++                        })?;
+                     if let Some(previous) = s.active.clone()
+                         && s.controller.reap_exited_owned_runtime()?
+                     {
+@@ -200,6 +205,7 @@
+                     }
+                     if s.active.as_deref() != Some(&model) {
+                         if let Some(previous) = s.active.clone() {
++                            phase("releasing");
+                             s.controller.stop_owned_runtime()?;
+                             s.events.push(Event {
+                                 model: previous.clone(),
+@@ -232,6 +238,7 @@
+                         if s.controller.poll_ready(plan)? {
+                             break;
+                         }
++                        if let Some(name) = s.controller.loading_phase() { phase(name); }
+                         std::thread::sleep(Duration::from_millis(25));
+                     }
+                     s.events.push(Event {
+@@ -243,8 +250,12 @@
+                     phase("ready");
+                     Ok(())
+                 })();
+-                if result.is_err() {
++                if let Err(error) = &result {
+                     phase("failed");
++                    if let Ok(mut value) = progress.lock()
++                        && let Some(value) = value.as_mut() {
++                        value["error"] = serde_json::json!(format!("{error:?}"));
++                    }
+                     // Only the controller's authenticated handle can be stopped.
+                     s.controller.stop_owned_runtime()?;
+                     if let Some(model) = s.active.take() {
+@@ -270,7 +281,16 @@
+     H::Handle: Send,
+ {
+     fn progress(&self) -> Option<serde_json::Value> {
++        // Never wait behind weight verification/loading on a UI polling thread.
++        if let Ok(mut state) = self.state.try_lock()
++            && state.active.is_some() && !state.controller.owned_alive().unwrap_or(false)
++            && let Ok(mut value) = self.progress.lock() {
++            *value = None;
++        }
+         self.progress.lock().ok().and_then(|value| value.clone())
++    }
++    fn load_model<'a>(&'a self, model: &'a str) -> PortFuture<'a, ()> {
++        Box::pin(self.ensure(model.to_owned()))
+     }
+     fn cancel_generation<'a>(&'a self, url: &'a str) -> PortFuture<'a, ()> {
+         Box::pin(async move {
+--- before/product/apps/desktop/src/ModelLoadControl.tsx
++++ after/product/apps/desktop/src/ModelLoadControl.tsx
+@@ -0,0 +1,31 @@
++import { useEffect, useState } from "react";
++import { Check, Download, LoaderCircle } from "lucide-react";
++import type { Model } from "./bridge";
++import "./modelLoading.css";
++export type ModelPreparation = { model: string; phase: string; percent?: number; started_at?: number; error?: string };
++export type PendingModelLoad = { model: string; started_at: number };
++const labels: Record<string, string> = { verifying: "Checking model files", releasing: "Releasing previous model", loading: "Loading model", initializing: "Initializing model", warming: "Warming up", queued: "Waiting for model slot" };
++export function modelPreparing(value?: ModelPreparation | null) { return !!value && value.phase in labels; }
++export function ModelLoadControl({ model, progress, pending, disabled, load }: { model?: Model; progress?: ModelPreparation | null; pending: PendingModelLoad | null; disabled: boolean; load: () => void }) {
++  const [now, setNow] = useState(Date.now);
++  const active = modelPreparing(progress);
++  const waiting = !!pending && (!progress || progress.model !== pending.model || (progress.started_at ?? 0) < pending.started_at);
++  const phase = waiting ? "queued" : active ? progress!.phase : undefined;
++  const started = waiting ? pending!.started_at : progress?.started_at;
++  useEffect(() => { if (!phase) return; setNow(Date.now()); const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [phase, started]);
++  if (model?.provider !== "llamacpp" && !phase) return null;
++  const selectedReady = progress?.phase === "ready" && progress.model === model?.id && !pending;
++  const percent = !waiting && phase && typeof progress?.percent === "number" && Number.isFinite(progress.percent) ? Math.max(0, Math.min(100, Math.floor(progress.percent))) : undefined;
++  const label = phase ? labels[phase] : selectedReady ? "Loaded" : progress?.phase === "failed" && progress.model === model?.id ? "Load failed" : "";
++  const seconds = started ? Math.max(0, Math.floor((now - started) / 1000)) : 0;
++  const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
++  const switchModel = progress?.phase === "ready" && progress.model !== model?.id;
++  return <div className="model-load-control">
++    {(phase || label) && <span className="model-load-state" title={phase ? (waiting ? pending!.model : progress?.model) : progress?.error || model?.id}>
++      {phase ? percent !== undefined ? <svg className="model-load-ring" viewBox="0 0 24 24" role="progressbar" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><circle className="model-load-track" cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="9" pathLength="100" strokeDasharray={`${percent} 100`} transform="rotate(-90 12 12)" /></svg> : <LoaderCircle size={16} className="model-load-spinner" aria-hidden="true" /> : selectedReady ? <Check size={14} aria-hidden="true" /> : null}
++      <span role="status">{label}{percent !== undefined ? ` · ${percent}%` : ""}</span>
++      {phase && started && <span className="model-load-elapsed" aria-hidden="true">{elapsed}</span>}
++    </span>}
++    {!phase && !selectedReady && model?.provider === "llamacpp" && <button type="button" className="model-load-button" disabled={disabled || !!pending || !!model.conflict} onClick={load} title="Load the selected model without sending a message"><Download size={14} aria-hidden="true" />{switchModel ? "Switch & load" : "Load"}</button>}
++  </div>;
++}
+--- before/product/apps/desktop/src/modelLoading.css
++++ after/product/apps/desktop/src/modelLoading.css
+@@ -0,0 +1,15 @@
++/* Composer controls use the selected app theme, including custom palettes. */
++.model-load-control { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; min-width: 0; margin: 0 2px 5px; font-size: 12px; color: var(--muted-foreground); }
++.model-load-control:empty { display: none; }
++.model-load-state { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
++.model-load-state [role="status"] { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.model-load-button { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 8px; padding: 5px 9px; font: inherit; color: var(--muted-foreground); background: transparent; }
++.model-load-button:hover:not(:disabled) { color: var(--foreground); background: color-mix(in srgb, var(--foreground) 6%, transparent); }
++.model-load-button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
++.model-load-button:disabled { opacity: .5; cursor: default; }
++.model-load-ring { width: 20px; height: 20px; flex: none; fill: none; stroke: var(--foreground); stroke-width: 2; stroke-linecap: round; }
++.model-load-ring .model-load-track { stroke: var(--border); }
++.model-load-spinner { flex: none; color: var(--foreground); animation: model-loading-spin 1s linear infinite; }
++.model-load-elapsed { font-variant-numeric: tabular-nums; opacity: .8; white-space: nowrap; }
++@keyframes model-loading-spin { to { transform: rotate(360deg); } }
++@media (prefers-reduced-motion: reduce) { .model-load-spinner { animation: none; } }
+--- before/product/apps/desktop/src/ModelLoadControl.test.tsx
++++ after/product/apps/desktop/src/ModelLoadControl.test.tsx
+@@ -0,0 +1,31 @@
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, expect, test, vi } from "vitest";
++import { ModelLoadControl } from "./ModelLoadControl";
++afterEach(cleanup);
++const model = { id: "35B", provider: "llamacpp" };
++test("local load is explicit; remote models have no load control", () => {
++  const load=vi.fn(); const {rerender}=render(<ModelLoadControl model={model} pending={null} disabled={false} load={load} />);
++  expect(load).not.toHaveBeenCalled();fireEvent.click(screen.getByRole("button",{name:"Load"}));expect(load).toHaveBeenCalledOnce();
++  rerender(<ModelLoadControl model={{id:"remote",provider:"openai"}} pending={null} disabled={false} load={load} />);
++  expect(screen.queryByRole("button")).toBeNull();
++});
++test("measured percentages, indeterminate loading and ready have distinct states", () => {
++  const props={model,pending:null,disabled:false,load:vi.fn()};
++  const {rerender}=render(<ModelLoadControl {...props} progress={{model:"35B",phase:"verifying",percent:63,started_at:Date.now()-5000}} />);
++  expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("63");expect(screen.getByRole("status").textContent).toContain("63%");
++  rerender(<ModelLoadControl {...props} progress={{model:"35B",phase:"loading"}} />);
++  expect(screen.queryByRole("progressbar")).toBeNull();expect(screen.getByRole("status").textContent).toBe("Loading model");
++  rerender(<ModelLoadControl {...props} progress={{model:"35B",phase:"ready"}} />);
++  expect(screen.getByRole("status").textContent).toBe("Loaded");expect(screen.queryByRole("button")).toBeNull();
++  rerender(<ModelLoadControl {...props} progress={{model:"other",phase:"ready"}} />);
++  expect(screen.getByRole("button",{name:"Switch & load"})).toBeTruthy();
++});
++test("stale ready state cannot hide a queued load, failure can retry, busy blocks swaps", () => {
++  const props={model,disabled:false,load:vi.fn()};
++  const {rerender}=render(<ModelLoadControl {...props} pending={{model:"35B",started_at:2000}} progress={{model:"35B",phase:"ready",started_at:1000}} />);
++  expect(screen.getByRole("status").textContent).toBe("Waiting for model slot");expect(screen.queryByRole("button")).toBeNull();
++  rerender(<ModelLoadControl {...props} pending={null} progress={{model:"35B",phase:"failed"}} />);
++  expect(screen.getByRole("status").textContent).toBe("Load failed");expect(screen.getByRole("button",{name:"Load"})).toBeTruthy();
++  rerender(<ModelLoadControl {...props} pending={null} disabled />);
++  expect((screen.getByRole("button") as HTMLButtonElement).disabled).toBe(true);
++});
+--- before/product/apps/desktop/src/App.test.tsx
++++ after/product/apps/desktop/src/App.test.tsx
+@@ -622,3 +622,33 @@
+   await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "choose_chat_folder")).toHaveLength(2));
+   expect((screen.getByRole("textbox", { name: "Project folder" }) as HTMLInputElement).value).toBe("/home/alex/New project");
+ });
++
++test("manual local model loading preserves an editable draft and sends no prompt", async () => {
++  let active=false, finish!: () => void;
++  const snapshot={version:{major:1,minor:0,schema:"fixture"},scope:{workspace:"ws",session:"s",instance:"i",epoch:"1"},revision:"1",watermark:"1",workspace_path:"/private/general-chat",status:"idle",active_operation:null,messages:[],message_count:0,pending:[],model:"35B",diagnostic:null,session_file:null,fixture_provider:true};
++  invoke.mockImplementation(async(name:string,args:any)=>{
++    if(name==="catalog")return {projects:[],chats:[],theme:"dark"};
++    if(name==="desktop_models")return [{id:"35B",provider:"llamacpp"}];
++    if(name==="open_general")active=true;
++    if(name==="bridge_command"){
++      const c=args.envelope.command;
++      if(c.kind==="runtime"&&c.action==="load_model")await new Promise<void>(r=>finish=r);
++      return {kind:"reply",status:"completed",data:null};
++    }
++    return {snapshot:active?snapshot:null,error:null,progress:""};
++  });
++  render(<App />);
++  const load=await screen.findByRole("button",{name:"Load"});
++  expect(invoke.mock.calls.some(([name])=>name==="open_general")).toBe(false);
++  const input=screen.getByRole("textbox",{name:"Message AG1"});
++  fireEvent.change(input,{target:{value:"My unfinished draft"}});fireEvent.click(load);
++  await waitFor(()=>expect(finish).toBeTypeOf("function"));
++  expect(screen.queryByText("Recovering the stopped response…")).toBeNull();
++  fireEvent.change(input,{target:{value:"My unfinished draft, still editable"}});
++  await act(async()=>finish());
++  await waitFor(()=>expect((screen.getByRole("button",{name:"Load"}) as HTMLButtonElement).disabled).toBe(false));
++  expect((input as HTMLTextAreaElement).value).toBe("My unfinished draft, still editable");
++  const commands=invoke.mock.calls.filter(([name])=>name==="bridge_command").map(([,args])=>args.envelope.command);
++  expect(commands.some(c=>c.kind==="prompt")).toBe(false);
++  expect(commands.filter(c=>c.action==="load_model")).toEqual([{kind:"runtime",action:"load_model",args:{provider:"llamacpp",model_id:"35B"}}]);
++});
+--- before/product/crates/ag1-platform/src/client/model_loading.rs
++++ after/product/crates/ag1-platform/src/client/model_loading.rs
+@@ -0,0 +1,241 @@
++//! Explicit, journaled model preparation. Shares generation admission across chats.
++use super::*;
++use crate::provider::http::endpoint_origin;
++
++impl Host {
++    pub(super) async fn load_local_model(
++        self: &Arc<Self>,
++        envelope: w::CommandEnvelope,
++    ) -> Result<w::BridgeFrame> {
++        #[derive(Deserialize)]
++        #[serde(deny_unknown_fields)]
++        struct Selection {
++            provider: String,
++            model_id: String,
++        }
++        let w::Command::Runtime { args, .. } = &envelope.command else {
++            return Err(DomainError::NotFound);
++        };
++        let selection: Selection = serde_json::from_value(args.clone()).map_err(json_error)?;
++        if selection.provider != "llamacpp" {
++            return Err(DomainError::InvalidInput(
++                "Only local models can be loaded".into(),
++            ));
++        }
++        let model = self
++            .config
++            .models
++            .iter()
++            .find(|m| m["provider"] == selection.provider && m["id"] == selection.model_id)
++            .ok_or(DomainError::NotFound)?;
++        if model
++            .get("runtimeConflict")
++            .is_some_and(|v| v != false && !v.is_null())
++        {
++            return Err(DomainError::Conflict);
++        }
++        let runtime = self
++            .local_runtime
++            .clone()
++            .ok_or_else(|| DomainError::Unavailable("Local model runtime is unavailable".into()))?;
++        let origin = endpoint_origin(model["baseUrl"].as_str().ok_or(DomainError::NotFound)?)?;
++        if self.commands.client_transition_pending()? {
++            return Err(DomainError::Conflict);
++        }
++        let key = format!(
++            "native-model-load-{}",
++            ag1_storage::digest(json!([envelope.scope, envelope.id]).to_string().as_bytes())
++        );
++        let admission = self.store.admit_client_command(
++            envelope.scope.session.as_str(),
++            &key,
++            envelope.expected_revision.get(),
++            &json!({"kind":"model-load","envelope":envelope}),
++        )?;
++        if !admission.inserted {
++            return admission
++                .record
++                .result
++                .map(|bytes| serde_json::from_slice(&bytes).map_err(json_error))
++                .unwrap_or(Err(DomainError::DurabilityUnknown));
++        }
++        // Keep the accepted operation alive if its renderer/request disconnects.
++        let owner = self.clone();
++        tokio::spawn(async move {
++            let result = async {
++                let scheduler = &owner.services.scheduler;
++                let ticket = scheduler.submit(&origin, ag1_core::OperationId::new(key.clone())?)?;
++                let deadline = tokio::time::Instant::now() + Duration::from_secs(900);
++                let permit = loop {
++                    match scheduler.start(&ticket) {
++                        Ok(Some(permit)) => break permit,
++                        Ok(None) => (),
++                        Err(error) => { let _ = scheduler.cancel(&ticket); return Err(error); }
++                    }
++                    if tokio::time::Instant::now() >= deadline || scheduler.status(&origin)?.quarantined > 0 {
++                        scheduler.cancel(&ticket)?;
++                        return Err(DomainError::Unavailable("Model is busy or needs recovery; try loading again when the response finishes".into()));
++                    }
++                    tokio::time::sleep(Duration::from_millis(100)).await;
++                };
++                // No inference is sent. Successful preparation leaves the model resident.
++                let result = match owner.check_authority() {
++                    Ok(()) => runtime.load_model(&selection.model_id).await,
++                    Err(error) => { permit.terminal()?; return Err(error); }
++                };
++                if result.is_ok() || runtime.cancel_generation(&origin).await.is_ok() {
++                    permit.terminal()?;
++                } // Otherwise dropping the permit quarantines uncertain local custody.
++                result
++            }.await;
++            let (status, data) = match result {
++                Ok(()) => ("completed", json!({"model":selection.model_id,"phase":"ready"})),
++                Err(error) => ("rejected", json!({"error":format!("{error:?}")})),
++            };
++            let frame = w::BridgeFrame::Reply { id: envelope.id, scope: envelope.scope, revision: owner.commands.snapshot()?.revision, durable: true, status: status.into(), data };
++            owner.store.settle_intent(&key, &admission.record.intent, &serde_json::to_vec(&frame).map_err(json_error)?)?;
++            Ok(frame)
++        }).await.map_err(|_| DomainError::DurabilityUnknown)?
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::provider::http::{GenerationRuntime, HttpRequest};
++    use std::sync::atomic::AtomicUsize;
++    #[derive(Default)]
++    struct Probe {
++        loads: AtomicUsize,
++        fail: AtomicBool,
++        stops: AtomicUsize,
++    }
++    impl GenerationRuntime for Probe {
++        fn prepare<'a>(&'a self, _: &'a HttpRequest) -> PortFuture<'a, ()> {
++            panic!("Manual load must not issue inference")
++        }
++        fn load_model<'a>(&'a self, model: &'a str) -> PortFuture<'a, ()> {
++            Box::pin(async move {
++                assert_eq!(model, "local");
++                self.loads.fetch_add(1, Ordering::SeqCst);
++                if self.fail.load(Ordering::SeqCst) {
++                    Err(DomainError::Unavailable("fixture load failed".into()))
++                } else {
++                    Ok(())
++                }
++            })
++        }
++        fn shutdown(&self) -> PortFuture<'_, ()> {
++            Box::pin(async { Ok(()) })
++        }
++        fn cancel_generation<'a>(&'a self, _: &'a str) -> PortFuture<'a, ()> {
++            Box::pin(async move {
++                self.stops.fetch_add(1, Ordering::SeqCst);
++                Ok(())
++            })
++        }
++    }
++    async fn fixture() -> (tempfile::TempDir, Arc<Host>, Arc<Probe>) {
++        let d = tempfile::tempdir().unwrap();
++        let workspace = d.path().join("workspace");
++        fs::create_dir(&workspace).unwrap();
++        let registry = crate::cutover::Registry::at(&d.path().join("authority")).unwrap();
++        registry.initialize_isolated(&workspace).unwrap();
++        let config: Config = serde_json::from_value(json!({"models":[{"provider":"llamacpp","id":"local","api":"openai-completions","baseUrl":"http://127.0.0.1:18087/v1","contextWindow":16000,"maxTokens":512}],"selected":"local","system_prompt":"Test","fixture":true})).unwrap();
++        let runtime = Arc::new(Probe::default());
++        let host = Host::open_rehearsal_with_runtime(
++            &workspace,
++            &d.path().join("state"),
++            config,
++            &registry,
++            runtime.clone(),
++        )
++        .await
++        .unwrap();
++        (d, host, runtime)
++    }
++    fn envelope(host: &Host, id: &str) -> w::CommandEnvelope {
++        let s = host.commands.snapshot().unwrap();
++        w::CommandEnvelope {
++            version: Default::default(),
++            id: id.to_owned().try_into().unwrap(),
++            scope: s.scope,
++            expected_revision: s.revision,
++            command: w::Command::Runtime {
++                action: "load_model".into(),
++                args: json!({"provider":"llamacpp","model_id":"local"}),
++            },
++            extension: None,
++        }
++    }
++    #[tokio::test]
++    async fn manual_load_is_message_free_and_receipt_replay_does_not_reload() {
++        let (_d, host, runtime) = fixture().await;
++        let before = host.commands.snapshot().unwrap();
++        let request = envelope(&host, "manual");
++        for _ in 0..2 {
++            assert!(
++                matches!(host.dispatch(request.clone()).await.unwrap(), w::BridgeFrame::Reply {status, ..} if status=="completed")
++            );
++        }
++        assert_eq!(runtime.loads.load(Ordering::SeqCst), 1);
++        let after = host.commands.snapshot().unwrap();
++        assert_eq!(before.watermark, after.watermark);
++        assert_eq!(before.revision, after.revision);
++        let mut bad = envelope(&host, "bad");
++        bad.command = w::Command::Runtime {
++            action: "load_model".into(),
++            args: json!({"provider":"remote","model_id":"local"}),
++        };
++        assert!(host.dispatch(bad).await.is_err());
++        assert_eq!(runtime.loads.load(Ordering::SeqCst), 1);
++        host.shutdown().await.unwrap();
++    }
++    #[tokio::test]
++    async fn manual_load_waits_for_shared_generation_and_releases_its_slot() {
++        let (_d, host, runtime) = fixture().await;
++        let scheduler = host.services.scheduler.clone();
++        let ticket = scheduler
++            .submit(
++                "http://127.0.0.1:18087",
++                ag1_core::OperationId::new("generation").unwrap(),
++            )
++            .unwrap();
++        let permit = scheduler.start(&ticket).unwrap().unwrap();
++        let other = host.open_conversation(None).await.unwrap();
++        let request = envelope(&other, "queued-load");
++        let task = tokio::spawn(async move { other.dispatch(request).await });
++        tokio::time::sleep(Duration::from_millis(150)).await;
++        assert_eq!(runtime.loads.load(Ordering::SeqCst), 0);
++        assert_eq!(
++            scheduler.status("http://127.0.0.1:18087").unwrap().waiting,
++            1
++        );
++        permit.terminal().unwrap();
++        tokio::time::timeout(Duration::from_secs(3), task)
++            .await
++            .unwrap()
++            .unwrap()
++            .unwrap();
++        assert_eq!(runtime.loads.load(Ordering::SeqCst), 1);
++        assert_eq!(
++            scheduler.status("http://127.0.0.1:18087").unwrap().active,
++            0
++        );
++        host.shutdown().await.unwrap();
++    }
++    #[tokio::test]
++    async fn failed_load_proves_stop_before_releasing_slot_and_can_retry() {
++        let (_d, host, runtime) = fixture().await;
++        runtime.fail.store(true, Ordering::SeqCst);
++        assert!(
++            matches!(host.dispatch(envelope(&host, "failed")).await.unwrap(), w::BridgeFrame::Reply { status, .. } if status=="rejected")
++        );
++        assert_eq!(runtime.stops.load(Ordering::SeqCst), 1);
++        runtime.fail.store(false, Ordering::SeqCst);
++        assert!(
++            matches!(host.dispatch(envelope(&host, "retry")).await.unwrap(), w::BridgeFrame::Reply { status, .. } if status=="completed")
++        );
++        host.shutdown().await.unwrap();
++    }
++}
+--- before/product/crates/ag1-platform/tests/runtime_custody_contract.rs
++++ after/product/crates/ag1-platform/tests/runtime_custody_contract.rs
+@@ -306,3 +306,36 @@
+     assert_eq!(audit.lock().unwrap().launches.len(), 1); // no fallback launch
+     bundle.stop().await.unwrap();
+ }
++
++#[tokio::test]
++async fn manual_preparation_reuses_resident_model_and_clears_status_on_unload() {
++    let dir = tempfile::tempdir().unwrap();
++    let registry = Registry::at(&dir.path().join("authority")).unwrap();
++    let audit = Arc::new(Mutex::new(Audit::default()));
++    let bundle = RuntimeBundle::new(FakeHost::new(audit.clone()), plans(dir.path(),18087,&["one","two"],32768),registry.runtime_lease().unwrap(),Duration::from_secs(2)).unwrap();
++    bundle.load_model("one").await.unwrap();
++    assert_eq!(bundle.progress().unwrap()["phase"], "ready");
++    bundle.load_model("one").await.unwrap();
++    assert_eq!(audit.lock().unwrap().launches.len(), 1);
++    bundle.load_model("two").await.unwrap();
++    assert_eq!(bundle.progress().unwrap()["model"], "two");
++    assert_eq!(audit.lock().unwrap().maximum_active, 1);
++    assert!(bundle.load_model("unknown").await.is_err());
++    bundle.unload_owned().await.unwrap();
++    assert!(bundle.progress().is_none());
++    bundle.stop().await.unwrap();
++}
++
++#[test]
++fn verification_percentage_counts_bytes_and_never_completes_failed_verification() {
++    use ag1_platform::llama::{native::MaterialVerifier, Material};
++    let dir = tempfile::tempdir().unwrap(); let path=dir.path().join("weight");
++    let bytes=vec![42u8;1024*1024]; std::fs::write(&path,&bytes).unwrap();
++    let material=Material {path:path.to_string_lossy().into_owned(),sha256:ag1_storage::digest(&bytes),kind:"weight".into()};
++    let mut verifier=MaterialVerifier::default(); let mut values=vec![];
++    verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();
++    assert_eq!(values.first(),Some(&0));assert_eq!(values.last(),Some(&100));assert!(values.len()>5);assert!(values.windows(2).all(|w|w[0]<=w[1]));
++    values.clear();verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();assert_eq!(values.last(),Some(&100));
++    std::fs::write(&path,vec![41u8;1024*1024]).unwrap();values.clear();
++    assert!(verifier.verify_progress(&[material],&mut |p|values.push(p)).is_err());assert!(!values.contains(&100));
++}

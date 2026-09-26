@@ -7,7 +7,7 @@ export const fixtures = [
       "version": {
         "major": 1,
         "minor": 0,
-        "schema": "3ba89798c05da922c08618b48e07fa8fb55e6f8f248b83b2b9bed32b921d2e85"
+        "schema": "309082e7366e23a8058d81e57fbc8c98d20fb3d4ef530de215191a8e27958e63"
       },
       "scope": {
         "workspace": "fixture-workspace",
@@ -32,7 +32,7 @@ export const fixtures = [
       "version": {
         "major": 1,
         "minor": 0,
-        "schema": "3ba89798c05da922c08618b48e07fa8fb55e6f8f248b83b2b9bed32b921d2e85"
+        "schema": "309082e7366e23a8058d81e57fbc8c98d20fb3d4ef530de215191a8e27958e63"
       },
       "id": "request-1",
       "scope": {
@@ -57,7 +57,7 @@ export const fixtures = [
       "version": {
         "major": 1,
         "minor": 0,
-        "schema": "3ba89798c05da922c08618b48e07fa8fb55e6f8f248b83b2b9bed32b921d2e85"
+        "schema": "309082e7366e23a8058d81e57fbc8c98d20fb3d4ef530de215191a8e27958e63"
       },
       "id": "request-1",
       "scope": {
@@ -83,7 +83,7 @@ export const fixtures = [
       "version": {
         "major": 1,
         "minor": 0,
-        "schema": "3ba89798c05da922c08618b48e07fa8fb55e6f8f248b83b2b9bed32b921d2e85"
+        "schema": "309082e7366e23a8058d81e57fbc8c98d20fb3d4ef530de215191a8e27958e63"
       },
       "id": "request-1",
       "scope": {
@@ -336,7 +336,7 @@ export const fixtures = [
         "version": {
           "major": 1,
           "minor": 0,
-          "schema": "3ba89798c05da922c08618b48e07fa8fb55e6f8f248b83b2b9bed32b921d2e85"
+          "schema": "309082e7366e23a8058d81e57fbc8c98d20fb3d4ef530de215191a8e27958e63"
         },
         "scope": {
           "workspace": "fixture-workspace",

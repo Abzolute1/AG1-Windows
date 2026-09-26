@@ -174,9 +174,15 @@ fn system_prompt_resources_tool_modes_and_stable_prefixes_match_sdk() {
     .unwrap();
     for row in oracle["prompts"].as_array().unwrap() {
         let input: PromptInput = serde_json::from_value(row["input"].clone()).unwrap();
+        // The native UI tools require an owned Runtime web target. The SDK
+        // capture predates that boundary; keep every other prompt byte pinned.
+        let expected = row["output"].as_str().unwrap().replace(
+            "- verify UI you built: verify_ui (concrete claim) or screenshot_url (HTML path or localhost URL); interact_then_screenshot after clicks/fills. Do not start a server just to screenshot static HTML.",
+            "- verify UI you built: verify_ui or screenshot_url require a ready AG1-owned web target started through Runtime; interact_then_screenshot after clicks/fills. These tools do not accept arbitrary websites or local file previews. Show local images (including simple vector SVG) with read; do not start a server just to show an image.",
+        );
         assert_eq!(
             prompt::build(&input).unwrap(),
-            row["output"],
+            expected,
             "prompt {:?}",
             row["input"]
         );

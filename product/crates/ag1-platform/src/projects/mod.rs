@@ -2,6 +2,7 @@
 //! No target command receives the host environment or an AG1 command capability.
 pub mod checks;
 mod display;
+pub mod environment;
 pub mod godot;
 pub mod preview;
 mod runtime;

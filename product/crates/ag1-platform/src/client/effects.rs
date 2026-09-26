@@ -3,14 +3,15 @@
 use super::*;
 pub(super) fn is_effect(command: &w::Command) -> bool {
     match command {
-        w::Command::Files { action, .. } => action == "save",
+        w::Command::Files { action, .. } => matches!(action.as_str(), "save" | "change_undo" | "change_undo_recover" | "git_confirm"),
         w::Command::Session { action, .. } => action == "export",
         w::Command::Project { action, .. } => {
             matches!(action.as_str(), "start" | "stop" | "discover")
         }
         w::Command::Artifacts { action, .. } => action.starts_with("upload_"),
-        w::Command::Runtime { action, .. } => {
-            action == "extension_answer"
+        w::Command::Runtime { action, args } => {
+            (action == "approval_policy" && args.get("mode").is_some())
+                || action == "extension_answer"
                 || (action.starts_with("terminal_") && action != "terminal_status")
         }
         _ => false,
@@ -42,8 +43,11 @@ impl Host {
                 None => Err(DomainError::DurabilityUnknown),
             };
         }
-        let result = self
-            .query(&envelope.command)
+        let result = (match &envelope.command {
+            w::Command::Files {action,args} if action=="git_confirm"=>self.local_git_confirm(args).map(Some),
+            w::Command::Files {action,args} if action == "change_undo" || action == "change_undo_recover" => self.change_undo(args, action == "change_undo_recover").map(Some),
+            _ => self.query(&envelope.command),
+        })
             .and_then(|v| v.ok_or(DomainError::NotFound))
             .and_then(|data| {
                 if serde_json::to_vec(&data).map_err(json_error)?.len() > 48000 {

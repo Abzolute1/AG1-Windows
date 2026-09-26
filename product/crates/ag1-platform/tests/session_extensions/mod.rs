@@ -467,6 +467,13 @@ async fn discovered_resources_acknowledge_prompt_before_client_input_and_do_not_
                     .system_prompt
                     .contains("discovered-skill")
             );
+            assert!(
+                !f.host
+                    .configuration()
+                    .unwrap()
+                    .system_prompt
+                    .contains("Top-level workspace entries (snapshot at session start):")
+            );
             assert_eq!(host.snapshot().unwrap().revision.get(), 1);
         } else {
             assert!(!f.host.persistence_healthy().unwrap());

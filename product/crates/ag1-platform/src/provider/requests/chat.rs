@@ -276,6 +276,16 @@ pub(super) fn build(
             match format {
                 "qwen-chat-template" => {
                     out["chat_template_kwargs"] = json!({"enable_thinking":enabled});
+                    if string(&model["thinking"], "apply") == "reasoning_effort" {
+                        let selected = if enabled { effort } else { "off" };
+                        let native = model["thinking"]["modes"]
+                            .as_array()
+                            .and_then(|a| a.iter().find(|m| m["id"] == selected))
+                            .and_then(|m| m["nativeValue"].as_str())
+                            .unwrap_or(selected);
+                        out["chat_template_kwargs"]["reasoning_effort"] = json!(native);
+                        out["reasoning_effort"] = json!(native);
+                    }
                     if enabled {
                         let apply = string(&model["thinking"], "apply");
                         if apply == "thinking_budget_tokens" {
@@ -287,15 +297,6 @@ pub(super) fn build(
                                     "xhigh" => 32768,
                                     _ => 16384,
                                 });
-                        }
-                        if apply == "reasoning_effort" {
-                            let native = model["thinking"]["modes"]
-                                .as_array()
-                                .and_then(|a| a.iter().find(|m| m["id"] == effort))
-                                .and_then(|v| v["nativeValue"].as_str())
-                                .unwrap_or(effort);
-                            out["chat_template_kwargs"]["reasoning_effort"] = json!(native);
-                            out["reasoning_effort"] = json!(native);
                         }
                     }
                 }

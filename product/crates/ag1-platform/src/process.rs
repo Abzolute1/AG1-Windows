@@ -26,8 +26,10 @@ pub const MAX_LOG_DISK: usize = 8 * 1024 * 1024;
 pub const STOP_DEADLINE_MS: u64 = 3000;
 /// Host-only argv placeholder consumed by spawn_tool_with_cwd.
 pub const PINNED_CWD_FD: &str = "@AG1_PINNED_CWD_FD@";
+pub(crate) const PINNED_DIRECTORY_PREFIX: &str = "@AG1_PINNED_DIRECTORY@";
 pub(crate) const READONLY_FILTER_FD: &str = "@AG1_READONLY_FILTER_FD@";
 mod readonly_filter;
+mod mcp_containment;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessIdentity {
@@ -248,6 +250,7 @@ fn reader(
 }
 
 /// Owns a compiled AG1 helper, never a discovered PID. At most 32 concurrent children per supervisor.
+#[derive(Clone)]
 pub struct ProcessSupervisor {
     helper: PathBuf,
     helper_identity: (u64, u64),
@@ -255,11 +258,14 @@ pub struct ProcessSupervisor {
 }
 #[derive(Clone, Copy)]
 struct SpawnLimits {
+    discard_stderr: bool,
     capture_stdout: bool,
     address_space: Option<u64>,
     disk_bytes: usize,
     inherit_cwd: bool,
     readonly_filter: bool,
+    readonly_git: bool,
+    mcp_environment: bool,
 }
 struct ActiveLease(Arc<std::sync::atomic::AtomicUsize>);
 impl Drop for ActiveLease {
@@ -291,13 +297,53 @@ impl ProcessSupervisor {
             spool_path,
             None,
             SpawnLimits {
+                discard_stderr: false,
                 capture_stdout: false,
                 address_space: None,
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
                 readonly_filter: false,
+                readonly_git: false,mcp_environment:false,
             },
         )
+    }
+    /// Native MCP discovery transport. Caller must hold reviewed launch authority;
+    /// this low-level capability is not a renderer command or a tool grant.
+    /// Until a streaming redactor is available, server stderr is discarded at
+    /// capture rather than persisted. Protocol diagnostics contain metadata only.
+    pub fn spawn_mcp_protocol(
+        &self,
+        spec: ProcessSpec,
+        spool_path: &Path,
+    ) -> Result<OwnedProcess, DomainError> {
+        if spec.resident || spec.timeout_ms > 600_000 {
+            return Err(DomainError::InvalidInput("bounded MCP process lifetime".into()));
+        }
+        self.spawn_configured(
+            spec,
+            spool_path,
+            None,
+            SpawnLimits {
+                discard_stderr: true,
+                capture_stdout: false,
+                address_space: Some(1024 * 1024 * 1024),
+                disk_bytes: 1024,
+                inherit_cwd: false,
+                readonly_filter: false,
+                readonly_git: false,mcp_environment:false,
+            },
+        )
+    }
+    /// Native MCP read-only namespace launcher. Public/private target environment
+    /// is transferred after isolation, never to the bubblewrap dynamic loader.
+    pub fn spawn_mcp_readonly_protocol(&self, spec: ProcessSpec, spool: &Path) -> Result<OwnedProcess, DomainError> {
+        if spec.resident || spec.timeout_ms > 600_000 || spec.executable != Path::new("/usr/bin/bwrap") {
+            return Err(DomainError::InvalidInput("bounded MCP containment launcher".into()));
+        }
+        self.spawn_configured(spec, spool, None, SpawnLimits {
+            discard_stderr:true, capture_stdout:false, address_space:Some(1024*1024*1024),
+            disk_bytes:1024, inherit_cwd:true, readonly_filter:true, readonly_git:false, mcp_environment:true,
+        })
     }
     /// Host-only memory bound for tool transports. Existing model/PTY paths retain their settings.
     pub fn spawn_protocol_limited(
@@ -316,11 +362,13 @@ impl ProcessSupervisor {
             spool_path,
             None,
             SpawnLimits {
+                discard_stderr: false,
                 capture_stdout: false,
                 address_space: Some(address_space),
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
                 readonly_filter: false,
+                readonly_git: false,mcp_environment:false,
             },
         )
     }
@@ -359,13 +407,23 @@ impl ProcessSupervisor {
             spool_path,
             None,
             SpawnLimits {
+                discard_stderr: false,
                 capture_stdout: false,
                 address_space: None,
                 disk_bytes: 8 * 1024 * 1024,
                 inherit_cwd: true,
                 readonly_filter: false,
+                readonly_git: false,mcp_environment:false,
             },
         )
+    }
+    pub(crate) fn spawn_readonly_protocol(&self,spec:ProcessSpec,spool:&Path)->Result<OwnedProcess,DomainError> {
+        self.spawn_configured(spec,spool,None,SpawnLimits {discard_stderr:false,capture_stdout:false,address_space:Some(1024*1024*1024),disk_bytes:MAX_LOG_DISK,inherit_cwd:true,readonly_filter:true,readonly_git:true,mcp_environment:false})
+    }
+    /// Credential-bearing Git transport: no raw remote stderr is retained in a
+    /// log or transcript. Stdout remains a separately drained bounded pipe.
+    pub(crate) fn spawn_private_git(&self,spec:ProcessSpec,spool:&Path)->Result<OwnedProcess,DomainError> {
+        self.spawn_configured(spec,spool,None,SpawnLimits{discard_stderr:true,capture_stdout:false,address_space:Some(1024*1024*1024),disk_bytes:1024,inherit_cwd:true,readonly_filter:false,readonly_git:false,mcp_environment:false})
     }
     pub(crate) fn spawn_readonly_tool(
         &self,
@@ -396,11 +454,13 @@ impl ProcessSupervisor {
             spool_path,
             None,
             SpawnLimits {
+                discard_stderr: false,
                 capture_stdout: true,
                 address_space,
                 disk_bytes,
                 inherit_cwd,
                 readonly_filter,
+                readonly_git:false,mcp_environment:false,
             },
         )
     }
@@ -457,11 +517,13 @@ impl ProcessSupervisor {
             spool_path,
             pty,
             SpawnLimits {
+                discard_stderr: false,
                 capture_stdout: true,
                 address_space: None,
                 disk_bytes: MAX_LOG_DISK,
                 inherit_cwd: false,
                 readonly_filter: false,
+                readonly_git: false,mcp_environment:false,
             },
         )
     }
@@ -525,6 +587,45 @@ impl ProcessSupervisor {
         let fd = child_control.as_raw_fd();
         let cwd_handle = File::open(&spec.cwd).map_err(io_error)?;
         let cwd_fd = cwd_handle.as_raw_fd();
+        let mut extra_directories = Vec::new();
+        if limits.inherit_cwd {
+            for index in 1..spec.argv.len() {
+                if let Some(path) = spec.argv[index].strip_prefix(PINNED_DIRECTORY_PREFIX) {
+                    let prefix = format!("/proc/{}/fd/", std::process::id());
+                    if !matches!(spec.argv[index-1].as_str(), "--bind-fd"|"--ro-bind-fd"|"--overlay-src") || !path.strip_prefix(&prefix).is_some_and(|fd| !fd.is_empty() && fd.bytes().all(|b|b.is_ascii_digit())) || extra_directories.len() >= 16 {
+                        return Err(DomainError::InvalidInput("host-pinned folder descriptor required".into()));
+                    }
+                    let directory = File::open(path).map_err(io_error)?;
+                    if !directory.metadata().map_err(io_error)?.is_dir() { return Err(DomainError::PermissionDenied); }
+                    // overlay-src accepts a path rather than a descriptor number.
+                    // Keep the same inherited, host-pinned directory custody.
+                    spec.argv[index] = if spec.argv[index - 1] == "--overlay-src" {
+                        format!("/proc/self/fd/{}", directory.as_raw_fd())
+                    } else { directory.as_raw_fd().to_string() };
+                    extra_directories.push(directory);
+                }
+            }
+        }
+        // Copy the two reviewed executable files through inherited descriptors.
+        // /proc/<host pid>/fd paths become inaccessible after a user namespace.
+        // Bubblewrap copies these bytes into read-only executable mounts.
+        let mut mcp_files = Vec::new();
+        if limits.mcp_environment {
+            for index in 1..spec.argv.len() {
+                if let Some(path) = spec.argv[index].strip_prefix("@AG1_MCP_PINNED_FILE@") {
+                    if spec.argv[index - 1] != "--ro-bind-data" || mcp_files.len() >= 2 {
+                        return Err(DomainError::PermissionDenied);
+                    }
+                    let file = File::open(path).map_err(io_error)?;
+                    let metadata = file.metadata().map_err(io_error)?;
+                    if !metadata.is_file() || metadata.len() > 128 * 1024 * 1024 { return Err(DomainError::PermissionDenied); }
+                    spec.argv[index] = file.as_raw_fd().to_string();
+                    mcp_files.push(file);
+                }
+            }
+            if mcp_files.len() != 2 { return Err(DomainError::PermissionDenied); }
+        }
+        let extra_fds: Vec<_> = extra_directories.iter().chain(mcp_files.iter()).map(AsRawFd::as_raw_fd).collect();
         if limits.inherit_cwd {
             let index = spec
                 .argv
@@ -543,7 +644,7 @@ impl ProcessSupervisor {
         // closes the descriptor. Neither the helper nor normal processes get it.
         let filter = limits
             .readonly_filter
-            .then(readonly_filter::file)
+            .then(||readonly_filter::file(limits.readonly_git))
             .transpose()?;
         let filter_fd = filter.as_ref().map(AsRawFd::as_raw_fd);
         if let Some(filter_fd) = filter_fd {
@@ -557,6 +658,15 @@ impl ProcessSupervisor {
                 + 1;
             spec.argv[index] = filter_fd.to_string();
         }
+        let mcp_environment = if limits.mcp_environment {
+            let file = mcp_containment::environment_file(&spec.env)?;
+            let index = spec.argv.windows(2).position(|p| p[0] == "--ro-bind-data" && p[1] == "@AG1_MCP_ENV_FD@")
+                .ok_or_else(|| DomainError::InvalidInput("MCP environment binding required".into()))? + 1;
+            spec.argv[index] = file.as_raw_fd().to_string();
+            spec.env.clear();
+            Some(file)
+        } else { None };
+        let mcp_environment_fd = mcp_environment.as_ref().map(AsRawFd::as_raw_fd);
         let mut command = Command::new(&self.helper);
         command
             .arg(fd.to_string())
@@ -571,10 +681,16 @@ impl ProcessSupervisor {
             command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+                .stderr(if limits.discard_stderr {Stdio::null()}else{Stdio::piped()});
         }
         unsafe {
             command.pre_exec(move || {
+                if let Some(env_fd) = mcp_environment_fd {
+                    if libc::fcntl(env_fd, libc::F_SETFD, 0) < 0 { return Err(std::io::Error::last_os_error()); }
+                }
+                for extra_fd in &extra_fds {
+                    if libc::fcntl(*extra_fd, libc::F_SETFD, 0) < 0 { return Err(std::io::Error::last_os_error()); }
+                }
                 if let Some(filter_fd) = filter_fd
                     && libc::fcntl(filter_fd, libc::F_SETFD, 0) < 0
                 {
@@ -588,6 +704,12 @@ impl ProcessSupervisor {
                     if libc::setrlimit(libc::RLIMIT_AS, &limit) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
+                }
+                if limits.discard_stderr {
+                    // Private Git and MCP discard untrusted stderr at capture.
+                    // Bound child-created files independently of log quotas.
+                    let limit=libc::rlimit{rlim_cur:256*1024*1024,rlim_max:256*1024*1024};
+                    if libc::setrlimit(libc::RLIMIT_FSIZE,&limit)<0{return Err(std::io::Error::last_os_error());}
                 }
                 if limits.inherit_cwd && libc::fcntl(cwd_fd, libc::F_SETFD, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
@@ -987,6 +1109,9 @@ impl Drop for HelperCleanup {
 }
 
 pub fn helper_main() -> Result<i32, DomainError> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--mcp-contained-entry")) {
+        return mcp_containment::entry();
+    }
     let fd: i32 = std::env::args()
         .nth(1)
         .ok_or(DomainError::PermissionDenied)?

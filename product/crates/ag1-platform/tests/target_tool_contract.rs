@@ -15,7 +15,7 @@ use ag1_platform::{
     resource_fs::ScanControl,
     target_tools::{self, Port, Prepared, Service},
 };
-use ag1_storage::{Store, context::ContextStore};
+use ag1_storage::{Boundary, FaultInjector, StorageResult, Store, context::ContextStore};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -23,6 +23,12 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
     time::{Duration, Instant},
 };
+struct NoFault;
+impl FaultInjector for NoFault {
+    fn check(&self, _: Boundary) -> StorageResult<()> { Ok(()) }
+}
+struct LeaseClock;
+impl Clock for LeaseClock { fn now_ms(&self) -> u64 { 10 } }
 struct TestClock;
 impl Clock for TestClock {
     fn now_ms(&self) -> u64 {
@@ -116,7 +122,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(&dir.path().join("store")).unwrap());
+        let store = Arc::new(Store::open_with(&dir.path().join("store"), Arc::new(LeaseClock), Arc::new(NoFault)).unwrap());
         store.create_session("fixture",json!({"type":"session","version":3,"id":"fixture","cwd":dir.path(),"timestamp":"2026-09-05T00:00:00.000Z"}).to_string().as_bytes()).unwrap();
         store
             .register_origin("fixture", "fixture", &[3; 32])
@@ -164,7 +170,7 @@ impl Fixture {
                 operation,
                 operation,
                 "check",
-                &json!({"fixtureOperation":operation}),
+                &json!({"fixtureOperation":operation,"verificationScope":"owned-check"}),
                 true,
             )
             .unwrap();
@@ -278,13 +284,8 @@ fn native_target_check_retains_failed_evidence_and_releases_it_only_on_success()
         )
         .unwrap();
     f.store
-        .lease(
-            "fixture",
-            "fixture",
-            &evidence.id,
-            "retain through verification",
-            60000,
-            true,
+        .scoped_lease_record(
+            "fixture", "fixture", &evidence.id, "retain through verification", 60000, true, Some("owned-check"),
         )
         .unwrap();
     drop(artifacts);

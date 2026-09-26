@@ -57,11 +57,16 @@ fn validate(selection: &RuntimeSelection) -> StorageResult<()> {
     }
     Ok(())
 }
-fn load(db: &Connection, workspace: &str) -> StorageResult<Option<(StoredSelection, Vec<u8>)>> {
+fn load(
+    db: &Connection,
+    workspace: &str,
+    conversation: Option<&str>,
+) -> StorageResult<Option<(StoredSelection, Vec<u8>)>> {
+    let (kind, key) = selection_key(workspace, conversation);
     let row: Option<(String, Vec<u8>)> = db
         .query_row(
             "SELECT digest,raw FROM metadata WHERE kind=?1 AND id=?2",
-            params![KIND, workspace],
+            params![kind, key],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
@@ -73,19 +78,49 @@ fn load(db: &Connection, workspace: &str) -> StorageResult<Option<(StoredSelecti
         }
         let selection: RuntimeSelection = serde_json::from_slice(&raw)?;
         validate(&selection)?;
-        if selection.workspace != workspace {
+        if selection.workspace != workspace
+            || conversation.is_some_and(|id| id != selection.session)
+        {
             return Err(StorageError::Corrupt("Native selection workspace".into()));
         }
         Ok((StoredSelection { sha256, selection }, raw))
     })
     .transpose()
 }
+fn selection_key(workspace: &str, conversation: Option<&str>) -> (&'static str, String) {
+    match conversation {
+        None => (KIND, workspace.into()),
+        Some(session) => (
+            "native-conversation-selection",
+            digest(&serde_json::to_vec(&(workspace, session)).expect("string tuple")),
+        ),
+    }
+}
 impl Store {
+    /// Independent conversation ownership, sharing the workspace journal store.
+    pub fn conversation_selection(
+        &self,
+        workspace: &str,
+        session: &str,
+    ) -> StorageResult<Option<StoredSelection>> {
+        valid_id(workspace)?;
+        valid_id(session)?;
+        let db = self.conn()?;
+        Self::ready(&db)?;
+        Ok(load(&db, workspace, Some(session))?.map(|(record, _)| record))
+    }
+    pub fn commit_conversation_selection(
+        &self,
+        change: &SelectionChange,
+    ) -> StorageResult<SelectionAck> {
+        self.commit_selection(change, true)
+    }
+
     pub fn runtime_selection(&self, workspace: &str) -> StorageResult<Option<StoredSelection>> {
         valid_id(workspace)?;
         let db = self.conn()?;
         Self::ready(&db)?;
-        Ok(load(&db, workspace)?.map(|(record, _)| record))
+        Ok(load(&db, workspace, None)?.map(|(record, _)| record))
     }
     /// Atomically publish the selected owner and its immutable command receipt.
     /// Retry returns the original receipt, even after a later selection; callers
@@ -94,7 +129,16 @@ impl Store {
         &self,
         change: &SelectionChange,
     ) -> StorageResult<SelectionAck> {
+        self.commit_selection(change, false)
+    }
+    fn commit_selection(
+        &self,
+        change: &SelectionChange,
+        conversation: bool,
+    ) -> StorageResult<SelectionAck> {
         validate(&change.selection)?;
+        let session = conversation.then_some(change.selection.session.as_str());
+        let (kind, key) = selection_key(&change.selection.workspace, session);
         if change
             .expected
             .as_ref()
@@ -102,7 +146,7 @@ impl Store {
         {
             return Err(StorageError::Invalid("Native selection revision".into()));
         }
-        let intent = serde_json::to_vec(&serde_json::json!({"kind":KIND,"change":change}))?;
+        let intent = serde_json::to_vec(&serde_json::json!({"kind":kind,"change":change}))?;
         if intent.len() > 32 * 1024 {
             return Err(StorageError::Limit("Native selection intent".into()));
         }
@@ -126,7 +170,7 @@ impl Store {
             }
             return Ok(ack);
         }
-        let previous = load(&db, &change.selection.workspace)?;
+        let previous = load(&db, &change.selection.workspace, session)?;
         if previous.as_ref().map(|(old, _)| &old.sha256) != change.expected.as_ref() {
             return Err(StorageError::Conflict("Native selection revision".into()));
         }
@@ -156,16 +200,12 @@ impl Store {
         if let Some((old, bytes)) = previous {
             tx.execute(
                 "INSERT OR IGNORE INTO metadata VALUES('metadata-history',?1,?2,?3,1)",
-                params![
-                    format!("{KIND}:{}:{}", change.selection.workspace, old.sha256),
-                    old.sha256,
-                    bytes
-                ],
+                params![format!("{kind}:{key}:{}", old.sha256), old.sha256, bytes],
             )?;
         }
         tx.execute(
             "INSERT OR REPLACE INTO metadata VALUES(?1,?2,?3,?4,0)",
-            params![KIND, change.selection.workspace, sha256, raw],
+            params![kind, key, sha256, raw],
         )?;
         let ack = SelectionAck {
             sequence: Self::next_sequence(&tx)?,

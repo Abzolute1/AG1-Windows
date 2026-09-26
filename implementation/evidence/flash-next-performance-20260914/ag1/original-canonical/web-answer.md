@@ -1,0 +1,3 @@
+**Why `time.monotonic()` is useful for elapsed time** (per [docs.python.org/3/library/time.html](https://docs.python.org/3/library/time.html#time.monotonic)):
+
+It returns a clock that cannot go backwards and is unaffected by system clock updates (NTP adjustments, DST, admin changes). Since its reference point is undefined, only the difference between two calls is valid — which is exactly what measuring a duration needs. Unlike `time.time()`, which can jump forward or backward when the system clock is corrected and even yield negative durations, monotonic time guarantees stable, meaningful deltas, making it reliable for timeouts, deadlines, and benchmarking.

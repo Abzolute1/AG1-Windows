@@ -40,12 +40,22 @@ pub fn working_state_with_task_tool(
     branch: &[Value],
     messages: &[Value],
     artifacts: &impl ContextArtifactPort,
-    mut validate: impl FnMut(&str) -> Option<SourceValidation>,
+    validate: impl FnMut(&str) -> Option<SourceValidation>,
     task_tool_available: bool,
+) -> Option<String> {
+    working_state_with_control_tool(branch, messages, artifacts, validate,
+        task_tool_available.then_some(projections::TaskControlTool::Legacy))
+}
+pub fn working_state_with_control_tool(
+    branch: &[Value],
+    messages: &[Value],
+    artifacts: &impl ContextArtifactPort,
+    mut validate: impl FnMut(&str) -> Option<SourceValidation>,
+    tool: Option<projections::TaskControlTool>,
 ) -> Option<String> {
     let task = latest_task(branch);
     let task_text = task.as_ref().and_then(|task| {
-        projections::task_with_tool(
+        projections::task_with_control_tool(
             task,
             |source| {
                 let mut verdict = validate(source)?;
@@ -61,7 +71,7 @@ pub fn working_state_with_task_tool(
                 Some(verdict)
             },
             |id| task.checkpoint_verified(id, branch),
-            task_tool_available,
+            tool,
         )
     });
     let runtime = [
@@ -97,8 +107,11 @@ pub fn working_state_with_task_tool(
         Some(format!("{WORKING_STATE}{tail}"))
     }
 }
-/// Match the SDK's stable insertion point: augment the latest user message,
-/// keeping all assistant/tool rounds after it untouched in the cached prefix.
+/// Place changing request-local state after completed conversation rounds.
+/// Rewriting the earlier user message invalidates the provider's cached prefix
+/// ahead of every accumulated assistant/tool round. This transient custom
+/// message is converted to provider input only; it never enters the journal or
+/// the reusable compiler working set.
 pub fn append_working_state(
     messages: &[Value],
     tail: Option<&str>,
@@ -107,18 +120,11 @@ pub fn append_working_state(
     let Some(tail) = tail else {
         return Ok(result);
     };
-    if let Some(index) = result.iter().rposition(|message| message["role"] == "user") {
-        let content = &mut result[index]["content"];
-        match content {
-            Value::String(text) => {
-                text.push_str("\n\n");
-                text.push_str(tail);
-            }
-            Value::Array(blocks) => blocks.push(json!({"type":"text","text":tail})),
-            _ => return Err(DomainError::InvalidInput("user context content".into())),
-        }
-    } else {
-        result.push(json!({"role":"custom","customType":"ag1-working-state","content":tail,"display":false,"timestamp":0}));
+    if result.last().is_some_and(|message| {
+        message["role"] == "custom" && message["customType"] == "ag1-working-state"
+    }) {
+        result.pop();
     }
+    result.push(json!({"role":"custom","customType":"ag1-working-state","content":tail,"display":false,"timestamp":0}));
     Ok(result)
 }

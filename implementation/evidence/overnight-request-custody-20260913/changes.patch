@@ -1,0 +1,151 @@
+--- a/product/crates/ag1-platform/src/session/context.rs
++++ b/product/crates/ag1-platform/src/session/context.rs
+@@ -1,4 +1,5 @@
+ use super::NativeSession;
++mod custody;
+ use crate::source::SourceService;
+ use ag1_core::{
+     DomainError,
+@@ -137,7 +138,7 @@
+                 }
+                 if delegated {
+                     let mut artifacts = ContextStore::new(&store,session,&origin,&operation,&timestamp,Features::default())?;
+-                    artifacts.put_evidence(&json!({"version":1,"systemPrompt":configuration.system_prompt,"tools":configuration.tools,"model":configuration.model,"messages":messages}).to_string(),"runtime-request-input",&json!({"type":"session","name":"subagent-context"}),&[],None)?;
++                    artifacts.put_evidence(&custody::input(&configuration, &messages, None),"runtime-request-input",&json!({"type":"session","name":"subagent-context"}),&[],None)?;
+                     let profile = ag1_core::model::infer_capabilities(configuration.model["contextWindow"].as_u64(),
+                         ag1_core::context::prompt::compact(configuration.model["provider"].as_str()),
+                         configuration.model["input"].as_array().is_some_and(|input| input.iter().any(|v| v == "image")),
+@@ -246,16 +247,8 @@
+                     Some(configuration.fixed_tokens().saturating_add(tail_tokens));
+                 // Retain the complete, unreduced request input before any
+                 // compiler reduction, alongside P08's raw journal custody.
+-                let input = json!({
+-                    "version": 1,
+-                    "systemPrompt": configuration.system_prompt,
+-                    "tools": configuration.tools,
+-                    "model": configuration.model,
+-                    "messages": original,
+-                    "memoryRevision": memory_revision,
+-                });
+                 artifacts.put_evidence(
+-                    &input.to_string(),
++                    &custody::input(&configuration, &original, Some(&memory_revision)),
+                     "runtime-request-input",
+                     &json!({"type":"session","name":"request-context"}),
+                     &[],
+@@ -290,9 +283,7 @@
+                 if let Some(previous) = &reuse {
+                     projection.stats["requestPrefixComparison"] = previous.compare_request(&request_identity);
+                 }
+-                artifacts.put_evidence(&json!({"version":1,"systemPrompt":configuration.system_prompt,
+-                    "tools":configuration.tools,"model":configuration.model,"thinking":configuration.thinking,"messages":projection.messages,
+-                    "stats":projection.stats,"memoryRevision":memory_revision}).to_string(),
++                artifacts.put_evidence(&custody::compiled(&configuration, &projection.messages, &memory_revision, &projection.stats),
+                     "runtime-request-compiled", &json!({"type":"session","name":"compiled-request-context"}), &[], None)?;
+                 let working_set = canonical_working.map(|compiled| super::working_set::WorkingSet::new(stamp,key,branch,messages,compiled,request_identity));
+                 Ok(PreparedContext {
+--- /dev/null
++++ b/product/crates/ag1-platform/src/session/context/custody.rs
+@@ -0,0 +1,102 @@
++//! Borrow request fields while serializing custody; do not duplicate the entire
++//! conversation in a temporary Value. Field order preserves the existing bytes
++//! produced by serde_json::Value's sorted object keys (and thus blob addresses).
++use ag1_core::runtime::session::Configuration;
++use serde::Serialize;
++use serde_json::Value;
++
++#[derive(Serialize)]
++#[serde(rename_all = "camelCase")]
++struct Envelope<'a> {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    memory_revision: Option<&'a Option<String>>,
++    messages: &'a [Value],
++    model: &'a Value,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    stats: Option<&'a Value>,
++    system_prompt: &'a str,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    thinking: Option<&'a str>,
++    tools: &'a [Value],
++    version: u8,
++}
++impl<'a> Envelope<'a> {
++    fn new(configuration: &'a Configuration, messages: &'a [Value]) -> Self {
++        Self {
++            memory_revision: None,
++            messages,
++            model: &configuration.model,
++            stats: None,
++            system_prompt: &configuration.system_prompt,
++            thinking: None,
++            tools: &configuration.tools,
++            version: 1,
++        }
++    }
++    fn encode(&self) -> String {
++        serde_json::to_string(self).expect("Borrowed JSON values serialize to custody")
++    }
++}
++
++pub(super) fn input(
++    configuration: &Configuration,
++    messages: &[Value],
++    memory_revision: Option<&Option<String>>,
++) -> String {
++    let mut envelope = Envelope::new(configuration, messages);
++    envelope.memory_revision = memory_revision;
++    envelope.encode()
++}
++
++pub(super) fn compiled(
++    configuration: &Configuration,
++    messages: &[Value],
++    memory_revision: &Option<String>,
++    stats: &Value,
++) -> String {
++    let mut envelope = Envelope::new(configuration, messages);
++    envelope.memory_revision = Some(memory_revision);
++    envelope.stats = Some(stats);
++    envelope.thinking = Some(&configuration.thinking);
++    envelope.encode()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use serde_json::json;
++
++    #[test]
++    fn exact_existing_custody_bytes_survive_borrowed_serialization() {
++        let configuration = Configuration {
++            model: json!({"id":"fixture","contextWindow":32768,"compat":{"unknown":true}}),
++            thinking: "medium".into(),
++            tools: vec![json!({"name":"evidence","parameters":{"type":"object"}})],
++            system_prompt: "Keep Unicode β and escaped \"quotes\"\n".into(),
++            prompt: None,
++            compiler: Default::default(),
++        };
++        let messages = vec![
++            json!({"role":"user","content":"original request"}),
++            json!({"role":"toolResult","toolCallId":"x","content":[{"type":"text","text":"line\n\tβ"}],"details":{"null":null,"integer":9007199254740991u64,"array":[false,1.25]}}),
++        ];
++        // These are the previous native expressions, including key order and
++        // absent-vs-null fields. Artifact addresses must remain byte identical.
++        let delegated = json!({"version":1,"systemPrompt":configuration.system_prompt,"tools":configuration.tools,"model":configuration.model,"messages":messages}).to_string();
++        assert_eq!(input(&configuration, &messages, None), delegated);
++        for revision in [None, Some("revision-β".into())] {
++            let original = json!({"version":1,"systemPrompt":configuration.system_prompt,"tools":configuration.tools,"model":configuration.model,"messages":messages,"memoryRevision":revision}).to_string();
++            assert_eq!(input(&configuration, &messages, Some(&revision)), original);
++            let stats = json!({"workingSetReused":true,"tokens":4096,"unknown":null});
++            let output = json!({"version":1,"systemPrompt":configuration.system_prompt,"tools":configuration.tools,"model":configuration.model,"thinking":configuration.thinking,"messages":messages,"stats":stats,"memoryRevision":revision}).to_string();
++            assert_eq!(
++                compiled(&configuration, &messages, &revision, &stats),
++                output
++            );
++        }
++        assert_ne!(
++            input(&configuration, &messages, None),
++            input(&configuration, &messages, Some(&None))
++        );
++    }
++}

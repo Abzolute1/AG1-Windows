@@ -1,6 +1,29 @@
 use ag1_platform::provider::requests::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
+
+#[test]
+fn text_only_models_can_continue_after_tool_images_without_losing_journal_images() {
+    use ag1_platform::provider::requests::{RequestContext, build_payload};
+    let context = json!({"messages":[
+        {"role":"user","content":"Make an image"},
+        {"role":"assistant","provider":"fixture","model":"fixture","api":"openai-completions","content":[{"type":"toolCall","id":"preview-call","name":"read","arguments":{"path":"ball.svg"}}],"stopReason":"toolUse"},
+        {"role":"toolResult","toolCallId":"preview-call","toolName":"read","isError":false,"content":[{"type":"text","text":"SVG source retained"},{"type":"image","mimeType":"image/png","data":"aW1hZ2UtYnl0ZXM="}]}
+    ]});
+    let original = context.clone();
+    for vision in [false, true] {
+        let model = json!({"id":"fixture","provider":"fixture","api":"openai-completions","input":if vision {json!(["text","image"])} else {json!(["text"])},"maxTokens":1024});
+        let result = build_payload(&RequestContext { model: &model, context: &context, options: &json!({}), anthropic_oauth: false, google_project: None, request_id: "image-preview" }).unwrap();
+        let encoded = result.to_string();
+        assert!(encoded.contains("SVG source retained"));
+        assert_eq!(encoded.contains("has not visually inspected"), !vision);
+        assert_eq!(encoded.contains("aW1hZ2UtYnl0ZXM="), vision);
+        assert_eq!(context, original, "provider projection must not mutate journal content");
+    }
+    let model = json!({"id":"fixture","provider":"fixture","api":"openai-completions","input":["text"]});
+    let user_image = json!({"messages":[{"role":"user","content":[{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}]});
+    assert!(build_payload(&RequestContext { model: &model, context: &user_image, options: &json!({}), anthropic_oauth: false, google_project: None, request_id: "user-image" }).is_err(), "user image input still requires vision support");
+}
 fn transport_body(mut v: Value, api: &str) -> Value {
     // Original Bedrock capture is the SDK command. HTTP serialization places modelId
     // in the URL and encodes Uint8Array image bytes as base64, independently checked below.
@@ -173,5 +196,28 @@ fn bedrock_http_payloads_match_actual_sdk_serialization() {
         })
         .unwrap();
         assert_eq!(payload, expected["body"]);
+    }
+}
+
+#[test]
+fn native_template_effort_keeps_casing_and_can_disable_via_none() {
+    let model = json!({"id":"native","api":"openai-completions","provider":"llamacpp","reasoning":true,"input":["text"],"maxTokens":4096,"compat":{"thinkingFormat":"qwen-chat-template"},"thinking":{"apply":"reasoning_effort","modes":[{"id":"off","nativeValue":"none"},{"id":"xhigh","nativeValue":"xHigh"},{"id":"max","nativeValue":"max"}]}});
+    for (level, native) in [("xhigh", "xHigh"), ("off", "none"), ("max", "max")] {
+        let options =
+            ag1_platform::provider::requests::session_options(&model, level, None).unwrap();
+        let payload = build_payload(&RequestContext {
+            model: &model,
+            context: &base_context(),
+            options: &options,
+            anthropic_oauth: false,
+            google_project: None,
+            request_id: "native",
+        })
+        .unwrap();
+        assert_eq!(payload["chat_template_kwargs"]["reasoning_effort"], native);
+        assert_eq!(
+            payload["chat_template_kwargs"]["enable_thinking"],
+            level != "off"
+        );
     }
 }

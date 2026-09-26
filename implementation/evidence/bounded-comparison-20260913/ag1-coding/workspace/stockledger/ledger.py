@@ -1,0 +1,128 @@
+import sqlite3
+
+
+class LedgerError(ValueError):
+    pass
+
+
+class Ledger:
+    def __init__(self, path):
+        self.db = sqlite3.connect(path)
+        self.db.execute("CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, sku TEXT, delta INTEGER)")
+        self.db.commit()
+
+    def _validate_event(self, event):
+        """Validate a single event dict. Raises LedgerError on any issue."""
+        if not isinstance(event, dict):
+            raise LedgerError("event must be a dict")
+
+        required_keys = {"id", "sku", "delta"}
+        if set(event.keys()) != required_keys:
+            raise LedgerError("event must have exactly id, sku, and delta keys")
+
+        # id: must be a nonempty string containing at least one non-whitespace char
+        eid = event["id"]
+        if not isinstance(eid, str) or not eid or not eid.strip():
+            raise LedgerError("id must be a nonempty string with non-whitespace")
+
+        # sku: must be a nonempty string containing at least one non-whitespace char
+        sku = event["sku"]
+        if not isinstance(sku, str) or not sku or not sku.strip():
+            raise LedgerError("sku must be a nonempty string with non-whitespace")
+
+        # delta: must be an int, but NOT a bool; must be nonzero
+        delta = event["delta"]
+        if isinstance(delta, bool) or not isinstance(delta, int):
+            raise LedgerError("delta must be an integer (not boolean)")
+        if delta == 0:
+            raise LedgerError("delta must be nonzero")
+
+    def _check_replay(self, eid):
+        """Check if event id already exists. Same data = no-op; different data = error."""
+        row = self.db.execute("SELECT sku, delta FROM events WHERE id = ?", (eid,)).fetchone()
+        if row is not None:
+            return row  # (sku, delta) of existing event
+
+    def apply_batch(self, events):
+        """Apply a batch of events atomically. Returns sorted stock map."""
+        if not isinstance(events, list):
+            raise LedgerError("batch must be a list")
+
+        # Phase 1: Validate all events first
+        parsed = []
+        for event in events:
+            self._validate_event(event)
+            parsed.append(event)
+
+        # Phase 2: Check for id conflicts (replay detection)
+        # We need to check every event's id against existing data AND within the batch
+        seen_ids = {}  # eid -> (sku, delta) from this batch
+        for event in parsed:
+            eid = event["id"]
+            sku = event["sku"]
+            delta = event["delta"]
+
+            # Check against existing DB record
+            existing = self._check_replay(eid)
+            if existing is not None:
+                existing_sku, existing_delta = existing
+                if existing_sku != sku or existing_delta != delta:
+                    raise LedgerError(f"conflicting event id: {eid}")
+                # Same data = idempotent no-op, skip
+                continue
+
+            # Check against other events in this same batch
+            if eid in seen_ids:
+                prev_sku, prev_delta = seen_ids[eid]
+                if prev_sku != sku or prev_delta != delta:
+                    raise LedgerError(f"conflicting event id in batch: {eid}")
+                # Same data within batch = no-op
+                continue
+
+            seen_ids[eid] = (sku, delta)
+
+        # Phase 3: Apply events in order, checking for negative stock
+        # Track running balance per sku within this batch
+        running_delta = {}
+        for event in parsed:
+            eid = event["id"]
+            sku = event["sku"]
+            delta = event["delta"]
+
+            # Skip idempotent replays
+            if self._check_replay(eid) is not None:
+                continue
+            if eid in seen_ids:
+                del seen_ids[eid]
+            else:
+                # This is a new event — remove from seen_ids tracking
+                pass
+
+            # Check negative stock: current total + running changes within batch
+            current_total = self._get_sku_total(sku)
+            running_adjustment = running_delta.get(sku, 0)
+            if current_total + running_adjustment + delta < 0:
+                raise LedgerError(f"negative stock for sku {sku}")
+
+            running_delta[sku] = running_adjustment + delta
+            self.db.execute("INSERT INTO events VALUES (?, ?, ?)", (eid, sku, delta))
+
+        self.db.commit()
+        return self.stock()
+
+    def _get_sku_total(self, sku):
+        """Get the current total for a sku from the database."""
+        row = self.db.execute("SELECT SUM(delta) FROM events WHERE sku = ?", (sku,)).fetchone()
+        return row[0] if row and row[0] is not None else 0
+
+    def stock(self):
+        """Return a dict of sku -> total, with alphabetically sorted keys.
+        Includes SKUs that have been seen but currently total zero."""
+        rows = self.db.execute("SELECT sku, SUM(delta) FROM events GROUP BY sku").fetchall()
+        result = {}
+        for sku, total in rows:
+            result[sku] = total
+        return dict(sorted(result.items()))
+
+    def close(self):
+        self.db.close()

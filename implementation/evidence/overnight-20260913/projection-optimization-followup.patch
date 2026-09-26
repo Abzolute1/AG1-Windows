@@ -1,0 +1,109 @@
+--- a/product/crates/ag1-platform/src/client/projection.rs
++++ b/product/crates/ag1-platform/src/client/projection.rs
+@@ -113,6 +113,22 @@
+     }
+     Some(message)
+ }
++// Full history stays in the journal. Count its message entries without building
++// display blocks for all of them; project only the recent bounded preview.
++fn recent_messages(records: &[Value]) -> Result<(usize, Vec<w::ClientMessage>)> {
++    let count = records.iter().filter(|entry| entry["type"] == "message").count();
++    let mut messages = Vec::new();
++    let mut budget = 8000;
++    for item in records.iter().rev().filter_map(message).take(100) {
++        let bytes = serde_json::to_vec(&item).map_err(json_error)?.len();
++        if bytes > budget { break; }
++        budget -= bytes;
++        messages.push(item);
++    }
++    messages.reverse();
++    Ok((count, messages))
++}
++
+ impl Host {
+     /// Read-only resnapshot across a concurrent registry publication. A client
+     /// must not treat a transient selection fence as failure of its accepted action.
+@@ -153,18 +169,7 @@
+             if snapshot.scope != after.scope || snapshot.revision != after.revision {
+                 continue;
+             }
+-            let all: Vec<_> = records.iter().filter_map(message).collect();
+-            let mut messages = Vec::new();
+-            let mut budget = 8000;
+-            for m in all.iter().rev().take(100) {
+-                let bytes = serde_json::to_vec(m).map_err(json_error)?.len();
+-                if bytes > budget {
+-                    break;
+-                }
+-                budget -= bytes;
+-                messages.push(m.clone());
+-            }
+-            messages.reverse();
++            let (message_count, messages) = recent_messages(&records)?;
+             let bridge_messages = messages
+                 .iter()
+                 .map(|m| w::BridgeMessage {
+@@ -253,7 +258,7 @@
+                     status: status.into(),
+                     active_operation: snapshot.queued.first().cloned(),
+                     messages: bridge_messages,
+-                    message_count: all.len() as u32,
++                    message_count: message_count as u32,
+                     pending,
+                     model: configuration.model["id"]
+                         .as_str()
+@@ -384,3 +389,54 @@
+         }
+     }
+ }
++
++#[cfg(test)]
++mod recent_preview_tests {
++    use super::*;
++
++    // Retain the prior full-projection algorithm as the behavioral reference.
++    fn full_projection(records: &[Value]) -> (usize, Vec<w::ClientMessage>) {
++        let all: Vec<_> = records.iter().filter_map(message).collect();
++        let mut selected = Vec::new();
++        let mut budget = 8000;
++        for item in all.iter().rev().take(100) {
++            let bytes = serde_json::to_vec(item).unwrap().len();
++            if bytes > budget { break; }
++            budget -= bytes;
++            selected.push(item.clone());
++        }
++        selected.reverse();
++        (all.len(), selected)
++    }
++
++    #[test]
++    fn recent_preview_preserves_full_history_count_order_and_exact_byte_boundary() {
++        let mut records = vec![json!({"type":"session"}), Value::Null];
++        let long = "界🙂<tag>".repeat(1800);
++        let variants = [
++            json!({"role":"user","content":"short"}),
++            json!({"role":"assistant","content":[{"type":"text","text":long},{"type":"thinking","thinking":long}]}),
++            json!({"role":"assistant","content":[{"type":"toolCall","id":"call","name":"edit","arguments":{"newText":long}}]}),
++            json!({"role":"toolResult","toolCallId":"call","toolName":"edit","isError":true,"content":[{"type":"text","text":long}]}),
++            json!({"role":"assistant","stopReason":"error","errorMessage":"retained failure","content":[{"type":"thinking","thinking":""}]}),
++            json!({"role":"toolResult","toolName":"mcp_unbound","content":[{"type":"unknown"},{"type":"image","mimeType":"image/png"}]}),
++            json!({"role":"user","content":null}),
++            json!({"role":null,"content":[{},null,{"type":"text","text":42}]}),
++        ];
++        for index in 0..1000 {
++            records.push(json!({"type":"message","id":format!("entry-{index}"),"message":variants[index % variants.len()]}));
++            if index % 3 == 0 { records.push(json!({"type":"custom","customType":"task_state"})); }
++            if [0,1,7,99,100,101,999].contains(&index) {
++                assert_eq!(serde_json::to_vec(&recent_messages(&records).unwrap()).unwrap(), serde_json::to_vec(&full_projection(&records)).unwrap());
++            }
++        }
++        assert_eq!(recent_messages(&[]).unwrap(), (0, vec![]));
++        let small = (0..200).map(|i|json!({"type":"message","id":i.to_string(),"message":{"role":"user","content":""}})).collect::<Vec<_>>();
++        let (count, preview) = recent_messages(&small).unwrap();
++        assert_eq!(count, 200);
++        assert_eq!(preview.len(), 100);
++        assert_eq!(preview.first().unwrap().id, "100");
++        assert_eq!(preview.last().unwrap().id, "199");
++        assert_eq!((count, preview), full_projection(&small));
++    }
++}

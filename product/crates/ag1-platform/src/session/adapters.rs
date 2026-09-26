@@ -34,6 +34,19 @@ use std::{
 
 #[derive(Clone, Default)]
 pub struct NativeAdapters {
+    #[cfg(target_os = "linux")]
+    pub mcp: Option<Arc<super::mcp::SessionCapabilities>>,
+    #[cfg(target_os = "linux")]
+    pub mcp_discovery: Option<Arc<super::mcp::discovery::Discovery>>,
+    #[cfg(target_os = "linux")]
+    pub mcp_management: Option<Arc<crate::mcp::service::Session>>,
+    pub local_git: Vec<Arc<crate::github::local::LocalGit>>,
+    pub github: Option<Arc<crate::github::service::Service>>,
+    pub folders: Option<Arc<crate::folder_access::Snapshot>>,
+    pub folder_authority: Option<Arc<crate::folder_access::FolderAccess>>,
+    pub folder_files: Vec<Arc<FileService>>,
+    pub folder_search: Vec<Arc<SearchService>>,
+    pub approval_policy: Option<Arc<crate::client::approval_policy::ApprovalPolicy>>,
     pub resources: Option<Arc<crate::client::resource_actions::Actions>>,
     pub project: Option<Arc<std::sync::Mutex<crate::projects::ProjectPort>>>,
     /// Host-selected planning capability. Ordinary sessions do not expose it.
@@ -85,6 +98,9 @@ impl NativeAdapters {
         if self.git.is_some() {
             names.push("diff");
         }
+        if self.github.is_some() { names.push("github"); }
+        #[cfg(target_os = "linux")]
+        if self.mcp_discovery.is_some() { names.push(ag1_core::tools::mcp::discovery::NAME); }
         if self.shell.is_some() {
             names.push("bash");
         }
@@ -149,6 +165,9 @@ impl NativeAdapters {
         if let Some(extensions) = &self.extensions {
             names.extend(extensions.tool_names());
         }
+        #[cfg(target_os = "linux")]
+        if let Some(mcp)=&self.mcp { names.extend(mcp.wire_names()); }
+        names.extend(ag1_core::tools::surface::available(&names));
         names
     }
     pub(super) fn prepare(
@@ -158,6 +177,33 @@ impl NativeAdapters {
         context: AdapterContext<'_>,
     ) -> Result<PreparedAdapter, DomainError> {
         let missing = || DomainError::Unavailable("native tool adapter is not configured".into());
+        #[cfg(target_os = "linux")]
+        if call.origin()==ag1_core::tools::registry::Origin::Mcp {
+            let service=self.mcp.clone().ok_or_else(missing)?;
+            let plan=service.prepare(call,context)?;
+            return Ok(PreparedAdapter::Mcp {service,plan});
+        }
+        #[cfg(target_os = "linux")]
+        if call.name()==ag1_core::tools::mcp::discovery::NAME {
+            let service=self.mcp_discovery.clone().ok_or_else(missing)?;
+            let plan=service.prepare(call,context)?;
+            return Ok(PreparedAdapter::McpDiscovery {service,plan});
+        }
+        let mut files = files.clone();
+        let mut search = self.search.clone();
+        if let Some(folders) = &self.folders && call.name() != "github" {
+            if !folders.primary_available() { return Err(DomainError::Unavailable("Choose an available working folder in Chat folders before running tools".into())); }
+            if let Some(authority) = &self.folder_authority { authority.check(folders.selection.revision)?; }
+            if ["read", "write", "edit", "append", "editPreview", "editApply", "ls", "grep", "find"].contains(&call.name()) {
+                let path = call.args()["path"].as_str().or_else(||call.args()["file_path"].as_str()).unwrap_or(".");
+                let root = folders.resolve(path, ["write", "edit", "append", "editApply"].contains(&call.name()) && !(call.name() == "edit" && call.args()["mode"] == "preview"))?;
+                let index = folders.roots.iter().position(|r| Arc::ptr_eq(r,&root)).ok_or(DomainError::Conflict)?;
+                files = self.folder_files.get(index).cloned().ok_or(DomainError::Conflict)?;
+                search = self.folder_search.get(index).cloned();
+            } else if !folders.primary_writable() && !(call.name() == "preview" && call.args()["action"] == "status") && !["bash", "job", "diff", "repo", "sourceContext", "webFetch", "webSearch", "artifact", "submit_plan"].contains(&call.name()) {
+                return Err(DomainError::InvalidInput("This tool needs a read/write working folder. Change it in Chat folders first.".into()));
+            }
+        }
         if call.origin() == ag1_core::tools::registry::Origin::Extension {
             let service = self.extensions.clone().ok_or_else(missing)?;
             if !service.tool_names().iter().any(|name| name == call.name()) {
@@ -166,7 +212,37 @@ impl NativeAdapters {
             return Ok(PreparedAdapter::Extension(service));
         }
         Ok(match call.name() {
-            "check" | "screenshot_url" | "interact_then_screenshot" | "verify_ui" => {
+            "github" => {
+                if call.origin() != ag1_core::tools::registry::Origin::TrustedHost { return Err(DomainError::PermissionDenied); }
+                let service=self.github.clone().ok_or_else(missing)?;
+                let request=if ["catalog","schema"].contains(&call.args()["operation"].as_str().unwrap_or("")){None}else{Some(crate::github::tool::request(call.args())?)};
+                if ["catalog","schema"].contains(&call.args()["operation"].as_str().unwrap_or("")) { PreparedAdapter::GitHubCatalog(crate::github::tool::discovery(call.args())?) }
+                else if request.as_ref().is_some_and(|r|r.operation=="releases.upload_asset") {
+                    let folders=self.folders.as_ref().ok_or_else(missing)?;
+                    let root=folders.resolve(call.args()["parameters"]["folder"].as_str().unwrap_or("."),false)?;
+                    let grant=self.folder_authority.clone().ok_or_else(missing)?;
+                    let control=crate::resource_fs::ScanControl{cancel:context.cancel,deadline:context.deadline};
+                    let plan=service.prepare_upload(request.unwrap(),root,grant,folders.selection.revision,&crate::github::tool::scope(context.scope),&control).map_err(crate::github::tool::domain)?;
+                    PreparedAdapter::GitHub{service,plan}
+                }
+                else if let Some(action)=call.args()["operation"].as_str().and_then(|s|s.strip_prefix("git.")) {
+                    let folders=self.folders.as_ref().ok_or_else(missing)?;
+                    let root=folders.resolve(call.args()["parameters"]["folder"].as_str().unwrap_or("."),!["status","diff","branches","recovery_status"].contains(&action))?;
+                    let service=self.local_git.iter().find(|g|g.root()==root.root()).cloned().ok_or_else(missing)?;
+                    let mut args=call.args()["parameters"].as_object().cloned().unwrap_or_default();
+                    args.insert("repo".into(),call.args()["repo"].clone());
+                    if call.args().get("body").is_some_and(|v|!v.is_null()){return Err(DomainError::InvalidInput("Local Git uses parameters, not a request body".into()));}
+                    let plan=service.prepare(action,&serde_json::Value::Object(args),&crate::github::tool::scope(context.scope),&crate::resource_fs::ScanControl {cancel:context.cancel,deadline:context.deadline})?;
+                    PreparedAdapter::LocalGit {service,plan}
+                }
+                else {
+                    let control=crate::resource_fs::ScanControl { cancel:context.cancel,deadline:context.deadline };
+                    let plan=service.prepare(request.unwrap(),&crate::github::tool::scope(context.scope),&control).map_err(crate::github::tool::domain)?;
+                    if plan.preview().to_string().len()>24*1024 { return Err(DomainError::LimitExceeded("GitHub approval preview; use a smaller request".into())); }
+                    PreparedAdapter::GitHub {service,plan}
+                }
+            }
+            "check" | "preview" | "screenshot_url" | "interact_then_screenshot" | "verify_ui" => {
                 let service = self.project.clone().ok_or_else(missing)?;
                 let request = ag1_core::tools::targets::Request::from_call(call)?;
                 let mut port = service.lock().map_err(|_| DomainError::Conflict)?;
@@ -174,7 +250,11 @@ impl NativeAdapters {
                     cancel: context.cancel,
                     deadline: context.deadline,
                 };
-                let plan = port.prepare(&request, &control)?;
+                let plan = port.prepare(&request, &control).map_err(|error| {
+                    if error == DomainError::NotFound && !["check", "preview"].contains(&call.name()) {
+                        DomainError::Unavailable("For a local image or SVG, call ui with {path: \"image.svg\"} (or inspect with its path) to receive a visible image without a server. No ready AG1-owned web preview target. Use preview status to discover an eligible target, preview start to launch its installed root Vite dev script, then preview status for the exact ready URL. If preview is unavailable, use the host Runtime UI. Editor Preview and bash/job servers do not grant browser access.".into())
+                    } else { error }
+                })?;
                 let binding = port.binding(&plan);
                 binding.admits(&request)?;
                 if binding.workspace != context.scope.workspace {
@@ -218,7 +298,7 @@ impl NativeAdapters {
                 }
             }
             "ls" => PreparedAdapter::List(files.clone()),
-            "grep" | "find" => PreparedAdapter::Search(self.search.clone().ok_or_else(missing)?),
+            "grep" | "find" => PreparedAdapter::Search(search.ok_or_else(missing)?),
             "diff" => PreparedAdapter::Diff(self.git.clone().ok_or_else(missing)?),
             "repo" => PreparedAdapter::Repo(self.repo.clone().ok_or_else(missing)?),
             "bash" => {
@@ -295,6 +375,7 @@ impl NativeAdapters {
 }
 #[derive(Clone, Copy)]
 pub(super) struct AdapterContext<'a> {
+    pub policy_mode: ag1_core::tools::policy::Mode,
     pub journal: Option<&'a Arc<super::tool_journal::ToolJournal>>,
     pub registry: &'a Registry,
     pub scope: &'a Scope,
@@ -328,6 +409,14 @@ impl<'a> AdapterContext<'a> {
     }
 }
 pub(super) enum PreparedAdapter {
+    #[cfg(target_os = "linux")]
+    McpDiscovery { service:Arc<super::mcp::discovery::Discovery>, plan:super::mcp::discovery::PreparedDiscovery },
+    #[cfg(target_os = "linux")]
+    Mcp { service:Arc<super::mcp::SessionCapabilities>, plan:crate::mcp::manager::PreparedOperation },
+    LocalGit {service:Arc<crate::github::local::LocalGit>,plan:crate::github::local::LocalPlan},
+    GitHubCatalog(serde_json::Value),
+    Capability(serde_json::Value),
+    GitHub {service:Arc<crate::github::service::Service>,plan:crate::github::service::Prepared},
     Explore {
         service: Arc<super::subagent_tool::DelegationService>,
         plan: Box<super::subagent_tool::PreparedExplore>,
@@ -397,6 +486,14 @@ pub(super) enum PreparedAdapter {
 impl PreparedAdapter {
     pub fn target_revision(&self) -> String {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::McpDiscovery {plan,..} => plan.target_revision(),
+            #[cfg(target_os = "linux")]
+            Self::Mcp {plan,..} => plan.target_revision(),
+            Self::LocalGit {plan,..} => plan.revision().into(),
+            Self::GitHubCatalog(_) => "github-catalog-v1".into(),
+            Self::Capability(_) => "capability-v1".into(),
+            Self::GitHub {plan,..} => plan.revision().into(),
             Self::Project { revision, .. } => revision.clone(),
             Self::Extension(service) => service.target_revision(),
             Self::SubmitPlan => "submit-plan-v1".into(),
@@ -441,6 +538,10 @@ impl PreparedAdapter {
     }
     pub fn may_mutate(&self) -> bool {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::Mcp {..} => true,
+            Self::LocalGit {plan,..} => plan.may_mutate(),
+            Self::GitHub {plan,..} => plan.may_mutate(),
             Self::Project { .. } => true,
             Self::Extension(_) => true,
             Self::Delegation { .. } => true,
@@ -474,6 +575,33 @@ impl PreparedAdapter {
             artifact_page: false,
         };
         match self {
+            #[cfg(target_os = "linux")]
+            Self::McpDiscovery {service,plan} => service.execute(plan,authorization,context),
+            #[cfg(target_os = "linux")]
+            Self::Mcp {service,plan} => service.execute(plan,authorization,context,artifacts),
+            Self::LocalGit {service,plan} => {
+                authorization.consume(context.registry,ag1_core::tools::approval::ExecutionFence {scope:context.scope,policy_revision:context.policy_revision,target_revision:plan.revision(),now:context.clock.now_ms()})?;
+                let mutate=plan.may_mutate();
+                let recovery_path=plan.preview["recovery_path"].clone();
+                let result=service.execute(plan,&crate::github::tool::scope(context.scope),&crate::resource_fs::ScanControl {cancel:context.cancel,deadline:context.deadline});
+                let (value,effect,failed)=match result {
+                    Ok(value)=>{let effect=if mutate&&value["outcome"]!="unchanged"{Effect::Committed}else{Effect::None};(value,effect,false)},
+                    Err(error)=>{let unknown=error==DomainError::DurabilityUnknown;(serde_json::json!({"error":format!("{error:?}"),"outcome":if unknown{"unknown"}else{"not_applied"},"recovery_path":recovery_path,"retry_automatically":false}),if unknown{Effect::Unknown}else{Effect::None},true)}
+                };
+                Ok(AdapterOutcome {result:serde_json::json!({"content":[{"type":"text","text":value.to_string()}],"details":{"localGit":value},"isError":failed}),effect,artifact_page:false})
+            }
+            Self::Capability(value) => {
+                authorization.consume(context.registry, ag1_core::tools::approval::ExecutionFence {scope:context.scope,policy_revision:context.policy_revision,target_revision:"capability-v1",now:context.clock.now_ms()})?;
+                Ok(AdapterOutcome {result:serde_json::json!({"content":[{"type":"text","text":value.to_string()}],"details":{"capability":value}}),effect:Effect::None,artifact_page:false})
+            }
+            Self::GitHubCatalog(value) => {
+                authorization.consume(context.registry,ag1_core::tools::approval::ExecutionFence {scope:context.scope,policy_revision:context.policy_revision,target_revision:"github-catalog-v1",now:context.clock.now_ms()})?;
+                Ok(AdapterOutcome {result:serde_json::json!({"content":[{"type":"text","text":value.to_string()}],"details":{"githubCatalog":true}}),effect:Effect::None,artifact_page:false})
+            }
+            Self::GitHub {service,plan} => {
+                authorization.consume(context.registry,ag1_core::tools::approval::ExecutionFence {scope:context.scope,policy_revision:context.policy_revision,target_revision:plan.revision(),now:context.clock.now_ms()})?;
+                Ok(crate::github::tool::outcome(service.execute(plan,&crate::github::tool::scope(context.scope),&crate::resource_fs::ScanControl {cancel:context.cancel,deadline:context.deadline})))
+            }
             Self::Project {
                 service,
                 plan,

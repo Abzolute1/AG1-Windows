@@ -32,7 +32,12 @@ export type BridgeQuestion = { binding: ApprovalBinding, title: string, kind: st
 export type BridgeSnapshot = { version: Version, scope: Scope, revision: Sequence, watermark: Sequence, workspace_path: string, status: string, active_operation: OperationId | null, messages: Array<BridgeMessage>, message_count: number, pending: Array<BridgeQuestion>, model: string, diagnostic: string | null, session_file: string | null, fixture_provider: boolean, };
 export type BridgeFrame = { "kind": "snapshot", snapshot: BridgeSnapshot, } | { "kind": "reply", id: CommandId, scope: Scope, revision: Sequence, durable: boolean, status: string, data: JsonValue, } | { "kind": "progress", scope: Scope, operation: OperationId, text: string, } | { "kind": "fatal", detail: string, };
 export type MessageBlock = { "kind": "text", text: string, } | { "kind": "thinking", text: string, } | { "kind": "tool", name: string, call_id: string, arguments: JsonValue, } | { "kind": "attachment", media_type: string, reference: string, } | { "kind": "unknown", value: JsonValue, };
-export type ClientMessage = { id: string, role: string, blocks: Array<MessageBlock>, };
+export type ClientMessage = { id: string, role: string, blocks: Array<MessageBlock>, 
+/**
+ * Execution identity, independent of result arrival order or display text.
+ */
+tool?: ToolResultIdentity, };
+export type ToolResultIdentity = { call_id: string, name: string, failed: boolean, };
 export type ClientDetails = { authority: string, messages: Array<ClientMessage>, task: JsonValue, context: JsonValue, artifacts: Array<JsonValue>, memory: JsonValue, activity: JsonValue, models: Array<JsonValue>, capabilities: Array<string>, };
 export type ClientView = { snapshot: BridgeSnapshot, error: string | null, progress: string, details: ClientDetails, };
 export type WireMessage = { "type": "handshake", "data": Handshake } | { "type": "command", "data": CommandEnvelope } | { "type": "result", "data": Reply } | { "type": "snapshot", "data": Snapshot } | { "type": "delivery", "data": Delivery } | { "type": "subscription", "data": Subscription } | { "type": "cursor", "data": Cursor } | { "type": "error", "data": ProtocolError } | { "type": "bridge", "data": BridgeFrame } | { "type": "client", "data": ClientView };

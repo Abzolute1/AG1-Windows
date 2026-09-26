@@ -1,0 +1,41 @@
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -39,6 +39,8 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include <thread>
++#include <cstdlib>
+ #ifdef __linux__
+ #include <unistd.h>
+ #include <dlfcn.h>
+@@ -1936,6 +1938,29 @@
+         const int64_t begin_us = ggml_time_us();
+         for (const auto & [first, last] : merged) {
+             if (mprotect((void *) first, last - first, PROT_READ | PROT_WRITE)) throw std::runtime_error("private host mapping mprotect failed");
++            // This mapping is MAP_PRIVATE over an O_RDONLY file descriptor.
++            // Write the same byte to disjoint pages to materialize private COW
++            // pages before serial driver pinning; original file bytes cannot change.
++            const char * prefault_env = std::getenv("AG1_FLASH_COW_PREFAULT_THREADS");
++            const int prefault_threads = prefault_env ? std::max(0, std::min(24, std::atoi(prefault_env))) : 0;
++            if (prefault_threads > 0) {
++                const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
++                const size_t pages = (last - first) / page_size;
++                std::vector<std::thread> workers;
++                workers.reserve(prefault_threads);
++                for (int worker = 0; worker < prefault_threads; ++worker) {
++                    workers.emplace_back([=]() {
++                        const size_t begin = pages * worker / prefault_threads;
++                        const size_t end = pages * (worker + 1) / prefault_threads;
++                        for (size_t page = begin; page < end; ++page) {
++                            volatile unsigned char * address = reinterpret_cast<volatile unsigned char *>(first + page * page_size);
++                            const unsigned char value = *address;
++                            *address = value;
++                        }
++                    });
++                }
++                for (auto & worker : workers) worker.join();
++            }
+             const int result = register_cow((void *) first, last - first, 1u);
+             if (result) {
+                 mprotect((void *) first, last - first, PROT_READ);

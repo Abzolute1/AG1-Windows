@@ -26,6 +26,27 @@ fn config() -> Config {
     let origin = UNUSED.with(|socket| format!("http://{}", socket.local_addr().unwrap()));
     serde_json::from_value(json!({"models":[{"provider":"fixture","id":"initial","api":"openai-completions","baseUrl":origin,"contextWindow":32768,"maxTokens":4096,"input":["text"],"reasoning":false}],"selected":"initial","credential_env":null,"system_prompt":"Fixture transfer","fixture":true})).unwrap()
 }
+#[test]
+fn fresh_native_registration_never_replaces_existing_typescript_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::at(&dir.path().join("registry")).unwrap();
+    let workspace = dir.path().join("workspace");
+    let state = dir.path().join("legacy-state");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::write(workspace.join("code.txt"), b"existing code").unwrap();
+    assert!(registry.initialize_isolated(&workspace).is_err());
+    let lease = registry.open_typescript(&workspace, &state).unwrap();
+    let original = registry.inspect(&workspace).unwrap();
+    assert!(registry.initialize_native(&workspace).is_err());
+    drop(lease);
+    assert!(registry.initialize_native(&workspace).is_err());
+    assert_eq!(registry.inspect(&workspace).unwrap(), original);
+    assert_eq!(
+        fs::read(workspace.join("code.txt")).unwrap(),
+        b"existing code"
+    );
+}
 impl Fixture {
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -1821,11 +1842,15 @@ async fn durable_desktop_startup_and_actual_cli_compete_for_the_same_workspace()
     f.migrate();
     let desktop = ag1_desktop::native_client::NativeClient::from_environment().unwrap();
     assert!(desktop.selects(&f.workspace).unwrap());
+    let desktop_state = f._dir.path().join("desktop-private");
+    fs::create_dir(&desktop_state).unwrap();
     desktop
-        .open(&f.workspace, &f._dir.path().join("desktop-private"))
+        .open(&f.workspace, &desktop_state)
         .await
         .unwrap();
-    let cli = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug/ag1-cli");
+    let cli = std::env::current_exe()
+        .unwrap()
+        .parent().unwrap().parent().unwrap().join("ag1-cli");
     let run = |state: &Path| {
         std::process::Command::new(&cli)
             .arg("--workspace")

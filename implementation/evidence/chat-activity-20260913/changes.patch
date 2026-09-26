@@ -1,0 +1,433 @@
+--- a/product/apps/desktop/src/NativeConversation.tsx
++++ b/product/apps/desktop/src/NativeConversation.tsx
+@@ -33,7 +33,7 @@
+         }
+         const entry = JSON.parse(text), content = entry.message.content;
+         const blocks: MessageBlock[] = typeof content === "string" ? [{ kind: "text", text: content }] : content.map((b: any): MessageBlock => b.type === "text" ? { kind: "text", text: b.text } : b.type === "thinking" ? { kind: "thinking", text: b.thinking } : b.type === "toolCall" ? { kind: "tool", name: b.name, call_id: b.id, arguments: b.arguments } : b.type === "image" ? { kind: "attachment", media_type: b.mimeType, reference: m.id } : { kind: "unknown", value: b });
+-        blocks.unshift(...m.blocks.filter(b => b.kind === "unknown" && b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "mcp_result"));
++        blocks.unshift(...m.blocks.filter(b => b.kind === "unknown" && b.value && typeof b.value === "object" && !Array.isArray(b.value) && ["mcp_result", "web_result"].includes(String(b.value.kind))));
+         if (mounted.current) setFull(old => ({ ...old, [m.id]: { ...m, blocks } }));
+       })().catch(e => { if (mounted.current) setError(String(e)); });
+     }
+@@ -53,12 +53,13 @@
+   </>;
+   return <article className="chat-turn" data-turn-id={turn.id}>
+     {user && <div className="user-message"><ChatBlocks run={run} blocks={user.blocks} /></div>}
+-    {(active || !!work.length) && <ActivityGroup messages={work} active={active} time={workTime} status={workStatus} compact={compactTools} run={run} onExpand={expand} renderAssistant={renderAssistant} loading={id => requested.has(id) && !full[id] && !!turn.messages.find(m => m.id === id)?.blocks.some(b => b.kind === "text" && b.text.includes("[open journal page]"))} />}
++    {(active || !!work.length) && <ActivityGroup messages={work} active={active} time={workTime} compact={compactTools} run={run} onExpand={expand} renderAssistant={renderAssistant} loading={id => requested.has(id) && !full[id] && !!turn.messages.find(m => m.id === id)?.blocks.some(b => b.kind === "text" && b.text.includes("[open journal page]"))} />}
+     {final && <div className="assistant-message final-answer"><ChatBlocks run={run} blocks={final.blocks} {...thoughts(assistantIndex(final))} /><button className="copy-answer" aria-label="Copy answer" onClick={() => void navigator.clipboard.writeText(final.blocks.filter(b => b.kind === "text").map(b => b.text).join("\n")).catch(e => setError(String(e)))}><Copy size={14} /></button></div>}
+-    {active && live && !live.committed && <div className="assistant-message live-answer" key={live.id}><LiveBlocks live={live} run={run} {...thoughts(rest.filter(m => m.role === "assistant").length)} /></div>}
+     {user && reviewChanges && messages.some(m => m.blocks.some(b => b.kind === "tool" && ["write", "edit"].includes(b.name))) && <TurnChangeCard turn={user.id} revision={`${active}/${messages.map(m => m.id).join("/")}`} run={run} review={reviewChanges} />}
+     {/* Retained-output footer temporarily hidden at user request. */}
+     {error && <p role="alert">{error}</p>}
++    {active && live && !live.committed && <div className="assistant-message live-answer" key={live.id}><LiveBlocks live={live} run={run} {...thoughts(rest.filter(m => m.role === "assistant").length)} /></div>}
++    {active && workStatus && !(live && !live.committed && live.blocks.some(b => b.kind === "thinking" || b.kind === "text" && b.text.trim())) && <div className="work-phase" role="status">{workStatus}</div>}
+   </article>;
+ }
+ const MemoTurn = memo(TurnView);
+--- a/product/apps/desktop/src/NativeConversation.test.tsx
++++ b/product/apps/desktop/src/NativeConversation.test.tsx
+@@ -9,7 +9,7 @@
+   const live = { id: "generation-1", committed: false, blocks: [{ kind: "thinking" as const, text: "First thought" }, { kind: "text" as const, text: "Answer begins" }] };
+   const { rerender } = render(<TurnView turn={{ id: "u1", messages: [user] }} active live={live} run={run} />);
+   expect(screen.getByText("Answer begins")).toBeTruthy(); expect(screen.queryByText("First thought")).toBeNull();
+-  fireEvent.click(screen.getByRole("button", { name: "Thinking" }));
++  fireEvent.click(screen.getByRole("button", { name: "Thoughts" }));
+   rerender(<TurnView turn={{ id: "u1", messages: [user] }} active live={{ ...live, blocks: [{ kind: "thinking", text: "First thought, then a second" }, { kind: "text", text: "Answer begins and continues" }] }} run={run} />);
+   expect(screen.getByText("First thought, then a second")).toBeTruthy();
+   const assistant: ClientMessage = { id: "a1", role: "assistant", blocks: [{ kind: "thinking", text: "First thought, then a second" }, { kind: "text", text: "Complete answer" }] };
+@@ -30,7 +30,7 @@
+   const run = vi.fn(async () => ({ base64: btoa("A much longer thought"), offset: 21, total: 21 }));
+   const live = { id: "g", committed: false, blocks: [{ kind: "thinking" as const, key: "t", text: "A", bytes: 21, truncated: true }, { kind: "text" as const, key: "a", text: "Visible answer" }] };
+   render(<TurnView turn={{ id: "u1", messages: [user] }} active live={live} run={run} />);
+-  expect(screen.getByText("Visible answer")).toBeTruthy(); fireEvent.click(screen.getByRole("button", { name: "Thinking" }));
++  expect(screen.getByText("Visible answer")).toBeTruthy(); fireEvent.click(screen.getByRole("button", { name: "Thoughts" }));
+   await waitFor(() => expect(screen.getByText("A much longer thought")).toBeTruthy());
+   expect(run.mock.calls.length).toBe(1);
+ });
+@@ -165,3 +165,40 @@
+   expect(screen.queryByRole("status")).toBeNull();
+   expect(screen.queryByText("Working for 12s")).toBeNull();
+ });
++
++
++test("current thinking status follows all work rows, including a collapsed work log", () => {
++  const messages: ClientMessage[] = [user, { id: "a", role: "assistant", blocks: [{ kind: "thinking", text: "Earlier reasoning" }, { kind: "tool", call_id: "s", name: "webSearch", arguments: { query: "Rust documentation" } }] }, { id: "r", role: "toolResult", tool: { name: "webSearch", call_id: "s", failed: false }, blocks: [{ kind: "text", text: "Search output" }] }];
++  const view = render(<TurnView turn={{ id: user.id, messages }} active workStatus="Thinking" run={vi.fn()} />);
++  const status = screen.getByRole("status"), row = screen.getByRole("button", { name: /Searched the web/ });
++  expect(row.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++  expect(view.container.querySelector('.response-work.is-working')).toBeTruthy();
++  fireEvent.click(screen.getByRole("button", { name: /Working.*1 tool/ }));
++  expect(screen.getByRole("status").textContent).toBe("Thinking");
++});
++test("a new thinking generation appears below old work and loses its live label when text arrives", () => {
++  const run = vi.fn(async () => null);
++  const messages: ClientMessage[] = [user, { id: "a", role: "assistant", blocks: [{ kind: "thinking", text: "Previous thought" }, { kind: "tool", call_id: "r", name: "read", arguments: { path: "notes.md" } }] }, { id: "r", role: "toolResult", tool: { name: "read", call_id: "r", failed: false }, blocks: [{ kind: "text", text: "Notes" }] }];
++  const props = { turn: { id: user.id, messages }, active: true, workStatus: "Thinking", run };
++  const live = { id: "next", committed: false, blocks: [{ kind: "thinking" as const, text: "Current thought" }] };
++  const view = render(<TurnView {...props} live={live} />);
++  const current = screen.getByRole("button", { name: "Thinking" });
++  expect(screen.getByRole("button", { name: /Read notes.md/ }).compareDocumentPosition(current) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++  expect(screen.queryByRole("status")).toBeNull();
++  fireEvent.click(current);
++  view.rerender(<TurnView {...props} live={{ ...live, blocks: [...live.blocks, { kind: "text", text: "Answer is arriving" }] }} />);
++  expect(screen.queryByRole("button", { name: "Thinking" })).toBeNull();
++  expect(screen.getByText("Current thought")).toBeTruthy();
++  expect(screen.getByText("Answer is arriving")).toBeTruthy();
++});
++
++
++test("active status and thinking follow prominent result cards", () => {
++  const messages: ClientMessage[] = [user, { id: "a", role: "assistant", blocks: [{ kind: "tool", name: "github", call_id: "g", arguments: { operation: "issues.create" } }] }, { id: "r", role: "toolResult", tool: { name: "github", call_id: "g", failed: true }, blocks: [{ kind: "text", text: '{"outcome":"unknown","message":"Interrupted"}' }] }];
++  const props = { turn: { id: user.id, messages }, active: true, run: vi.fn(), workStatus: "Waiting for model" };
++  const view = render(<TurnView {...props} />);
++  const result = screen.getByText("GitHub outcome uncertain");
++  expect(result.compareDocumentPosition(screen.getByRole("status")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++  view.rerender(<TurnView {...props} live={{ id: "next", committed: false, blocks: [{ kind: "thinking", text: "Checking the result" }] }} />);
++  expect(result.compareDocumentPosition(screen.getByRole("button", { name: "Thinking" })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
++});
+--- a/product/apps/desktop/src/ChatBlocks.tsx
++++ b/product/apps/desktop/src/ChatBlocks.tsx
+@@ -12,5 +12,5 @@
+   return <div className="thinking"><button className="disclosure" aria-expanded={open} onClick={() => { setOpen(!open); onToggle?.(!open); }}><ChevronRight size={14} className={open ? "expanded" : ""} />{live && <LoaderCircle size={13} className="spin" />}{live ? "Thinking" : "Thoughts"}</button>{open && <div className="thinking-content" aria-label={live ? "Live thinking" : "Model thinking"}><Markdown text={text} /></div>}</div>;
+ }
+ export function ChatBlocks({ blocks, live = false, thinking = {}, onThinking, run }: { run?: ImageRun; blocks: MessageBlock[]; live?: boolean; thinking?: Record<number, boolean>; onThinking?: (index: number, open: boolean) => void }) {
+-  return <>{blocks.map((b, i) => b.kind === "thinking" ? <Thinking key={i} text={b.text} live={live} expanded={thinking[i]} onToggle={open => onThinking?.(i, open)} /> : b.kind === "text" ? <Markdown key={i} text={b.text} /> : b.kind === "tool" ? <details className="tool-call" key={i}><summary><Terminal size={14} />{b.name}</summary><pre>{JSON.stringify(b.arguments, null, 2)}</pre></details> : b.kind === "attachment" ? run && b.media_type.startsWith("image/") ? blocks.slice(0, i).some(previous => previous.kind === "attachment" && previous.reference === b.reference) ? null : <JournalImages key={b.reference} reference={b.reference} run={run} /> : <span className="attachment-chip" key={i}>Attachment · {b.media_type}</span> : b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "mcp_result" && run ? <MCPResult key={i} value={b.value} run={run} /> : b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "provider_error" ? <div key={i} className="provider-error" role="alert"><strong>{b.value.cancelled ? "Response stopped" : "Response failed"}</strong><p>{String(b.value.message ?? "The response ended before completion.")}</p><p className="muted">This response is no longer running. You can send a new message to continue.</p></div> : <details key={i}><summary>Preserved content</summary><pre>{JSON.stringify(b.value)}</pre></details>)}</>;
++  return <>{blocks.map((b, i) => b.kind === "thinking" ? <Thinking key={i} text={b.text} live={live && !blocks.slice(i + 1).some(next => next.kind === "tool" || next.kind === "text" && next.text.trim())} expanded={thinking[i]} onToggle={open => onThinking?.(i, open)} /> : b.kind === "text" ? <Markdown key={i} text={b.text} /> : b.kind === "tool" ? <details className="tool-call" key={i}><summary><Terminal size={14} />{b.name}</summary><pre>{JSON.stringify(b.arguments, null, 2)}</pre></details> : b.kind === "attachment" ? run && b.media_type.startsWith("image/") ? blocks.slice(0, i).some(previous => previous.kind === "attachment" && previous.reference === b.reference) ? null : <JournalImages key={b.reference} reference={b.reference} run={run} /> : <span className="attachment-chip" key={i}>Attachment · {b.media_type}</span> : b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "web_result" ? null : b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "mcp_result" && run ? <MCPResult key={i} value={b.value} run={run} /> : b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "provider_error" ? <div key={i} className="provider-error" role="alert"><strong>{b.value.cancelled ? "Response stopped" : "Response failed"}</strong><p>{String(b.value.message ?? "The response ended before completion.")}</p><p className="muted">This response is no longer running. You can send a new message to continue.</p></div> : <details key={i}><summary>Preserved content</summary><pre>{JSON.stringify(b.value)}</pre></details>)}</>;
+ }
+--- a/product/apps/desktop/src/ToolActivity.tsx
++++ b/product/apps/desktop/src/ToolActivity.tsx
+@@ -5,6 +5,7 @@
+ import { JournalImages, previewableImage, type ImageRun } from "./ImageAttachment";
+ import { GitHubResult } from "./GitHubResult";
+ import "./workflow.css";
++import { SiteIcons, SourceList, webSources } from "./WebSources";
+ type Call = Extract<MessageBlock, { kind: "tool" }>;
+ const labels: Record<string, string> = { read: "Read", ls: "List folder", grep: "Search", glob: "Find files", bash: "Run command", check: "Check", edit: "Edit", editPreview: "Preview edit", editApply: "Apply edit", append: "Append", write: "Write", webSearch: "Search the web", webFetch: "Fetch page", repo: "Inspect repository" };
+ export function toolTarget(call: Call): string {
+@@ -20,6 +21,8 @@
+   return "";
+ }
+ export function toolLabel(call: Call, completed = false): string {
++  if (call.name === "webSearch") return completed ? "Searched the web" : "Searching the web";
++  if (call.name === "webFetch") return completed ? "Read webpage" : "Reading webpage";
+   if (call.name.startsWith("mcp_")) return "MCP operation";
+   if (call.name === "mcpDiscover") return completed ? "Discovered MCP capabilities" : "Discovering MCP capabilities";
+   const a = call.arguments as Record<string, any> | null;
+@@ -73,9 +76,11 @@
+   const capability = source?.kind === "unknown" && source.value && typeof source.value === "object" && !Array.isArray(source.value) ? source.value.capability : undefined;
+   const label = typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : results[0]?.tool?.name || "Tool output";
+   const Icon = call?.name === "github" ? Github : ["read", "inspect", "write", "edit"].includes(call?.name ?? "") ? FileText : ["grep", "find", "webSearch"].includes(call?.name ?? "") ? Search : Terminal;
++  const sources = results.flatMap(webSources);
+   return <div className={`tool-entry ${failed ? "failed" : ""}`}>
+-    <button className="tool-entry-toggle" aria-expanded={open} onClick={() => { setOpen(!open); if (!open) results.forEach(m => onExpand(m.id)); }}>{failed ? <X size={14} /> : active && !results.length ? <LoaderCircle size={14} className="spin" /> : <Icon size={14} />}<span>{label}</span>{target && <span className="tool-target" title={target}>{target}</span>}{failed && <small>Failed</small>}{!active && !results.length && <small>No result</small>}<ChevronRight size={12} className={open ? "expanded" : ""} /></button>
++    <button className="tool-entry-toggle" aria-expanded={open} onClick={() => { setOpen(!open); if (!open) results.forEach(m => onExpand(m.id)); }}>{failed ? <X size={14} /> : active && !results.length ? <LoaderCircle size={14} className="spin" /> : sources.length ? <SiteIcons sources={sources} run={run} /> : <Icon size={14} />}<span>{label}</span>{sources.length > 0 && <small className="web-source-count">{sources.length} {sources.length === 1 ? "source" : "sources"}</small>}{target && <span className="tool-target" title={target}>{target}</span>}{failed && <small>Failed</small>}{!active && !results.length && <small>No result</small>}<ChevronRight size={12} className={open ? "expanded" : ""} /></button>
+     {open && <div className="tool-entry-body">
++      {sources.length > 0 && <SourceList sources={sources} run={run} />}
+       {call && <><button className="tool-arguments-toggle" aria-expanded={argumentsOpen} onClick={() => setArgumentsOpen(!argumentsOpen)}>Arguments</button>{argumentsOpen && <pre className="tool-arguments">{JSON.stringify(call.arguments, null, 2)}</pre>}</>}
+       {results.map(m => call?.name === "github" && !prominentGitHub(m) && !["catalog", "schema"].includes(String((call.arguments as any)?.operation))
+         ? <GitHubResult key={m.id} inline call={call} message={m} expand={() => onExpand(m.id)}><ToolOutput message={m} run={run} loading={loading(m.id)} /></GitHubResult>
+@@ -84,7 +89,7 @@
+     </div>}
+   </div>;
+ }
+-export function ActivityGroup({ messages, active, compact, run, onExpand, loading, renderAssistant, time, status }: { messages: ClientMessage[]; active: boolean; compact: boolean; run: ImageRun; onExpand: (id: string) => void; loading: (id: string) => boolean; renderAssistant?: (m: ClientMessage) => React.ReactNode; time?: string; status?: string }) {
++export function ActivityGroup({ messages, active, compact, run, onExpand, loading, renderAssistant, time }: { messages: ClientMessage[]; active: boolean; compact: boolean; run: ImageRun; onExpand: (id: string) => void; loading: (id: string) => boolean; renderAssistant?: (m: ClientMessage) => React.ReactNode; time?: string }) {
+   const [expanded, setExpanded] = useState<boolean | null>(null);
+   const open = expanded ?? (active || !compact);
+   const calls = messages.flatMap(m => m.role === "assistant" ? m.blocks.filter((b): b is Call => b.kind === "tool") : []);
+@@ -94,8 +99,7 @@
+   const failures = results.filter(m => m.tool?.failed).length;
+   const count = calls.length + results.filter(m => !m.tool?.call_id || !ids.has(m.tool.call_id)).length;
+   const images = [...new Set(results.filter(m => !m.tool?.failed).flatMap(m => m.blocks.flatMap(b => b.kind === "attachment" && previewableImage(b.media_type) ? [b.reference] : [])))];
+-  return <><div className="work-summary response-work"><button type="button" className="work-toggle" disabled={!messages.length} aria-expanded={!!messages.length && open} onClick={() => setExpanded(!open)}>{active && <LoaderCircle size={13} className="spin" />}<span>{active ? time ? `Working for ${time}` : "Working…" : time ? `Worked for ${time}` : "Work details"}</span>{!!messages.length && <ChevronRight size={12} className={open ? "expanded" : ""} />}{count > 0 && <small>{count} {count === 1 ? "tool" : "tools"}</small>}{failures > 0 && <small className="danger-text">{failures} failed</small>}</button>
+-    {active && status && <div className="work-phase" role="status">{status}</div>}
++  return <><div className={`work-summary response-work ${active ? "is-working" : ""}`}><button type="button" className="work-toggle" disabled={!messages.length} aria-expanded={!!messages.length && open} onClick={() => setExpanded(!open)}>{active && <LoaderCircle size={13} className="spin" />}<span>{active ? time ? `Working for ${time}` : "Working…" : time ? `Worked for ${time}` : "Work details"}</span>{!!messages.length && <ChevronRight size={12} className={open ? "expanded" : ""} />}{count > 0 && <small>{count} {count === 1 ? "tool" : "tools"}</small>}{failures > 0 && <small className="danger-text">{failures} failed</small>}</button>
+     {open && !!messages.length && <div className="work-log">{messages.map(m => <div key={m.id} className="work-step">{m.role === "assistant" && <>{renderAssistant?.(m)}{m.blocks.filter((b): b is Call => b.kind === "tool").map(call => <ToolEntry key={call.call_id} call={call} results={matched(call)} active={active} run={run} onExpand={onExpand} loading={loading} />)}</>}{m.role === "toolResult" && (!m.tool?.call_id || !ids.has(m.tool.call_id)) && <ToolEntry results={[m]} active={false} run={run} onExpand={onExpand} loading={loading} />}</div>)}</div>}
+   </div>{calls.filter(call => call.name === "github").flatMap(call => matched(call).filter(m => prominentGitHub(m)).map(m => <GitHubResult key={m.id} call={call} message={m} expand={() => onExpand(m.id)}><ToolOutput message={m} run={run} loading={loading(m.id)} /></GitHubResult>))}{images.length > 0 && <div className="assistant-message image-results" aria-label="Image results">{images.map(reference => <JournalImages key={reference} reference={reference} run={run} inline />)}</div>}</>;
+ }
+--- a/product/apps/desktop/src/workflow.css
++++ b/product/apps/desktop/src/workflow.css
+@@ -28,4 +28,20 @@
+ .response-work .tool-entry-toggle > .tool-target { flex-shrink: 1; }
+ 
+ .response-work .work-toggle:disabled { opacity: 1; cursor: default; }
+-.response-work .work-phase { color: var(--muted-foreground); font-size: .88em; line-height: 1.5; padding: 2px 0 10px; overflow-wrap: anywhere; }
++.chat-turn > .work-phase { color: var(--muted-foreground); font-size: .88em; line-height: 1.5; padding: 2px 0 10px; overflow-wrap: anywhere; }
++
++/* Active progress follows the chronology in the main conversation scroller. */
++.response-work.is-working .work-log { max-height: none; overflow: visible; }
++.chat-turn > .work-phase { margin-top: 0; padding: 4px 0 0; }
++.site-icons { display: inline-flex; align-items: center; flex-shrink: 0; padding-right: 2px; }
++.site-icon { width: 20px; height: 20px; flex: 0 0 20px; display: inline-flex; align-items: center; justify-content: center; overflow: hidden; border-radius: 50%; background: var(--card); color: var(--muted-foreground); border: 1px solid var(--border); font-size: 11px; font-weight: 550; }
++.site-icons .site-icon + .site-icon { margin-left: -5px; }
++.site-icon:has(img) { background: #f5f5f5; }
++.site-icon img { width: 16px; height: 16px; object-fit: contain; }
++.tool-entry-toggle > .web-source-count { color: var(--muted-foreground); white-space: nowrap; font-size: .82em; opacity: .8; }
++.web-sources { display: grid; gap: 9px; margin: 2px 0 14px; }
++.web-source { display: flex; gap: 9px; align-items: center; color: var(--foreground); text-decoration: none; min-width: 0; }
++.web-source > span:last-child { min-width: 0; }
++.web-source strong { display: block; font-size: .9em; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
++.web-source small { color: var(--muted-foreground); font-size: .78em; }
++.web-source:hover strong { text-decoration: underline; }
+--- a/product/crates/ag1-platform/src/client/mod.rs
++++ b/product/crates/ag1-platform/src/client/mod.rs
+@@ -57,6 +57,7 @@
+ pub mod projection;
+ mod projects;
+ mod queries;
++mod website_icons;
+ pub mod resource_actions;
+ mod resources;
+ mod terminal;
+--- a/product/crates/ag1-platform/src/client/queries.rs
++++ b/product/crates/ag1-platform/src/client/queries.rs
+@@ -12,6 +12,17 @@
+                 let current=self.commands.snapshot()?.scope;
+                 let scope=ag1_core::tools::registry::Scope {workspace:current.workspace.as_str().into(),session:current.session.as_str().into(),epoch:session.context_epoch()?,revision:session.journal_revision()?};
+                 selected.services.tools().client_mcp().ok_or_else(||DomainError::Unavailable("MCP manager is unavailable for this chat; choose an available working folder or reopen the desktop".into()))?.dispatch(&scope,args)?
++            },
++            w::Command::Runtime {action,args} if action=="website_icon"=>{
++                let scope=self.commands.snapshot()?.scope;
++                let records=session.client_records()?;
++                let entry=records.iter().find(|r| r["id"]==args["entry"]).ok_or(DomainError::NotFound)?;
++                let url=args["url"].as_str().ok_or(DomainError::PermissionDenied)?;
++                let source=website_icons::sources(entry).into_iter().any(|s| s["url"]==url);
++                if !source {return Err(DomainError::PermissionDenied);}
++                let data=website_icons::icon(url)?;
++                if self.commands.snapshot()?.scope!=scope {return Err(DomainError::Conflict);}
++                json!({"dataUrl":data})
+             },
+             w::Command::Files {action,args} if action=="github_upload_preview"=>self.github_upload_preview(args)?,
+             w::Command::Files {action,args} if action=="git_preview"=>self.local_git_preview(args)?,
+--- a/product/crates/ag1-platform/src/client/projection.rs
++++ b/product/crates/ag1-platform/src/client/projection.rs
+@@ -63,6 +63,10 @@
+             })
+             .collect()
+     };
++    let sources=super::website_icons::sources(entry);
++    if !sources.is_empty() {
++        blocks.insert(0,w::MessageBlock::Unknown {value:json!({"kind":"web_result","sources":sources})});
++    }
+     if m["role"] == "toolResult" && m["toolName"].as_str().is_some_and(|n| n.starts_with("mcp_")) {
+         let details = &m["details"]["mcp"];
+         if let Ok(identity) = serde_json::from_value::<ag1_core::tools::mcp::Identity>(details["source"].clone()) {
+--- a/product/crates/ag1-platform/src/image_tools.rs
++++ b/product/crates/ag1-platform/src/image_tools.rs
+@@ -214,6 +214,16 @@
+     if bytes.len()>128*1024 { return Err(DomainError::LimitExceeded("registry icon bytes".into())); }
+     let format=image::guess_format(bytes).map_err(|_| DomainError::InvalidInput("registry icon header".into()))?;
+     if !matches!(format,ImageFormat::Png|ImageFormat::Jpeg) || mime(format)!=Some(declared) { return Err(DomainError::InvalidInput("registry icon MIME".into())); }
++    small_icon(bytes, format)
++}
++
++pub(crate) fn website_icon(bytes: &[u8]) -> Result<String, DomainError> {
++    if bytes.len()>128*1024 {return Err(DomainError::LimitExceeded("website icon bytes".into()));}
++    let format=image::guess_format(bytes).map_err(|_|DomainError::InvalidInput("website icon header".into()))?;
++    if !matches!(format,ImageFormat::Png|ImageFormat::Jpeg|ImageFormat::Gif|ImageFormat::WebP|ImageFormat::Ico) {return Err(DomainError::InvalidInput("website icon format".into()));}
++    small_icon(bytes, format)
++}
++fn small_icon(bytes: &[u8], format: ImageFormat) -> Result<String, DomainError> {
+     let _permit=DECODER.lock().map_err(|_|DomainError::Conflict)?;
+     let mut reader=ImageReader::with_format(Cursor::new(bytes),format);
+     let mut limits=Limits::default();limits.max_image_width=Some(1024);limits.max_image_height=Some(1024);limits.max_alloc=Some(8*1024*1024);reader.limits(limits.clone());
+--- a/product/crates/ag1-platform/Cargo.toml
++++ b/product/crates/ag1-platform/Cargo.toml
+@@ -19,7 +19,7 @@
+ base64.workspace = true
+ tempfile.workspace = true
+ hmac = "=0.12.1"
+-image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
++image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "ico"] }
+ resvg = { version = "=0.45.1", default-features = false }
+ regex = "=1.13.1"
+ ignore = "=0.4.25"
+--- a/product/apps/desktop/src/WebSources.tsx
++++ b/product/apps/desktop/src/WebSources.tsx
+@@ -0,0 +1,51 @@
++import { useEffect, useRef, useState } from "react";
++import { Globe } from "lucide-react";
++import type { ClientMessage } from "./generated/protocol";
++import type { ImageRun } from "./ImageAttachment";
++export type WebSource = { entry: string; url: string; title: string; host: string };
++export function webSources(message: ClientMessage): WebSource[] {
++  if (message.tool?.failed || !["webSearch", "webFetch"].includes(message.tool?.name ?? "")) return [];
++  const block = message.blocks.find(b => b.kind === "unknown" && (b.value as any)?.kind === "web_result");
++  const rows = block?.kind === "unknown" ? (block.value as any)?.sources : null;
++  if (!Array.isArray(rows)) return [];
++  return rows.slice(0, 4).flatMap(row => {
++    try {
++      const url = new URL(row.url);
++      if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return [];
++      return [{ entry: message.id, url: url.href, title: String(row.title || url.hostname).slice(0, 240), host: url.hostname.replace(/^www\./, "") }];
++    } catch { return []; }
++  });
++}
++const caches = new WeakMap<ImageRun, Map<string, Promise<string | null>>>();
++function load(source: WebSource, run: ImageRun) {
++  let cache = caches.get(run); if (!cache) { cache = new Map(); caches.set(run, cache); }
++  const key = new URL(source.url).origin;
++  let promise = cache.get(key);
++  if (!promise) {
++    promise = run({ kind: "runtime", action: "website_icon", args: { entry: source.entry, url: source.url } }).then(result => {
++      const data = (result as any)?.dataUrl;
++      return typeof data === "string" && data.length <= 33000 && /^data:image\/png;base64,[A-Za-z0-9+/=]+$/.test(data) ? data : null;
++    }).catch(() => null);
++    cache.set(key, promise); if (cache.size > 128) cache.delete(cache.keys().next().value!);
++  }
++  return promise;
++}
++function SiteIcon({ source, run }: { source: WebSource; run: ImageRun }) {
++  const [image, setImage] = useState<string | null>(null), [failed, setFailed] = useState(false);
++  const element = useRef<HTMLSpanElement>(null);
++  useEffect(() => {
++    let current = true; setImage(null); setFailed(false);
++    const show = () => { void load(source, run).then(data => { if (current) setImage(data); }); };
++    const observer = typeof IntersectionObserver === "undefined" ? null : new IntersectionObserver(entries => { if (entries.some(e => e.isIntersecting)) { observer?.disconnect(); show(); } });
++    if (observer && element.current) observer.observe(element.current); else show();
++    return () => { current = false; observer?.disconnect(); };
++  }, [source.entry, source.url, run]);
++  return <span className="site-icon" ref={element} title={source.host} aria-hidden="true">{image && !failed ? <img src={image} width={16} height={16} alt="" onError={() => setFailed(true)} /> : source.host ? source.host[0].toUpperCase() : <Globe size={14} />}</span>;
++}
++export function SiteIcons({ sources, run }: { sources: WebSource[]; run: ImageRun }) {
++  const unique = sources.filter((s, i) => sources.findIndex(other => other.host === s.host) === i).slice(0, 3);
++  return <span className="site-icons" aria-label={unique.map(s => s.host).join(", ")}>{unique.map(source => <SiteIcon key={source.host} source={source} run={run} />)}</span>;
++}
++export function SourceList({ sources, run }: { sources: WebSource[]; run: ImageRun }) {
++  return <div className="web-sources" aria-label="Web sources">{sources.map(source => <a key={source.url} className="web-source" href={source.url} target="_blank" rel="noopener noreferrer"><SiteIcon source={source} run={run} /><span><strong>{source.title}</strong><small>{source.host}</small></span></a>)}</div>;
++}
+--- a/product/apps/desktop/src/WebSources.test.tsx
++++ b/product/apps/desktop/src/WebSources.test.tsx
+@@ -0,0 +1,23 @@
++import { afterEach, expect, test, vi } from "vitest";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { SiteIcons, SourceList, webSources } from "./WebSources";
++import type { ClientMessage } from "./generated/protocol";
++afterEach(cleanup);
++const message: ClientMessage = { id: "result", role: "toolResult", tool: { name: "webSearch", call_id: "call", failed: false }, blocks: [{ kind: "unknown", value: { kind: "web_result", sources: [{ url: "https://example.com/a", title: "First page" }, { url: "https://example.com/b", title: "Second page" }, { url: "javascript:alert(1)", title: "Bad" }] } }] };
++test("source URLs are validated, icons deduplicate and use only native raster data", async () => {
++  const run = vi.fn(async () => ({ dataUrl: "data:image/png;base64,aGVsbG8=" }));
++  const sources = webSources(message); expect(sources).toHaveLength(2);
++  const { container } = render(<><SiteIcons sources={sources} run={run} /><SourceList sources={sources} run={run} /></>);
++  await waitFor(() => expect(container.querySelectorAll('img')).toHaveLength(3));
++  expect(run).toHaveBeenCalledTimes(1);
++  expect(run).toHaveBeenCalledWith({ kind: "runtime", action: "website_icon", args: { entry: "result", url: "https://example.com/a" } });
++  expect(screen.getByRole('link', { name: /First page/ }).getAttribute('href')).toBe('https://example.com/a');
++  fireEvent.error(container.querySelector('img')!); expect(container.querySelectorAll('img')).toHaveLength(2);
++  expect(webSources({ ...message, tool: { ...message.tool!, failed: true } })).toEqual([]);
++});
++test("failed or unsafe icon responses leave an offline-friendly fallback", async () => {
++  const run = vi.fn(async () => ({ dataUrl: "https://tracker.example/icon.svg" }));
++  const { container } = render(<SiteIcons sources={webSources(message)} run={run} />);
++  await waitFor(() => expect(run).toHaveBeenCalledTimes(1));
++  expect(container.querySelector('img')).toBeNull();expect(screen.getByText('E')).toBeTruthy();
++});
+--- a/product/crates/ag1-platform/src/client/website_icons.rs
++++ b/product/crates/ag1-platform/src/client/website_icons.rs
+@@ -0,0 +1,105 @@
++//! Optional public favicon decoration, bound to an existing web-tool result.
++//! Never fetch from the renderer, send search text/credentials, or alter tool evidence.
++use super::*;
++use crate::web_http::{SystemResolver, WebPolicy, WebResolver};
++use std::{collections::{HashSet, VecDeque}, net::SocketAddr, sync::LazyLock, time::Instant};
++use reqwest::Url;
++
++pub(super) fn sources(entry: &Value) -> Vec<Value> {
++    let m=&entry["message"];
++    if m["role"]!="toolResult" || m["isError"]==true {return vec![];}
++    let details=&m["details"];
++    let urls:Vec<_>=match m["toolName"].as_str() {
++        Some("webSearch")=>details["sourceUrls"].as_array().into_iter().flatten().filter_map(Value::as_str).take(4).collect(),
++        Some("webFetch")=>details["finalUrl"].as_str().or_else(||details["url"].as_str()).into_iter().collect(),
++        _=>return vec![],
++    };
++    let mut seen=HashSet::new();
++    urls.into_iter().filter_map(|raw| {
++        if raw.len()>2048 {return None;}
++        let url=Url::parse(raw).ok()?;
++        if !matches!(url.scheme(),"http"|"https") || !url.username().is_empty() || url.password().is_some() || !seen.insert(url.to_string()) {return None;}
++        let title=details["results"].as_array().into_iter().flatten().find(|row|row["url"]==raw).and_then(|row|row["title"].as_str()).unwrap_or_else(||url.host_str().unwrap_or("Webpage"));
++        Some(json!({"url":url.as_str(),"title":title.chars().take(240).collect::<String>()}))
++    }).collect()
++}
++fn origin(raw:&str)->Result<Url> {
++    let mut url=Url::parse(raw).map_err(|_|DomainError::PermissionDenied)?;
++    if !matches!(url.scheme(),"http"|"https") || !url.username().is_empty() || url.password().is_some() || url.port().is_some() {return Err(DomainError::PermissionDenied);}
++    url.set_scheme("https").map_err(|_|DomainError::PermissionDenied)?;
++    url.set_path("/");url.set_query(None);url.set_fragment(None);Ok(url)
++}
++#[derive(Default)]
++struct Cache { values:VecDeque<(String,Option<String>,Instant)>, inflight:HashSet<String>, requests:VecDeque<Instant> }
++static CACHE:LazyLock<Mutex<Cache>>=LazyLock::new(||Mutex::new(Cache::default()));
++pub(super) fn icon(raw:&str)->Result<Option<String>> {
++    let root=origin(raw)?;let key=root.to_string();let now=Instant::now();
++    {
++        let mut c=CACHE.lock().map_err(|_|DomainError::Conflict)?;
++        c.values.retain(|(_,_,until)|*until>now);
++        if let Some((_,data,_))=c.values.iter().find(|(k,_,_)|k==&key) {return Ok(data.clone());}
++        c.requests.retain(|t|now.duration_since(*t)<Duration::from_secs(60));
++        if c.inflight.len()>=4 || c.inflight.contains(&key) || c.requests.len()>=60 {return Ok(None);}
++        c.inflight.insert(key.clone());c.requests.push_back(now);
++    }
++    let data=fetch(root).ok();
++    let mut c=CACHE.lock().map_err(|_|DomainError::Conflict)?;c.inflight.remove(&key);
++    let ttl=if data.is_some(){3600}else{300};c.values.push_back((key,data.clone(),Instant::now()+Duration::from_secs(ttl)));
++    while c.values.len()>128 {c.values.pop_front();}
++    Ok(data)
++}
++fn fetch(root:Url)->Result<String> {
++    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|DomainError::Unavailable("icon runtime".into()))?;
++    runtime.block_on(async {tokio::time::timeout(Duration::from_secs(6),async {
++        for path in ["favicon.ico","apple-touch-icon.png"] {
++            let mut url=root.join(path).map_err(|_|DomainError::PermissionDenied)?;
++            for redirects in 0..=2 {
++                if url.scheme()!="https" || url.port_or_known_default()!=Some(443) || !url.username().is_empty() || url.password().is_some() {break;}
++                let host=url.host_str().ok_or(DomainError::PermissionDenied)?;
++                let addresses=SystemResolver.resolve(host,443).await?;WebPolicy::default().validate(url.as_str(),&addresses)?;
++                let addresses:Vec<_>=addresses.into_iter().map(|ip|SocketAddr::new(ip,443)).collect();
++                let client=reqwest::Client::builder().no_proxy().no_gzip().no_brotli().no_deflate().redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never()).pool_max_idle_per_host(0).connect_timeout(Duration::from_secs(2)).timeout(Duration::from_secs(3)).resolve_to_addrs(host,&addresses).build().map_err(|_|DomainError::Unavailable("icon TLS".into()))?;
++                let response=client.get(url.clone()).header("accept","image/*").header("user-agent","AG1/0.1").send().await;
++                let Ok(mut response)=response else {break;};
++                let h=response.headers();
++                if h.len()>64 || h.iter().map(|(k,v)|k.as_str().len()+v.as_bytes().len()).sum::<usize>()>16384 || h.get("content-encoding").is_some_and(|v|v!="identity") {break;}
++                if response.status().is_redirection() && redirects<2 {
++                    let Some(next)=h.get("location").and_then(|v|v.to_str().ok()).and_then(|v|url.join(v).ok()) else {break;};url=next;continue;
++                }
++                if response.status()!=200 || response.content_length().is_some_and(|n|n>128*1024) {break;}
++                let mut bytes=Vec::new();
++                while let Some(chunk)=response.chunk().await.map_err(|_|DomainError::Unavailable("icon body".into()))? {
++                    if bytes.len()+chunk.len()>128*1024 {return Err(DomainError::LimitExceeded("icon bytes".into()));}bytes.extend_from_slice(&chunk);
++                }
++                if let Ok(data)=crate::image_tools::website_icon(&bytes) {return Ok(data);}
++                break;
++            }
++        }
++        Err(DomainError::NotFound)
++    }).await.map_err(|_|DomainError::TimedOut)?})
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn sources_are_bounded_to_successful_native_web_results() {
++        let mut e=json!({"message":{"role":"toolResult","toolName":"webSearch","details":{"sourceUrls":["https://example.com/a?q=x","javascript:alert(1)","https://secret@example.com/","https://example.com/a?q=x"],"results":[{"url":"https://example.com/a?q=x","title":"Example source"}]}}});
++        assert_eq!(sources(&e),vec![json!({"url":"https://example.com/a?q=x","title":"Example source"})]);
++        e["message"]["isError"]=json!(true);assert!(sources(&e).is_empty());e["message"]["isError"]=json!(false);e["message"]["toolName"]=json!("bash");assert!(sources(&e).is_empty());
++    }
++    #[test]
++    fn icons_strip_page_paths_queries_and_reject_private_networks() {
++        assert_eq!(origin("http://example.com/private?q=secret#fragment").unwrap().as_str(),"https://example.com/");
++        for raw in ["file:///tmp/icon","https://user:secret@example.com/","https://example.com:8443/a"] {assert!(origin(raw).is_err());}
++        for ip in ["127.0.0.1","10.0.0.1","169.254.169.254","::1"] {assert!(WebPolicy::default().validate("https://example.com/favicon.ico",&[ip.parse().unwrap()]).is_err());}
++    }
++    #[test]
++    fn favicon_decode_returns_only_bounded_png_and_refuses_active_content() {
++        use image::{DynamicImage,ImageFormat};use std::io::Cursor;
++        for format in [ImageFormat::Png,ImageFormat::Ico] {
++            let mut bytes=Cursor::new(Vec::new());DynamicImage::new_rgba8(32,32).write_to(&mut bytes,format).unwrap();
++            assert!(crate::image_tools::website_icon(bytes.get_ref()).unwrap().starts_with("data:image/png;base64,"));
++        }
++        for bad in [b"<svg onload='alert(1)'/>".as_slice(),b"<html>error</html>",b"\x89PNG\r\n\x1a\n"] {assert!(crate::image_tools::website_icon(bad).is_err());}
++    }
++}

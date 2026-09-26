@@ -1,0 +1,387 @@
+{
+  "name": "profile-original",
+  "config": {
+    "name": "profile-original",
+    "repetitions": 1,
+    "workloads": [
+      "short",
+      "medium",
+      "quality"
+    ],
+    "flags": {
+      "--batch-size": 256,
+      "--ubatch-size": 128
+    },
+    "environment": {
+      "LD_PRELOAD": "/home/alex/Projects/llama-perf-20260914/libag1perf.so",
+      "AG1_PERF_PROFILE_OUT": "/home/alex/Projects/AG1/implementation/evidence/llama-performance-20260914/profile-original.jsonl"
+    },
+    "prepare_extra": true
+  },
+  "requests": [
+    {
+      "workload": "short",
+      "repeat": 0,
+      "ttft_seconds": 2.485030233001453,
+      "wall_seconds": 6.6468443689991545,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 957,
+        "prompt_ms": 2484.126,
+        "prompt_per_token_ms": 2.595742946708464,
+        "prompt_per_second": 385.2461590112578,
+        "predicted_n": 256,
+        "predicted_ms": 4161.692,
+        "predicted_per_token_ms": 16.256609375,
+        "predicted_per_second": 61.51344212882645
+      },
+      "output": "The provided `fetch_with_retry` implementation is fundamentally flawed for production use, particularly given the operational context of services requiring strict deadline adherence, idempotency, and connection efficiency. Below is a detailed review of its deficiencies across the requested dimensions, followed by a corrected pseudocode implementation.\n\n**Deadline Handling**\nThe original code ignores the `deadline` parameter entirely. It uses a fixed `timeout=30` for every request, which is arbitrary and likely exceeds the service-specific `timeout_ms` values (ranging from 300ms to 650ms in the context). Furthermore, it does not track elapsed time. If a retry loop consumes the entire budget, the final request may hang indefinitely or complete after the logical deadline has passed, violating the requirement to \"retry transient errors only within the remaining deadline.\"\n\n**Idempotency**\nThe code uses `session.post`, which is a non-idempotent method. The operational context specifies that services accept \"idempotent reads and tagged writes.\" Using POST for retries is dangerous; if the first request succeeded but the response was lost, a retry POST will create duplicate resources. The implementation should ideally use GET for reads or ensure that POST requests are strictly idempotent via unique tags,",
+      "prompt_tokens": 957,
+      "prompt_sha256": "fc774dcd33029d5528b2589dd46cee01f1bfceb8cf923e53a041a787e4f3a785",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 99.5,
+          "max": 100.0
+        },
+        "gpu_memory_pct": {
+          "median": 18.0,
+          "max": 23.0
+        },
+        "vram_mib": {
+          "median": 15580.0,
+          "max": 15582.0
+        },
+        "rss_mib": {
+          "median": 10696.8125,
+          "max": 10697.28125
+        },
+        "cpu_pct": {
+          "median": 100.07680352989215,
+          "max": 143.98314232589357
+        },
+        "gpu_temp": {
+          "median": 52.0,
+          "max": 54.0
+        },
+        "gpu_watts": {
+          "median": 107.13,
+          "max": 119.06
+        },
+        "sm_mhz": {
+          "median": 2640.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 23066406.0,
+          "max": 23952539
+        },
+        "pcie_tx_kibs": {
+          "median": 1847704.5,
+          "max": 2672070
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 44.5,
+          "max": 100.0
+        },
+        "gpu_memory_pct": {
+          "median": 31.0,
+          "max": 32.0
+        },
+        "vram_mib": {
+          "median": 15594.0,
+          "max": 15614.0
+        },
+        "rss_mib": {
+          "median": 10869.4765625,
+          "max": 10869.6640625
+        },
+        "cpu_pct": {
+          "median": 1179.9246091293685,
+          "max": 1201.8214201863343
+        },
+        "gpu_temp": {
+          "median": 53.0,
+          "max": 60.0
+        },
+        "gpu_watts": {
+          "median": 116.57,
+          "max": 118.32
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 111230.0,
+          "max": 125683
+        },
+        "pcie_tx_kibs": {
+          "median": 85961.0,
+          "max": 130224
+        }
+      },
+      "stop_type": "limit"
+    },
+    {
+      "workload": "medium",
+      "repeat": 0,
+      "ttft_seconds": 24.014012537998497,
+      "wall_seconds": 28.230476788998203,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9154,
+        "prompt_ms": 23982.862,
+        "prompt_per_token_ms": 2.6199324885296047,
+        "prompt_per_second": 381.6892245804525,
+        "predicted_n": 256,
+        "predicted_ms": 4216.089,
+        "predicted_per_token_ms": 16.46909765625,
+        "predicted_per_second": 60.71978082056617
+      },
+      "output": "The provided retry implementation is fundamentally flawed and violates the core principles outlined in the service inventory for `svc-003`, `svc-021`, `svc-047`, `svc-075`, and `svc-089`. The inventory explicitly mandates that retries must occur \"only within the remaining deadline,\" require \"jitter,\" and \"honor Retry-After\" headers. The current code ignores all these constraints, leading to potential cascading failures, timeout violations, and poor resource utilization.\n\n### Comparison of Service Policies\n\nFirst, let us extract the specific configurations for the requested services from the inventory:\n\n*   **svc-003**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-021**: `timeout_ms=800`, `retry_budget=1`\n*   **svc-047**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-075**: `timeout_ms=750`, `retry_budget=3`\n*   **svc-089**: `timeout_ms=350**, `retry_budget=1`\n\nThe current implementation uses a",
+      "prompt_tokens": 9154,
+      "prompt_sha256": "c6beb492673bfc61981c120101c5e23fd5706eb8b92e5005b5f412b889e0feb4",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 100.0,
+          "max": 100.0
+        },
+        "gpu_memory_pct": {
+          "median": 11.0,
+          "max": 25.0
+        },
+        "vram_mib": {
+          "median": 15614.0,
+          "max": 15668.0
+        },
+        "rss_mib": {
+          "median": 10945.859375,
+          "max": 11071.43359375
+        },
+        "cpu_pct": {
+          "median": 99.88745751462675,
+          "max": 237.36626106637374
+        },
+        "gpu_temp": {
+          "median": 55.0,
+          "max": 62.0
+        },
+        "gpu_watts": {
+          "median": 119.71,
+          "max": 129.5
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 22942187,
+          "max": 24150683
+        },
+        "pcie_tx_kibs": {
+          "median": 2660351,
+          "max": 2787207
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 46.0,
+          "max": 49.0
+        },
+        "gpu_memory_pct": {
+          "median": 32.0,
+          "max": 33.0
+        },
+        "vram_mib": {
+          "median": 15633.0,
+          "max": 15633.0
+        },
+        "rss_mib": {
+          "median": 11071.43359375,
+          "max": 11071.43359375
+        },
+        "cpu_pct": {
+          "median": 1170.2872747423633,
+          "max": 1184.7560402254037
+        },
+        "gpu_temp": {
+          "median": 56.0,
+          "max": 57.0
+        },
+        "gpu_watts": {
+          "median": 124.2,
+          "max": 125.8
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 107714,
+          "max": 128417
+        },
+        "pcie_tx_kibs": {
+          "median": 82177,
+          "max": 136474
+        }
+      },
+      "stop_type": "limit"
+    },
+    {
+      "workload": "quality",
+      "repeat": 0,
+      "ttft_seconds": 23.148702007001702,
+      "wall_seconds": 28.544736939998984,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9051,
+        "prompt_ms": 23103.261,
+        "prompt_per_token_ms": 2.552564468014584,
+        "prompt_per_second": 391.7628771107248,
+        "predicted_n": 331,
+        "predicted_ms": 5395.745,
+        "predicted_per_token_ms": 16.301344410876133,
+        "predicted_per_second": 61.34463359554613
+      },
+      "output": "{\n  \"svc-003\": {\n    \"replicas\": 5,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-3\",\n    \"deploy\": \"rev-9003\"\n  },\n  \"svc-021\": {\n    \"replicas\": 2,\n    \"timeout_ms\": 800,\n    \"retry_budget\": 1,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9021\"\n  },\n  \"svc-047\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9047\"\n  },\n  \"svc-075\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 750,\n    \"retry_budget\": 3,\n    \"owner\": \"team-10\",\n    \"deploy\": \"rev-9075\"\n  },\n  \"svc-089\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 350,\n    \"retry_budget\": 1,\n    \"owner\": \"team-11\",\n    \"deploy\": \"rev-9089\"\n  }\n}",
+      "prompt_tokens": 9051,
+      "prompt_sha256": "6bfdbbd6e8371f4377125be12ff788714218290ba1a813c641713f83d272a58a",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 100.0,
+          "max": 100.0
+        },
+        "gpu_memory_pct": {
+          "median": 11.0,
+          "max": 24.0
+        },
+        "vram_mib": {
+          "median": 15633.0,
+          "max": 15633.0
+        },
+        "rss_mib": {
+          "median": 11233.8203125,
+          "max": 11298.296875
+        },
+        "cpu_pct": {
+          "median": 99.93714649433733,
+          "max": 478.41586259350584
+        },
+        "gpu_temp": {
+          "median": 58.0,
+          "max": 65.0
+        },
+        "gpu_watts": {
+          "median": 120.48,
+          "max": 127.18
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 22939697,
+          "max": 23999414
+        },
+        "pcie_tx_kibs": {
+          "median": 2646533,
+          "max": 2762988
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 46.0,
+          "max": 99.0
+        },
+        "gpu_memory_pct": {
+          "median": 32.0,
+          "max": 34.0
+        },
+        "vram_mib": {
+          "median": 15631.0,
+          "max": 15631.0
+        },
+        "rss_mib": {
+          "median": 11358.39453125,
+          "max": 11361.08203125
+        },
+        "cpu_pct": {
+          "median": 1163.3735650865974,
+          "max": 1187.0880276513158
+        },
+        "gpu_temp": {
+          "median": 59.0,
+          "max": 60.0
+        },
+        "gpu_watts": {
+          "median": 126.84,
+          "max": 127.74
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 101049.5,
+          "max": 120703
+        },
+        "pcie_tx_kibs": {
+          "median": 86035.0,
+          "max": 128125
+        }
+      },
+      "stop_type": "eos",
+      "quality_pass": true
+    }
+  ],
+  "started_at": "2026-09-14T01:24:50Z",
+  "load_seconds": 6.886072530000092,
+  "status": "passed",
+  "load_resources": {
+    "gpu_pct": {
+      "median": 1.0,
+      "max": 71.0
+    },
+    "gpu_memory_pct": {
+      "median": 0.0,
+      "max": 4.0
+    },
+    "vram_mib": {
+      "median": 12974.0,
+      "max": 15262.0
+    },
+    "rss_mib": {
+      "median": 7279.484375,
+      "max": 10503.203125
+    },
+    "cpu_pct": {
+      "median": 100.19644999238895,
+      "max": 158.77065473342674
+    },
+    "gpu_temp": {
+      "median": 48.0,
+      "max": 49.0
+    },
+    "gpu_watts": {
+      "median": 42.4,
+      "max": 57.99
+    },
+    "sm_mhz": {
+      "median": 780.0,
+      "max": 2640.0
+    },
+    "pcie_rx_kibs": {
+      "median": 20703,
+      "max": 17117529
+    },
+    "pcie_tx_kibs": {
+      "median": 3613,
+      "max": 1967578
+    }
+  },
+  "peak_vram_mib": 15668.0,
+  "peak_rss_mib": 11361.08203125,
+  "exit_code": 0
+}

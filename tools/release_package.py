@@ -71,10 +71,11 @@ def package():
     shutil.copytree(ROOT/'product/licenses', stage/'licenses')
     shutil.copyfile(ROOT/'product/LICENSE', stage/'LICENSE')
     shutil.copyfile(ROOT/'fixtures/provenance/DYAD-NOTICE', stage/'NOTICE')
-    for name in ('README.md','install.py'):
+    for name in ('README.md','install.py','install-systemwide.py'):
         shutil.copyfile(ROOT/'product/release'/name, stage/name)
     for name in ('COMPATIBILITY.md','CUTOVER.md'):
         shutil.copyfile(ROOT/'product/clients'/name, stage/name)
+    shutil.copytree(ROOT/'product/apps/desktop/src-tauri/icons', stage/'icons')
     # Explicit launch root, persistent state outside immutable installation; no profile overrides.
     launcher = stage/'run-ag1'
     launcher.write_text('#!/bin/sh\nset -eu\nAG1_INSTALL_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\nexport AG1_INSTALL_ROOT\n: "${AG1_DESKTOP_STATE:=${XDG_STATE_HOME:-$HOME/.local/state}/ag1/desktop}"\nexport AG1_DESKTOP_STATE\nexec "$AG1_INSTALL_ROOT/bin/ag1-desktop" "$@"\n')
@@ -117,6 +118,10 @@ def package():
                'components':components,'properties':[{'name':'ag1:binary-closure','value':'binary-dependencies.json'},
                 {'name':'ag1:scope','value':'local Linux candidate; conservative static inventory; system shared libraries external'}]})
     write_json(stage/'binary-dependencies.json',dependencies)
+    # Shared installs must be readable by every desktop user.
+    for path in stage.rglob('*'):
+        if path.is_file():
+            path.chmod(0o755 if path.stat().st_mode & 0o111 else 0o644)
     inputs = fingerprints()
     manifest = {'version':1,'platform':'linux-x86_64','input_sha256':input_digest(),
                 'files':inventory(stage),'optional_dependencies':{'extensions':'separate archive; external Node 24',
@@ -124,6 +129,7 @@ def package():
                 'browser':'external optional','project_toolchains':'external','models':'external preserved builds'},
                 'release_accepted':False}
     write_json(stage/'package-manifest.json',manifest)
+    (stage/'package-manifest.json').chmod(0o644)
     tar = output/'ag1-0.1.0-rc-linux-x86_64.tar.gz'
     archive(stage,tar)
     companion = output/'extensions'

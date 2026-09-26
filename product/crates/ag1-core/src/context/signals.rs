@@ -66,7 +66,7 @@ pub fn recent(
                 }
                 let args = &b["arguments"];
                 match string(b, "name") {
-                    "read" | "edit" | "write" | "append" | "grep" | "find" | "ls" => {
+                    "read" | "inspect" | "edit" | "write" | "append" | "grep" | "find" | "ls" => {
                         paths.push(&args["path"])
                     }
                     "sourceContext" => paths.extend(blocks(&args["paths"])),
@@ -81,7 +81,7 @@ pub fn recent(
             }
         } else if m["role"] == "toolResult" && !exclude.is_some_and(|id| m["toolCallId"] == id) {
             let details = &m["details"];
-            match string(m, "toolName") {
+            match crate::tools::surface::message_tool(m) {
                 "grep" => paths.push(&details["firstMatchPath"]),
                 "sourceContext" => {
                     paths.extend(blocks(&details["files"]).iter().map(|f| &f["path"]))

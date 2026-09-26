@@ -81,6 +81,8 @@ pub struct Record {
     pub revision: u64,
     pub policy_revision: u64,
     pub target_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<super::mcp::Identity>,
     pub arguments: ContextArtifact,
     pub status: Status,
     pub effect: Effect,
@@ -120,7 +122,7 @@ fn key(workspace: &str, session: &str, operation: &str) -> String {
     format!("tool-{}", digest(&json!([workspace, session, operation])))
 }
 fn identity(call: &ValidatedCall, scope: &Scope) -> String {
-    digest(&json!([
+    let legacy = digest(&json!([
         call.operation(),
         call.call_id(),
         call.name(),
@@ -129,7 +131,16 @@ fn identity(call: &ValidatedCall, scope: &Scope) -> String {
         scope.session,
         scope.epoch,
         scope.revision
-    ]))
+    ]));
+    match call.mcp_identity() {
+        Some(identity) => digest(&json!(["mcp", legacy, identity])),
+        None => legacy,
+    }
+}
+fn source(call: &ValidatedCall) -> Value {
+    let mut source = json!({"type":"tool","name":call.name(),"callId":call.call_id()});
+    if let Some(identity) = call.mcp_identity() { source["mcp"] = json!(identity); }
+    source
 }
 fn event(record: &Record, stage: &str) -> ToolEvent {
     ToolEvent {
@@ -256,7 +267,7 @@ pub fn execute_with_artifacts<A: ExecutionArtifacts>(
     let args = artifacts.put_evidence(
         &call.args().to_string(),
         "tool-arguments",
-        &json!({"type":"tool","name":call.name(),"callId":call.call_id()}),
+        &source(&call),
         &[],
         None,
     )?;
@@ -272,6 +283,7 @@ pub fn execute_with_artifacts<A: ExecutionArtifacts>(
         revision: fence.scope.revision,
         policy_revision: fence.policy_revision,
         target_revision: fence.target_revision.into(),
+        mcp: call.mcp_identity().cloned(),
         arguments: args,
         status: Status::Intent,
         effect: Effect::Unknown,
@@ -295,7 +307,7 @@ pub fn execute_with_artifacts<A: ExecutionArtifacts>(
     let native = artifacts.put_evidence(
         &outcome.result.to_string(),
         "tool-native-result",
-        &json!({"type":"tool","name":call.name(),"callId":call.call_id()}),
+        &source(&call),
         &[],
         Some(&record.arguments.id),
     )?;
@@ -439,7 +451,7 @@ pub fn reject_with_hint(
         budget,
     } = rejection;
     crate::OperationId::new(operation)?;
-    crate::OperationId::new(call_id)?;
+    super::registry::validate_call_id(call_id)?;
     if name.len() > 128 || !name.is_ascii() {
         return Err(DomainError::InvalidInput("tool name".into()));
     }
@@ -506,6 +518,7 @@ pub fn reject_with_hint(
         revision: scope.revision,
         policy_revision: 0,
         target_revision: String::new(),
+        mcp: None,
         arguments,
         status: Status::Rejected,
         effect: Effect::None,

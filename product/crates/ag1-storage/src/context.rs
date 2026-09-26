@@ -92,19 +92,24 @@ impl<'a> ContextStore<'a> {
         reduce: impl FnOnce(&[Value], &mut Self) -> Result<Compilation, DomainError>,
     ) -> Result<ShadowCompilation, DomainError> {
         validate_history(messages)?;
-        let journal = self.store.journal_snapshot(&self.session)?;
-        if journal.revision != expected {
-            return Err(DomainError::Conflict);
-        }
-        // Base64 retains exact bytes without expanding each source byte into a JSON number.
-        let original = json!({"version":1,"session":self.session.as_str(),"revision":journal.revision,"leaf":journal.leaf,"headerBase64":B64.encode(&journal.header),"entries":journal.entries.iter().map(|e| json!({"id":e.id,"parent":e.parent,"physicalOrder":e.physical_order,"rawBase64":B64.encode(&e.raw)})).collect::<Vec<_>>()});
-        let original_journal = self.put_text(
-            &original.to_string(),
-            "context-original-journal",
-            "contextCompiler",
-            "journal",
-            &[],
-        )?;
+        // Release the raw/normalized snapshot and base64 JSON before building
+        // the original request and invoking the compiler. Only its durable
+        // artifact handle needs to live across reduction.
+        let original_journal = {
+            let journal = self.store.journal_snapshot(&self.session)?;
+            if journal.revision != expected {
+                return Err(DomainError::Conflict);
+            }
+            // Base64 retains exact bytes without expanding each source byte into a JSON number.
+            let original = json!({"version":1,"session":self.session.as_str(),"revision":journal.revision,"leaf":journal.leaf,"headerBase64":B64.encode(&journal.header),"entries":journal.entries.iter().map(|e| json!({"id":e.id,"parent":e.parent,"physicalOrder":e.physical_order,"rawBase64":B64.encode(&e.raw)})).collect::<Vec<_>>()});
+            self.put_text(
+                &original.to_string(),
+                "context-original-journal",
+                "contextCompiler",
+                "journal",
+                &[],
+            )?
+        };
         let original_request = self.put_text(
             &serde_json::to_string(messages)
                 .map_err(|_| DomainError::InvalidInput("request JSON".into()))?,
@@ -119,7 +124,14 @@ impl<'a> ContextStore<'a> {
                 "context projection has an orphan tool result".into(),
             ));
         }
-        if self.store.journal_snapshot(&self.session)?.revision != expected {
+        // Custody already retained the exact journal above. Recheck admission
+        // without materializing every raw and normalized entry a second time.
+        let revision = {
+            let db = self.store.conn().map_err(domain_error)?;
+            Store::ready(&db).map_err(domain_error)?;
+            crate::journal::active_session(&db, self.session.as_str()).map_err(domain_error)?
+        };
+        if revision != expected {
             return Err(DomainError::Conflict);
         }
         Ok(ShadowCompilation {

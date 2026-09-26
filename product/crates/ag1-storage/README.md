@@ -66,3 +66,30 @@ python3 tools/phase_gate.py P05
 The gate runs only P05 tests plus reference comparisons, lint/format/build, preservation and licensing checks. `storage-probe` is a disposable-store benchmark/crash harness; it is not included in the desktop launcher. The gate captures 10k/100k journal imports and full resumes, 100 durable acknowledgement samples, catalog growth and warm/reopened artifact reads. “Cold” here means a reopened adapter with kernel caches retained. Unsynced TS append latency is not an equivalent durability comparison.
 
 The fixture corpus derives from immutable P01 source and journal captures. Model/runtime actions remain zero. All L01–L08 preservation requirements remain binding. P06 can consume metadata CAS, P07 can consume journal/evidence ports, and P13 alone owns state authority cutover. Rollback discards only an unaccepted private destination and preserves its source snapshots and export.
+
+## Custody compression (storage schema 2)
+
+The native store reads schemas 1 and 2. New UTF-8 custody payloads of kinds
+`context-original-journal`, `runtime-request-input`, and `context-original-request`
+may use `blobs/<logical-sha256>.z1` when at least 16 KiB and compression saves at
+least 12.5%. Existing raw blobs are never rewritten. Other kinds remain raw.
+The envelope is `AG1ZLIB1`, an eight-byte little-endian logical length, and exactly
+one zlib stream. Both physical and logical compressed payloads are capped at
+256 MiB. Decoding rejects unknown formats, truncation, trailing data, invalid
+lengths, and hash mismatches. Authenticated pages and search stream logical bytes
+and verify the same bytes before returning trusted results.
+
+Schema 2 activates in the transaction publishing the first compressed artifact
+reference, after physical file sync, no-clobber rename, and directory sync.
+Older binaries reject schema 2 before writing. A pre-commit crash can leave only
+unreferenced physical data; normal reconciliation and orphan collection retain
+all referenced raw/compressed payloads. Raw is preferred deterministically when
+both representations exist; corruption never silently falls back to the other.
+
+`Store::blob_path` still means raw bytes and explicitly rejects compressed-only
+blobs. Consumers use authenticated pages/search or `export`. Lossless exports
+carry the source schema, exact selected physical blobs, and the existing decoded
+original-format compatibility views. Restore verifies both manifest and logical
+closure before atomic publication. Do not point an older binary at a schema-2
+store; use verified compatible export views to create a separate old-format
+state when rollback is required. Export does not transfer runtime authority.

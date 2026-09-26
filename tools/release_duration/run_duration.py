@@ -25,6 +25,7 @@ TOOLS=['read','grep','ls','bash','edit','write','artifact','sourceContext']
 POLICY={'max_idle_seconds':120,'max_activity_seconds':1800,'minimum_tasks_per_hour':2}
 
 class Run:
+    allow_semantic_continuation = False
     def __init__(self,args):
         os.umask(0o077)
         self.args=args;self.out=args.output.absolute();base=ROOT/'.local/p14-long-horizon'
@@ -72,7 +73,7 @@ class Run:
         return artifacts_intact(self.state,self.seed)
 
     def activity(self,kind,work):
-        reject_failed_reviews(self.out,self.tasks)
+        reject_failed_reviews(self.out,self.tasks,allow_semantic_continuation=self.allow_semantic_continuation)
         self.serial+=1;name=f'{self.serial:06}-{kind}';directory=self.out/'activities'/name;directory.mkdir(parents=True,mode=0o700)
         begin=time.monotonic_ns()
         if self.activities and begin-self.activities[-1]['finished_monotonic_ns']>POLICY['max_idle_seconds']*1e9:raise RuntimeError('Duration activity gap exceeded frozen budget')
@@ -145,7 +146,7 @@ class Run:
             full_context=None
             if through_renderer:
                 self.close()
-                result=renderer.run(self.desktop_binary,self.workspace,self.config,self.out/f'renderer-{index+1}',spec['task'],False,self.sampler,self.heap_library)
+                result=renderer.run(self.desktop_binary,self.workspace,self.config,self.out/f'renderer-{index+1}',spec['task'],False,self.sampler,self.heap_library,after_task=getattr(self,'renderer_probe',None))
                 full_context=result['full_context'];self.open()
                 self.scenarios.append({'scenario':'detach-reconnect','executed':True,'passed':True,'evidence':[ref(self.out/f'renderer-{index+1}/renderer-result.json')]})
                 receipt=result['terminal']
@@ -236,6 +237,9 @@ class Run:
         self.open();artifacts_intact(self.state,self.seed)
         return self.remember_scenario('corrupt-state-recovery',directory,{'refused_startup_exit_code':code,'corrupt_database_sha256':broken,'native_archive_sha256':sha,'archive_receipt':ref(directory/'archive.log'),'restore_receipt':ref(directory/'restore.log')})
 
+    def final_preservation(self):
+        self.run_command([str(self.cutover),'audit-cutover','/home/alex/Projects/Cruzible'],self.out/'final-preservation.json',1800)
+
     def run(self):
         self.started=time.monotonic_ns();duration=self.args.hours*3600
         start={'version':1,'status':'started','start_monotonic_ns':self.started,'hours':self.args.hours,'input_sha256':input_digest(),'package_sha256':self.package_sha,'heap_growth_budget_bytes_per_hour':8*1024*1024,'activity_policy':POLICY,'warmup_seconds':1800,'token_accounting':'externalized-content-once','externalized_tokens':self.seed['token_count'],'fault_schedule':{'renderer_after_tasks':3,'branch_and_fork_after_tasks':2,'corruption_after_seconds':3600,'model_crash_after_seconds':duration/4,'host_crash_after_seconds':duration/2},'bound_inputs':self.bound,'claim_review':'Every final assistant/source claim requires retained agent review after or during the run; missing review cannot pass final quality.'}
@@ -268,7 +272,7 @@ class Run:
             memory=analyze_memory(self.sampler.samples,self.started,start['warmup_seconds'],start['heap_growth_budget_bytes_per_hour'])
             retain(self.out/'memory-analysis.json',memory)
             if memory['status']!='passed':raise RuntimeError('Per-host post-warmup heap growth failed its predeclared budget')
-            self.run_command([str(self.cutover),'audit-cutover','/home/alex/Projects/Cruzible'],self.out/'final-preservation.json',1800)
+            self.final_preservation()
             self.evidence_bound()
         except (Exception, KeyboardInterrupt) as error:
             failure=repr(error);traceback.print_exc()

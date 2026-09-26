@@ -1,0 +1,840 @@
+--- before/product/crates/ag1-core/src/tools/websearch.rs
++++ after/product/crates/ag1-core/src/tools/websearch.rs
+@@ -1,4 +1,5 @@
+ //! Search planning, ranking and provider response parsing. No network or secrets.
++pub mod duckduckgo_web;
+ use super::research::{self, compact, compile, has, replace, rx, trim};
+ use crate::DomainError;
+ use serde::{Deserialize, Serialize};
+--- before/product/crates/ag1-platform/src/web_http.rs
++++ after/product/crates/ag1-platform/src/web_http.rs
+@@ -228,6 +228,7 @@
+     Fetch,
+     SearchHtml,
+     SearchJson,
++    SearchWeb,
+ }
+ impl WebHttp<SystemResolver> {
+     pub fn new(policy: WebPolicy) -> Self {
+@@ -346,7 +347,7 @@
+                 .no_proxy()
+                 .user_agent(match purpose {
+                     WebPurpose::Fetch => "AG1 webFetch",
+-                    WebPurpose::SearchHtml => "Mozilla/5.0",
++                    WebPurpose::SearchHtml | WebPurpose::SearchWeb => "Mozilla/5.0",
+                     WebPurpose::SearchJson => "AG1 webSearch",
+                 })
+                 .redirect(reqwest::redirect::Policy::none())
+@@ -380,6 +381,13 @@
+                         );
+                     }
+                 }
++                WebPurpose::SearchWeb => {
++                    headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
++                    headers.insert(
++                        reqwest::header::REFERER,
++                        HeaderValue::from_static("https://noai.duckduckgo.com/"),
++                    );
++                }
+                 WebPurpose::SearchJson => {
+                     headers.insert(
+                         reqwest::header::ACCEPT,
+@@ -400,6 +408,9 @@
+                 response=request.send()=>response.map_err(|e| if e.is_timeout() { DomainError::TimedOut } else { DomainError::Unavailable("web connection failed".into()) })?,
+             };
+             if response.status().is_redirection() {
++                if matches!(purpose, WebPurpose::SearchWeb) {
++                    return Err(DomainError::PermissionDenied);
++                }
+                 if hop == 5 {
+                     return Err(DomainError::LimitExceeded("web redirects".into()));
+                 }
+--- before/product/crates/ag1-platform/src/web_tools/search.rs
++++ after/product/crates/ag1-platform/src/web_tools/search.rs
+@@ -1,5 +1,6 @@
+ //! Native search providers share fetch's DNS/TLS boundaries and scoped hint memory.
+ use super::*;
++mod ddg_web;
+ use crate::web_http::WebPurpose;
+ use ag1_core::tools::websearch::{self, Attempt, ProviderResponse};
+ use std::time::Duration;
+@@ -21,6 +22,7 @@
+ }
+ #[derive(Clone)]
+ pub struct SearchEndpoints {
++    pub web: Option<(String, String)>,
+     pub html: String,
+     pub lite: String,
+     pub brave: String,
+@@ -28,6 +30,10 @@
+ impl Default for SearchEndpoints {
+     fn default() -> Self {
+         Self {
++            web: Some((
++                "https://noai.duckduckgo.com/".into(),
++                "https://links.duckduckgo.com/d.js".into(),
++            )),
+             html: "https://html.duckduckgo.com/html/".into(),
+             lite: "https://lite.duckduckgo.com/lite/".into(),
+             brave: "https://api.search.brave.com/res/v1/web/search".into(),
+@@ -76,11 +82,15 @@
+         ) {
+             return Err(DomainError::InvalidInput("web search provider".into()));
+         }
+-        for endpoint in [
++        let mut endpoints = vec![
+             &config.endpoints.html,
+             &config.endpoints.lite,
+             &config.endpoints.brave,
+-        ] {
++        ];
++        if let Some((landing, data)) = &config.endpoints.web {
++            endpoints.extend([landing, data]);
++        }
++        for endpoint in endpoints {
+             let url = reqwest::Url::parse(endpoint)
+                 .map_err(|_| DomainError::InvalidInput("search endpoint".into()))?;
+             if endpoint.len() > 4096
+@@ -343,6 +353,73 @@
+                     error: Some("DuckDuckGo is paused after a blocked request.".into()),
+                 });
+                 continue;
++            }
++            if name == "duckduckgo"
++                && let Some((landing, data)) = &self.config.endpoints.web
++            {
++                let result = self
++                    .duckduckgo_web(
++                        landing,
++                        data,
++                        max,
++                        &mut ddg_web::WebAttempt {
++                            query,
++                            deadline: deadline.min(Instant::now() + Duration::from_secs(12)),
++                            cancel,
++                            artifacts,
++                            evidence: &mut evidence,
++                            call_id,
++                        },
++                    )
++                    .await;
++                match result {
++                    Ok(results) => {
++                        attempts.push(Attempt {
++                            provider: "duckduckgo-web".into(),
++                            url: search_url(landing, query, None),
++                            status: "ok".into(),
++                            result_count: results.len(),
++                            error: None,
++                        });
++                        return Ok((
++                            ProviderResponse {
++                                results,
++                                attempts,
++                                provider: "duckduckgo-web".into(),
++                                provider_mode: self.config.mode.clone(),
++                                provider_order: order,
++                                cache_hit: false,
++                            },
++                            evidence,
++                        ));
++                    }
++                    Err(DomainError::Cancelled) => return Err(DomainError::Cancelled),
++                    Err(DomainError::PermissionDenied) => {
++                        return Err(DomainError::PermissionDenied);
++                    }
++                    Err(DomainError::TimedOut) if Instant::now() >= deadline => {
++                        return Err(DomainError::TimedOut);
++                    }
++                    Err(error) => {
++                        let message = error_message(error);
++                        let blocked = message == "DuckDuckGo web blocked"
++                            || message == "web HTTP status 403"
++                            || message == "web HTTP status 429";
++                        attempts.push(Attempt {
++                            provider: "duckduckgo-web".into(),
++                            url: search_url(landing, query, None),
++                            status: if blocked { "blocked" } else { "error" }.into(),
++                            result_count: 0,
++                            error: Some(message),
++                        });
++                        if blocked {
++                            *self.blocked_until.lock().map_err(|_| {
++                                DomainError::Unavailable("search cooldown".into())
++                            })? = Some(Instant::now() + Duration::from_secs(300));
++                            continue;
++                        }
++                    }
++                }
+             }
+             let endpoints = if name == "brave" {
+                 vec![(
+--- before/product/crates/ag1-platform/tests/web_http_contract.rs
++++ after/product/crates/ag1-platform/tests/web_http_contract.rs
+@@ -1241,6 +1241,7 @@
+                 mode: mode.into(),
+                 brave: None,
+                 endpoints: SearchEndpoints {
++                    web: None,
+                     html: format!("{origin}/html"),
+                     lite: format!("{origin}/lite"),
+                     ..SearchEndpoints::default()
+@@ -1345,6 +1346,7 @@
+         SearchConfig {
+             mode: "auto".into(),
+             endpoints: SearchEndpoints {
++                web: None,
+                 brave: format!("{origin}/search"),
+                 ..SearchEndpoints::default()
+             },
+@@ -1439,6 +1441,7 @@
+         SearchConfig {
+             mode: "serpapi".into(),
+             endpoints: SearchEndpoints {
++                web: None,
+                 html: format!("{origin}/html"),
+                 lite: format!("{origin}/lite"),
+                 ..SearchEndpoints::default()
+@@ -1627,6 +1630,7 @@
+         SearchConfig {
+             mode: "duckduckgo".into(),
+             endpoints: SearchEndpoints {
++                web: None,
+                 html: format!("{origin}/html"),
+                 lite: format!("{origin}/lite"),
+                 ..SearchEndpoints::default()
+@@ -1820,6 +1824,7 @@
+             mode: "duckduckgo".into(),
+             brave: None,
+             endpoints: SearchEndpoints {
++                web: None,
+                 html: format!("{origin}/html"),
+                 lite: format!("{origin}/lite"),
+                 ..Default::default()
+@@ -1929,6 +1934,7 @@
+             mode: "duckduckgo".into(),
+             brave: None,
+             endpoints: SearchEndpoints {
++                web: None,
+                 html: format!("{origin}/html"),
+                 lite: format!("{origin}/lite"),
+                 ..Default::default()
+@@ -1981,6 +1987,43 @@
+ #[tokio::test]
+ #[ignore = "Explicit bounded live DuckDuckGo probe; no model or desktop needed"]
+ async fn duckduckgo_live_search_checkpoint() {
++    run_duckduckgo_live_queries(&[
++        "site:urllib3.readthedocs.io Retry allowed_methods",
++        "Rust ownership borrowing documentation",
++        "Norway public transport Oslo",
++    ])
++    .await;
++}
++#[tokio::test]
++#[ignore = "Explicit eight-query web-flow quality probe; no model or desktop needed"]
++async fn duckduckgo_web_live_quality() {
++    run_duckduckgo_live_queries(&[
++        "site:urllib3.readthedocs.io Retry allowed_methods",
++        "Rust ownership borrowing documentation",
++        "Oslo public transport tickets Ruter",
++        "site:docs.python.org free threading Python GIL",
++        "site:postgresql.org docs jsonb indexing GIN",
++        "\"sqlite3_prepare_v3\" \"SQLITE_PREPARE_PERSISTENT\"",
++        "site:esa.int news September 2026",
++        "\"ag1_nonexistent_search_control_zxqv719824610\"",
++    ])
++    .await;
++}
++#[tokio::test]
++#[ignore = "Explicit final fresh-query checkpoint; no model or desktop needed"]
++async fn duckduckgo_web_live_final() {
++    run_duckduckgo_live_queries(&[
++        "site:docs.python.org asyncio TaskGroup cancellation",
++        "site:nodejs.org fetch AbortSignal timeout",
++        "site:sqlite.org WAL checkpoint busy",
++        "site:git-scm.com git worktree add detach",
++        "Oslo airport train Vy Flytoget",
++        "site:esa.int Earth observation Sentinel 2026",
++        "\"ag1_nonexistent_search_control_zxqv719824610\"",
++    ])
++    .await;
++}
++async fn run_duckduckgo_live_queries(queries: &[&str]) {
+     let _case = WEB_CASE.lock().await;
+     use ag1_core::tools::research;
+     use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
+@@ -1998,14 +2041,8 @@
+     let search = SearchService::new(web, SearchConfig::default(), "live-search").unwrap();
+     let mut results = vec![];
+     let mut responses = vec![];
+-    for (index, query) in [
+-        "site:urllib3.readthedocs.io Retry allowed_methods",
+-        "Rust ownership borrowing documentation",
+-        "Norway public transport Oslo",
+-    ]
+-    .into_iter()
+-    .enumerate()
+-    {
++    for (index, query) in queries.iter().copied().enumerate() {
++        let started = Instant::now();
+         let id = format!("live-{index}");
+         let ticket = fixture.ticket(
+             &id,
+@@ -2016,7 +2053,7 @@
+         );
+         let mut artifacts = fixture.artifacts(&id);
+         let (_source, mut cancel) = cancellation();
+-        let result = search
++        let mut result = search
+             .execute(
+                 ticket,
+                 WebExecution {
+@@ -2043,12 +2080,12 @@
+         {
+             responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
+         }
++        result["details"]["probeElapsedMs"] = json!(started.elapsed().as_millis());
+         let blocked = result["details"]["status"] == "blocked";
+         results.push(result);
+         if blocked {
+             break;
+         }
+-        tokio::time::sleep(Duration::from_secs(2)).await;
+     }
+     println!(
+         "LIVE_SEARCH_RESULTS={}",
+@@ -2136,3 +2173,154 @@
+     );
+     assert_eq!(task.join().unwrap().len(), 1);
+ }
++
++#[tokio::test]
++async fn duckduckgo_web_flow_retains_all_hops_and_bounds_verification() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::tools::research;
++    use ag1_platform::web_tools::{
++        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
++    };
++    use serde_json::json;
++    for blocked in [false, true] {
++        let fixture = ToolFixture::new();
++        let (port, task) = server(3, move |i, request| {
++            assert!(request.starts_with("GET "));
++            assert!(
++                request
++                    .to_lowercase()
++                    .contains("referer: https://noai.duckduckgo.com/")
++            );
++            match i {
++                0 => {
++                    assert!(request.starts_with("GET /landing?q=a%2Bb "));
++                    ok(b"<script id=deep_preload_script src='/d.js?q=a%2Bb&amp;dp=token'></script>")
++                }
++                1 => {
++                    assert!(request.starts_with("GET /d.js?q=a%2Bb&dp=token "));
++                    let body = "window.execDeep = function() { let jsa = 2; try { let Calc = function(num) {return num * 3;};jsa = Calc(jsa); } catch (e) { jsa = -1; } DDG.deep.initialize('/d.js?q=a%2Bb&dp=token&jsa_hash=hash&jsa=' + jsa, false); return {isJsaChallenge: true}; };";
++                    let mut bytes = format!(
++                        "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
++                        body.len()
++                    )
++                    .into_bytes();
++                    bytes.extend(body.as_bytes());
++                    bytes
++                }
++                _ => {
++                    assert!(request.starts_with("GET /d.js?q=a%2Bb&dp=token&jsa_hash=hash&jsa=6 "));
++                    if blocked {
++                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
++                            .to_vec()
++                    } else {
++                        ok(b"DDG.pageLayout.load('d',[{\"t\":\"Reference\",\"u\":\"https://example.org/reference\",\"a\":\"Useful result\"}]);")
++                    }
++                }
++            }
++        });
++        let origin = format!("http://127.0.0.1:{port}");
++        let web = Arc::new(
++            WebService::new(
++                WebHttp::new(
++                    WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap(),
++                ),
++                fixture.scope.clone(),
++                "web-flow",
++                Default::default(),
++            )
++            .unwrap(),
++        );
++        let search = SearchService::new(
++            web,
++            SearchConfig {
++                endpoints: SearchEndpoints {
++                    web: Some((format!("{origin}/landing"), format!("{origin}/d.js"))),
++                    html: format!("{origin}/html"),
++                    lite: format!("{origin}/lite"),
++                    ..SearchEndpoints::default()
++                },
++                ..SearchConfig::default()
++            },
++            "flow-search",
++        )
++        .unwrap();
++        for (i, query) in ["a+b", if blocked { "another query" } else { "a+b" }]
++            .into_iter()
++            .enumerate()
++        {
++            let id = format!("flow-{i}");
++            let ticket = fixture.ticket(
++                &id,
++                "webSearch",
++                json!({"query":query}),
++                search.target_revision(),
++                12,
++            );
++            let mut artifacts = fixture.artifacts(&id);
++            let (_source, mut cancel) = cancellation();
++            let result = search
++                .execute(
++                    ticket,
++                    WebExecution {
++                        registry: &fixture.registry,
++                        scope: &fixture.scope,
++                        policy_revision: 1,
++                        now: || 12,
++                        deadline: Instant::now() + Duration::from_secs(3),
++                        cancel: &mut cancel,
++                        profile: research::profile(90000., 0.),
++                    },
++                    2026,
++                    &mut artifacts,
++                )
++                .await
++                .unwrap()
++                .result;
++            assert_eq!(
++                result["details"]["resultCount"],
++                if blocked { 0 } else { 1 }
++            );
++            if i == 0 {
++                assert_eq!(
++                    result["details"]["networkEvidence"]["artifactIds"]
++                        .as_array()
++                        .unwrap()
++                        .len(),
++                    3
++                );
++            }
++            if blocked {
++                assert_eq!(result["isError"], true);
++                assert_eq!(result["details"]["status"], "blocked");
++            } else {
++                assert_eq!(result["details"]["searchProvider"], "duckduckgo-web");
++                assert_eq!(result["details"]["cacheHit"], i > 0);
++            }
++        }
++        assert_eq!(task.join().unwrap().len(), 3);
++    }
++}
++
++#[tokio::test]
++async fn duckduckgo_web_transport_rejects_redirect_before_contacting_target() {
++    let _case = WEB_CASE.lock().await;
++    let (port, task) = server(1, |_, _| {
++        b"HTTP/1.1 302 Found\r\nLocation: https://example.org/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
++    });
++    let origin = format!("http://127.0.0.1:{port}");
++    let http =
++        WebHttp::new(WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap());
++    let (_source, mut cancel) = cancellation();
++    assert!(matches!(
++        http.fetch_for(
++            &format!("{origin}/d.js?q=test"),
++            None,
++            WebPurpose::SearchWeb,
++            Instant::now() + Duration::from_secs(3),
++            &mut cancel
++        )
++        .await,
++        Err(DomainError::PermissionDenied)
++    ));
++    assert_eq!(task.join().unwrap().len(), 1);
++}
+--- before/product/crates/ag1-platform/tests/session_contract.rs
++++ after/product/crates/ag1-platform/tests/session_contract.rs
+@@ -2614,6 +2614,7 @@
+                 mode: "duckduckgo".into(),
+                 brave: None,
+                 endpoints: SearchEndpoints {
++                    web: None,
+                     html: format!("{origin}/html"),
+                     lite: format!("{origin}/lite"),
+                     brave: format!("{origin}/brave"),
+--- /dev/null
++++ after/product/crates/ag1-core/src/tools/websearch/duckduckgo_web.rs
+@@ -0,0 +1,144 @@
++//! Decode DDG's web result envelope and a narrowly recognized arithmetic check.
++//! Downloaded JavaScript is data only and is never executed.
++use super::*;
++
++fn invalid() -> DomainError {
++    DomainError::InvalidInput("unrecognized DuckDuckGo web response".into())
++}
++pub fn preload(html: &str) -> Result<String, DomainError> {
++    if html.len() > 1_000_000 {
++        return Err(invalid());
++    }
++    let doc = dom_query::Document::from(html);
++    let scripts = doc.select("script#deep_preload_script");
++    if scripts.length() != 1 {
++        return Err(invalid());
++    }
++    scripts
++        .attr("src")
++        .map(|s| s.to_string())
++        .ok_or_else(invalid)
++}
++pub fn results(script: &str, max: usize) -> Result<Vec<ResultRow>, DomainError> {
++    if script.len() > 1_000_000 || max > 256 {
++        return Err(invalid());
++    }
++    if max == 0 {
++        return Ok(vec![]);
++    }
++    let (_, tail) = script
++        .split_once("DDG.pageLayout.load('d',")
++        .ok_or_else(invalid)?;
++    let value = serde_json::Deserializer::from_str(tail)
++        .into_iter::<Value>()
++        .next()
++        .ok_or_else(invalid)?
++        .map_err(|_| invalid())?;
++    let items = value.as_array().ok_or_else(invalid)?;
++    if items.len() > 256 {
++        return Err(invalid());
++    }
++    if items.len() == 1 && items[0]["t"] == "DEEP_SIMPLE_NO_RESULTS" && items[0]["u"] == "" {
++        return Ok(vec![]);
++    }
++    let mut rows = vec![];
++    let mut seen = BTreeSet::new();
++    for item in items {
++        let (Some(title), Some(url)) = (item["t"].as_str(), item["u"].as_str()) else {
++            continue;
++        };
++        let url = normalize_result_url(url);
++        let title = decode_html(title);
++        if title.is_empty() || !usable(&url) || !seen.insert(canonical(&url)) {
++            continue;
++        }
++        rows.push(ResultRow {
++            title: title.chars().take(4096).collect(),
++            url,
++            snippet: decode_html(item["a"].as_str().unwrap_or_default())
++                .chars()
++                .take(4096)
++                .collect(),
++        });
++        if rows.len() >= max {
++            break;
++        }
++    }
++    if rows.is_empty() && !items.is_empty() {
++        return Err(invalid());
++    }
++    Ok(rows)
++}
++/// Only accept the observed grammar: integer seed, up to 64 declared arithmetic
++/// helpers, up to 64 invocations, and a literal DDG continuation. Unknown code
++/// fails closed. The caller separately authorizes the returned URL and query.
++pub fn arithmetic_continuation(script: &str) -> Result<String, DomainError> {
++    if script.len() > 16384 {
++        return Err(invalid());
++    }
++    let prefix =
++        rx(r"(?s)^window\.execDeep = function\(\) \{\s*let jsa = ([0-9]{1,9});\s*try \{\s*");
++    let caps = prefix.captures(script).ok_or_else(invalid)?;
++    let mut value: u64 = caps[1].parse().map_err(|_| invalid())?;
++    let mut rest = &script[caps.get(0).unwrap().end()..];
++    let helper = rx(r"^let ([A-Za-z]{1,32}) = function\(num\) \{([^{}]{1,256})\};\s*");
++    let multiply = rx(r"^return num \* ([0-9]{1,3});$");
++    let fragment = rx(
++        r"^const el = document\.createElement\('div'\);el\.innerHTML = `([^`]{1,80})`;return num \+ el\.innerHTML\.length;$",
++    );
++    let mut operations = BTreeMap::new();
++    while let Some(c) = helper.captures(rest) {
++        if operations.len() >= 64 {
++            return Err(invalid());
++        }
++        let operation = if let Some(m) = multiply.captures(&c[2]) {
++            (true, m[1].parse::<u64>().map_err(|_| invalid())?)
++        } else {
++            let m = fragment.captures(&c[2]).ok_or_else(invalid)?;
++            // Browser HTML-fragment serialization lengths, independently checked
++            // against Chromium. No arbitrary markup or script evaluation.
++            let n = match &m[1] {
++                "<div><div></div><div></div" => 33,
++                "<br><div></br><br></div" => 23,
++                "<li><div></li><li></div" => 29,
++                "<p><div></p><p></div" => 32,
++                _ => return Err(invalid()),
++            };
++            (false, n)
++        };
++        if operations.insert(c[1].to_string(), operation).is_some() {
++            return Err(invalid());
++        }
++        rest = &rest[c.get(0).unwrap().end()..];
++    }
++    let step = rx(r"^jsa = ([A-Za-z]{1,32})\(jsa\);\s*");
++    let mut count = 0;
++    while let Some(c) = step.captures(rest) {
++        count += 1;
++        if count > 64 {
++            return Err(invalid());
++        }
++        let (multiply, n) = operations.get(&c[1]).ok_or_else(invalid)?;
++        value = if *multiply {
++            value.checked_mul(*n)
++        } else {
++            value.checked_add(*n)
++        }
++        .ok_or_else(invalid)?;
++        if value > 9_007_199_254_740_991 {
++            return Err(invalid());
++        }
++        rest = &rest[c.get(0).unwrap().end()..];
++    }
++    if count == 0 {
++        return Err(invalid());
++    }
++    let suffix = rx(
++        r"(?s)^\} catch \(e\) \{ jsa = -1; \}\s*DDG\.deep\.initialize\('([^'\s\\]+)' \+ jsa, false\);\s*return \{isJsaChallenge: true\};\s*\};\s*$",
++    );
++    let c = suffix.captures(rest).ok_or_else(invalid)?;
++    if c[1].len() > 8192 || !c[1].ends_with("&jsa=") {
++        return Err(invalid());
++    }
++    Ok(format!("{}{value}", &c[1]))
++}
+--- /dev/null
++++ after/product/crates/ag1-core/tests/duckduckgo_web.rs
+@@ -0,0 +1,84 @@
++use ag1_core::tools::websearch::duckduckgo_web::*;
++const SCRIPT: &str = include_str!("fixtures/duckduckgo-web/results.js");
++const CHECK: &str = include_str!("fixtures/duckduckgo-web/arithmetic.js");
++#[test]
++fn retained_live_results_decode_without_running_javascript() {
++    let rows = results(SCRIPT, 4).unwrap();
++    assert_eq!(rows.len(), 4);
++    assert_eq!(
++        rows[0].url,
++        "https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html"
++    );
++    assert!(rows[0].snippet.contains("memory safety"));
++    assert!(!rows[0].snippet.contains("<b>"));
++}
++#[test]
++fn live_arithmetic_and_changed_seed_match_browser_calculation() {
++    assert!(
++        arithmetic_continuation(CHECK)
++            .unwrap()
++            .ends_with("&jsa=10715")
++    );
++    // Seed is multiplied by 3 and 5; this proves calculation rather than replay.
++    assert!(
++        arithmetic_continuation(&CHECK.replace("let jsa = 559", "let jsa = 560"))
++            .unwrap()
++            .ends_with("&jsa=10730")
++    );
++}
++#[test]
++fn unknown_code_fragments_operations_and_overflow_are_rejected() {
++    for changed in [
++        CHECK.replace("return num * 3;", "return eval(num);"),
++        CHECK.replace("<br><div></br><br></div", "<img src=x onerror=alert(1)>"),
++        CHECK.replace("jsa = dgZHlvHI(jsa);", "jsa = unknown(jsa);"),
++        CHECK
++            .replace("return num * 3;", "return num * 999;")
++            .replace("jsa = dgZHlvHI(jsa);", &"jsa = FPBtGrSz(jsa);".repeat(60)),
++        format!("{CHECK}fetch('https://evil.test')"),
++    ] {
++        assert!(arithmetic_continuation(&changed).is_err());
++    }
++}
++#[test]
++fn preload_requires_one_named_script_and_preserves_escaped_query() {
++    assert_eq!(preload("<script id=deep_preload_script src='https://links.duckduckgo.com/d.js?q=a%2Bb&amp;dp=x'></script>").unwrap(), "https://links.duckduckgo.com/d.js?q=a%2Bb&dp=x");
++    assert!(preload("<script src='https://evil.test/'></script>").is_err());
++    assert!(preload("<script id=deep_preload_script src=a></script><script id=deep_preload_script src=b></script>").is_err());
++}
++#[test]
++fn result_envelope_limits_deduplicates_and_rejects_unusable_payloads() {
++    let body = r#"DDG.pageLayout.load('d',[{"t":"A &amp; B","u":"https://example.org/a%2Fb","a":"Use <b>safe</b> text"},{"t":"duplicate","u":"https://example.org/a%2Fb"},{"t":"bad","u":"javascript:alert(1)"},{"t":"second","u":"https://example.net/"}]);"#;
++    let rows = results(body, 3).unwrap();
++    assert_eq!(rows.len(), 2);
++    assert_eq!(rows[0].title, "A & B");
++    assert_eq!(rows[0].url, "https://example.org/a%2Fb");
++    assert!(
++        results("DDG.pageLayout.load('d',[]);", 4)
++            .unwrap()
++            .is_empty()
++    );
++    assert!(
++        results(
++            "DDG.pageLayout.load('d',[{\"t\":\"bad\",\"u\":\"file:///tmp/x\"}]);",
++            4
++        )
++        .is_err()
++    );
++    assert!(results("DDG.pageLayout.load('d',[oops]);", 4).is_err());
++    assert!(results(SCRIPT, 257).is_err());
++    assert!(results(SCRIPT, 0).unwrap().is_empty());
++}
++
++#[test]
++fn explicit_no_result_sentinel_is_empty_but_unknown_rows_are_not() {
++    assert!(
++        results(
++            r#"DDG.pageLayout.load('d',[{"t":"DEEP_SIMPLE_NO_RESULTS","u":"","a":""}]);"#,
++            4
++        )
++        .unwrap()
++        .is_empty()
++    );
++    assert!(results(r#"DDG.pageLayout.load('d',[{"unrecognized":true}]);"#, 4).is_err());
++}
+--- /dev/null
++++ after/product/crates/ag1-core/tests/fixtures/duckduckgo-web/results.js
+@@ -0,0 +1 @@
++window.execDeep = function() {DDG.deep.adUnitIndex = '9';if (DDG.deep && DDG.deep.setUpstream) DDG.deep.setUpstream("bingv7aa");DDG.deep.deepPayload = {"instantAnswers":[{"data":{"assist_operator":0,"belowAds":true,"can_auto_answer":0,"endpoint":"/qna.js?q=Rust%20ownership%20borrowing%20documentation&vqd=4-280096344240509712872206749159195233934&signal=low&upgradable=0&run_id=7e04f685-7f17-4161-bbf1-e35cf5820a15&ikey=BRWIww&perf_id=9613c8c976ecbc93&perf_sampled=0","intent":0,"isSignalUpgradable":0,"is_recent_topic":0,"postData":{"abstracts":[],"auto_sorry_reason":null,"bing_market":"en-US","country_code":"NO","deep_wiki_title":null,"domains":[],"dominant_result_language":"en","dw":1,"entities":[],"fresh_news_required":0,"genericized_query_l0":"rust ownership borrowing documentation","genericized_query_l1":"rust ownership borrowing documentation","genericized_query_l2":"rust ownership borrowing documentation","has_ads":0,"index_wiki_title":"","is_news_heavy":0,"news_heavy_trigger_reasons":[],"news_slot_rank":1000,"num_top_ten_urls_within_thirty_days":0,"num_top_ten_urls_within_two_days":0,"q":"Rust%20ownership%20borrowing%20documentation","query_language":"en","ranks":[],"serp_timestamp":1748304000,"spelling_suggestion":null,"supported_wikidata_prop_matches":[],"titles":[],"trigger_version":16,"urls":[],"wiki_entities_from_organics":[],"wikidata_ids":[],"wikidata_instance_of_ids":[],"wikidata_property_aliases_in_query":[],"word_shingles_from_organics":[]},"precheck_counts":2,"query":"Rust%20ownership%20borrowing%20documentation","run_id":"7e04f685-7f17-4161-bbf1-e35cf5820a15","should_use_cached_answer":0},"from":"wikinlp","resources":null,"signal":"low"}],"recommendedTabs":{"maxVisibleTabs":3,"tabOrder":["images","videos","news","maps_expanded","products"]}};DDG.deep.bn={'ivc':1};if (DDG.pageLayout) DDG.pageLayout.load('a',[], {"page_load_url":"https://duckduckgo.com/y.js?iurl=%7B2%7DIG%3D279B49B044634B70896CD451B6FDA083%26CID%3D071F0076F84B6A92177717A5F96D6BF7%26Type%3DEvent.CPT%26DATA%3D0&market=en%2DUS"});DDG.deep.signalSummary = "wikinlp:l";DDG.inject('DDG.Data.languages.resultLanguages', {"en":["https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html","https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html","https://rustify.rs/articles/rust-ownership-borrowing-explained","https://learningrust.org/lessons/06-ownership","https://web.mit.edu/rust-lang_v1.25/arch/amd64_ubuntu1404/share/doc/rust/html/book/first-edition/ownership.html","https://microsoft.github.io/RustTraining/c-cpp-book/ch07-ownership-and-borrowing.html","https://manjushaps.github.io/Rust-Series-Borrowing/","https://www.zetcode.com/rust/ownership/","https://codezup.com/mastering-rust-ownership-borrowing-best-practices/","https://rust.guide/article/Rust_Ownership_and_Borrowing.html"]});DDG.deep.pageLayoutSummary = "w10r1";DDG.inject('DDG.Data.languages.adLanguages', {});if (DDG.pageLayout) DDG.pageLayout.load('d',[{"a":"Understanding <b>Ownership</b> <b>Ownership</b> is <b>Rust&#x27;s</b> most unique feature and has deep implications for the rest of the language. It enables <b>Rust</b> to make memory safety guarantees without needing a garbage collector, so it&#x27;s important to understand how <b>ownership</b> works. In this chapter, we&#x27;ll talk about <b>ownership</b> as well as several related features: <b>borrowing</b>, slices, and how <b>Rust</b> lays data out in ...","ae":null,"c":"https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html","d":"doc.rust-lang.org/book/ch04-00-understanding-ownership.html","da":"rust_queries","h":0,"i":"doc.rust-lang.org","k":null,"l":[{"snippet":"Control Flow The ability to run some code depending on whether a condition is true and the ability to run some code repeatedly while a condition is true are basic building blocks in most programming languages. The most common constructs that let you control the flow of execution of Rust code are if expressions and loops. if Expressions An if expression allows you to branch your code depending ...","targetUrl":"https://doc.rust-lang.org/book/ch03-05-control-flow.html","text":"Control Flow"},{"snippet":"What Is Ownership? Ownership is a set of rules that govern how a Rust program manages memory. All programs have to manage the way they use a computer's memory while running. Some languages have garbage collection that regularly looks for no-longer-used memory as the program runs; in other languages, the programmer must explicitly allocate and free the memory. Rust uses a third approach ...","targetUrl":"https://doc.rust-lang.org/book/ch04-01-what-is-ownership.html","text":"What is Ownership"},{"snippet":"References and Borrowing The issue with the tuple code in Listing 4-5 is that we have to return the String to the calling function so that we can still use the String after the call to calculate_length, because the String was moved into calculate_length. Instead, we can provide a reference to the String value. A reference is like a pointer in that it's an address we can follow to access the ...","targetUrl":"https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html","text":"References and Borrowing"}],"m":0,"o":0,"p":0,"s":"bingv7aa","sn":"Rust Programming Language","t":"Understanding Ownership - The Rust Programming Language","u":"https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html"},{"a":"References and <b>Borrowing</b> The issue with the tuple code in Listing 4-5 is that we have to return the String to the calling function so that we can still use the String after the call to calculate_length, because the String was moved into calculate_length. Instead, we can provide a reference to the String value. A reference is like a pointer in that it&#x27;s an address we can follow to access the ...","ae":null,"c":"https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html","d":"doc.rust-lang.org/book/ch04-02-references-and-borrowing.html","da":"rust_queries","h":0,"i":"doc.rust-lang.org","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","sn":"Rust Programming Language","t":"References and Borrowing - The Rust Programming Language","u":"https://doc.rust-lang.org/book/ch04-02-references-and-borrowing.html"},{"a":"The clearest explanation of <b>Rust</b> <b>ownership</b>, <b>borrowing</b>, and the borrow checker in 2026. Understand why <b>Rust</b> works this way and how to stop fighting the compiler.","ae":null,"c":"https://rustify.rs/articles/rust-ownership-borrowing-explained","d":"rustify.rs/articles/rust-ownership-borrowing-explained","da":"","h":0,"i":"rustify.rs","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","t":"Rust Ownership and Borrowing Explained: A Visual Guide for 2026","u":"https://rustify.rs/articles/rust-ownership-borrowing-explained"},{"a":"<b>Ownership</b> &amp; <b>Borrowing</b> <b>Ownership</b> is <b>Rust&#x27;s</b> most unique feature and has deep implications for the rest of the language. It enables <b>Rust</b> to make memory safety guarantees without needing a garbage collector. What is <b>Ownership</b>? <b>Ownership</b> is a set of rules that govern how a <b>Rust</b> program manages memory. Unlike languages with garbage collection (like Java or Python) or manual memory management (like C ...","ae":null,"c":"https://learningrust.org/lessons/06-ownership","d":"learningrust.org/lessons/06-ownership","da":"","h":0,"i":"learningrust.org","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","t":"Ownership &amp; Borrowing \u00b7 Learn Rust | LearningRust.org","u":"https://learningrust.org/lessons/06-ownership"},{"a":"<b>Ownership</b> This is the first of three sections presenting <b>Rust&#x27;s</b> <b>ownership</b> system. This is one of <b>Rust&#x27;s</b> most distinct and compelling features, with which <b>Rust</b> developers should become quite acquainted. <b>Ownership</b> is how <b>Rust</b> achieves its largest goal, memory safety. There are a few distinct concepts, each with its own chapter: <b>ownership</b>, which you&#x27;re reading now <b>borrowing</b>, and their ...","ae":null,"b":"mitvid\tMIT Video\tvideo.mit.edu","c":"https://web.mit.edu/rust-lang_v1.25/arch/amd64_ubuntu1404/share/doc/rust/html/book/first-edition/ownership.html","d":"web.mit.edu/rust-lang_v1.25/arch/amd64_ubuntu1404/share/doc/rust/html/book/first-edition/ownership.html","da":"","h":0,"i":"web.mit.edu","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","sn":"MIT - Massachusetts Institute of Technology","t":"Ownership - The Rust Programming Language","u":"https://web.mit.edu/rust-lang_v1.25/arch/amd64_ubuntu1404/share/doc/rust/html/book/first-edition/ownership.html"},{"a":"<b>Rust</b> <b>ownership</b>, <b>borrowing</b> and lifetimes Recall that <b>Rust</b> only permits a single mutable reference to a variable and multiple read-only references The initial declaration of the variable establishes <b>ownership</b> Subsequent references borrow from the original owner. The rule is that the scope of the borrow can never exceed the owning scope.","ae":null,"c":"https://microsoft.github.io/RustTraining/c-cpp-book/ch07-ownership-and-borrowing.html","d":"microsoft.github.io/RustTraining/c-cpp-book/ch07-ownership-and-borrowing.html","da":"","h":0,"i":"microsoft.github.io","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","t":"7. Ownership and Borrowing - Rust for C/C++ Programmers","u":"https://microsoft.github.io/RustTraining/c-cpp-book/ch07-ownership-and-borrowing.html"},{"a":"\ud83d\udccc What is <b>Borrowing</b>? <b>Borrowing</b> is <b>Rust&#x27;s</b> way of allowing temporary access to data without taking <b>ownership</b> of it. When you borrow a value, you use it through a reference, and when you&#x27;re done, the original owner still retains full control. References are created using the &amp; symbol for immutable borrows or &amp;mut for mutable borrows:","ae":null,"c":"https://manjushaps.github.io/Rust-Series-Borrowing/","d":"manjushaps.github.io/Rust-Series-Borrowing/","da":"","h":0,"i":"manjushaps.github.io","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","t":"Rust Basics Explained: Borrowing in Rust - The Art of Lending Data","u":"https://manjushaps.github.io/Rust-Series-Borrowing/"},{"a":"<b>Rust</b> <b>ownership</b> and <b>borrowing</b> tutorial shows how to use <b>ownership</b>, <b>borrowing</b>, and slices in <b>Rust</b>.","ae":null,"c":"https://www.zetcode.com/rust/ownership/","d":"www.zetcode.com/rust/ownership/","da":"","e":"2026-06-07T00:00:00.0000000","h":0,"i":"www.zetcode.com","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","sn":"ZetCode","t":"Rust ownership and borrowing - understanding ownership in Rust - ZetCode","u":"https://www.zetcode.com/rust/ownership/"},{"a":"Learn how to master <b>Rust&#x27;s</b> <b>ownership</b> and <b>borrowing</b> system with real-world examples. Discover best practices to write efficient and safe <b>Rust</b> code.","ae":null,"c":"https://codezup.com/mastering-rust-ownership-borrowing-best-practices/","d":"codezup.com/mastering-rust-ownership-borrowing-best-practices/","da":"","e":"2025-05-27T00:00:00.0000000","h":0,"i":"codezup.com","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","sn":"Codez Up","t":"Master Rust Ownership and Borrowing: Best Practices","u":"https://codezup.com/mastering-rust-ownership-borrowing-best-practices/"},{"a":"<b>Rust&#x27;s</b> <b>ownership</b> and <b>borrowing</b> system is a powerful and intuitive way to manage memory in <b>Rust</b> programs. By enforcing strict rules around <b>ownership</b> and <b>borrowing</b>, <b>Rust</b> is able to guarantee memory safety and thread safety without sacrificing performance.","ae":null,"c":"https://rust.guide/article/Rust_Ownership_and_Borrowing.html","d":"rust.guide/article/Rust_Ownership_and_Borrowing.html","da":"","h":0,"i":"rust.guide","k":null,"m":0,"o":0,"p":0,"s":"bingv7aa","t":"Rust Ownership and Borrowing","u":"https://rust.guide/article/Rust_Ownership_and_Borrowing.html"},{"n":"/d.js?q=Rust%20ownership%20borrowing%20documentation&l=us-en&p=&s=10&a=noai&ex=-1&dl=en&ct=NO&sp=0&vqd=4-280096344240509712872206749159195233934&bing_market=en-US&host_region=eun&dp=K1c8t7cueJ5KQqFSYL3qJ0_6MOOvAKGbaO-1qyn_TUcsUmlqKrvp2sOqm3HlSCk4d_wkzYF1JO9-PWW4uhfEF18pMbRpmYhfouF9kY4xqN6iVknyfYEva5esm5G5-PvWU6sJLPyy5nfkIV7xYBxXjUksiELD3x0FL48CemZ4wqFY3nvAiT28Cib-R9ajumuMcAqg3lePg5AFSQycjdGBbsTeS20JbwLhDBOtgVf7VBE.9Zx9G22y0RH3SA_oiaAXPw"}]);DDG.duckbar.loadModule('related_searches', {"ads":[],"query":"Rust ownership borrowing documentation","queryEncoded":"Rust%20ownership%20borrowing%20documentation","response_type":"places","results":[{"display_text":"rust <b>programming</b> ownership","text":"rust programming ownership","web_search_url":"?q=rust%20programming%20ownership&origin=related"},{"display_text":"<b>how</b> <b>to</b> <b>use</b> <b>references</b> <b>in</b> rust","text":"how to use references in rust","web_search_url":"?q=how%20to%20use%20references%20in%20rust&origin=related"},{"display_text":"<b>reference</b> <b>and</b> borrowing <b>in</b> rust","text":"reference and borrowing in rust","web_search_url":"?q=reference%20and%20borrowing%20in%20rust&origin=related"},{"display_text":"rust <b>memory</b> ownership","text":"rust memory ownership","web_search_url":"?q=rust%20memory%20ownership&origin=related"},{"display_text":"rust <b>reference</b> <b>and</b> <b>borrow</b> <b>error</b>","text":"rust reference and borrow error","web_search_url":"?q=rust%20reference%20and%20borrow%20error&origin=related"},{"display_text":"rust ownership <b>language</b>","text":"rust ownership language","web_search_url":"?q=rust%20ownership%20language&origin=related"},{"display_text":"rust ownership","text":"rust ownership","web_search_url":"?q=rust%20ownership&origin=related"},{"display_text":"rust <b>lending</b> <b>error</b> <b>codes</b>","text":"rust lending error codes","web_search_url":"?q=rust%20lending%20error%20codes&origin=related"}],"vqd":{"Rust%20ownership%20borrowing%20documentation":"4-280096344240509712872206749159195233934"}});DDG.duckbar.loadModule('related_qna');if (DDG.pageLayout) DDG.pageLayout.initialize({"mainline":{"items":[["organic"],["organic"],["organic"],["organic"],["organic"],["organic"],["organic"],["organic"],["organic"],["organic"],["related_searches"]]}}, { start: 0 });DDG.deep.emit("load:completed");};--- /dev/null
++++ after/product/crates/ag1-core/tests/fixtures/duckduckgo-web/arithmetic.js
+@@ -0,0 +1,10 @@
++window.execDeep = function() { 
++let jsa = 559;
++try {
++let VHpXtxxd = function(num) {const el = document.createElement('div');el.innerHTML = `<div><div></div><div></div`;return num + el.innerHTML.length;};let gayjukcX = function(num) {const el = document.createElement('div');el.innerHTML = `<br><div></br><br></div`;return num + el.innerHTML.length;};let vSnLdzRM = function(num) {const el = document.createElement('div');el.innerHTML = `<li><div></li><li></div`;return num + el.innerHTML.length;};let UZyDwghI = function(num) {const el = document.createElement('div');el.innerHTML = `<div><div></div><div></div`;return num + el.innerHTML.length;};let dgZHlvHI = function(num) {const el = document.createElement('div');el.innerHTML = `<li><div></li><li></div`;return num + el.innerHTML.length;};let FPBtGrSz = function(num) {return num * 3;};let sFXEVDCp = function(num) {const el = document.createElement('div');el.innerHTML = `<p><div></p><p></div`;return num + el.innerHTML.length;};let zymKHSjN = function(num) {const el = document.createElement('div');el.innerHTML = `<p><div></p><p></div`;return num + el.innerHTML.length;};let jvbqOzLA = function(num) {const el = document.createElement('div');el.innerHTML = `<div><div></div><div></div`;return num + el.innerHTML.length;};let gzzgVWLv = function(num) {const el = document.createElement('div');el.innerHTML = `<li><div></li><li></div`;return num + el.innerHTML.length;};let ZjPAmTbY = function(num) {const el = document.createElement('div');el.innerHTML = `<div><div></div><div></div`;return num + el.innerHTML.length;};let qQvMVklG = function(num) {return num * 5;};let essaiTiL = function(num) {const el = document.createElement('div');el.innerHTML = `<br><div></br><br></div`;return num + el.innerHTML.length;};let PLLkBxmy = function(num) {const el = document.createElement('div');el.innerHTML = `<br><div></br><br></div`;return num + el.innerHTML.length;};jsa = dgZHlvHI(jsa);jsa = PLLkBxmy(jsa);jsa = jvbqOzLA(jsa);jsa = zymKHSjN(jsa);jsa = FPBtGrSz(jsa);jsa = gzzgVWLv(jsa);jsa = UZyDwghI(jsa);jsa = essaiTiL(jsa);jsa = qQvMVklG(jsa);jsa = vSnLdzRM(jsa);jsa = ZjPAmTbY(jsa);jsa = gayjukcX(jsa);jsa = VHpXtxxd(jsa);jsa = sFXEVDCp(jsa);
++} catch (e) { jsa = -1; }
++
++DDG.deep.initialize('/d.js?q=site%3Adocs.python.org%20free%20threading%20GIL&l=us-en&s=0&a=noai&dl=en&ct=NO&vqd=4-198328791588021845447066634378410742108&bing_market=en-US&p_ent=&ex=-1&dp=kFAvRv__fltn3Hog8JkUoSU4fYs6hQwwY9myzfR6sxBTHdHUeipJ4KQZIKd7qk-huz0jalQNPhGJPysXwJHq77n1kPizzqhLmoLLW_Cvij3wZHMi-Y7uFf6Rhr-Hon09E0LTz0yN1pHkvZS463D32BThtV4k4h9VQ6_i0NHyE2odeN0uptcCwgbvSNqx1nnAZMmjLoM4AXf8c4ArMjq-hHF23X1y1p76P44Qf59vQd4PEwmiEAjLGxZPKup1k6if.yQx_UWatpoIHdIWTG_wEWA&perf_id=768d4b29dceeeb35&parent_perf_id=035d04a75cefdd26&perf_sampled=0&host_region=eun&sp=1&dfrsp=1&bpa=1&wrap=1&aps=0&biaexp=b&desktopadclickablecontentexp=b&discussionsciexp=b&litexp=a&msvrtexp=b&searchbarexp=b&weatherexp=b&jsa_hash=cc813670599be3d94d7fabac6bda99b7&jsa=' + jsa, false);
++    
++return {isJsaChallenge: true};
++};--- /dev/null
++++ after/product/crates/ag1-platform/src/web_tools/search/ddg_web.rs
+@@ -0,0 +1,118 @@
++use super::*;
++use crate::web_http::{WebPurpose, WebResponse};
++use ag1_core::tools::websearch::duckduckgo_web;
++
++fn checked_data_url(value: &str, endpoint: &str, query: &str) -> Result<String, DomainError> {
++    let base = reqwest::Url::parse(endpoint).map_err(|_| DomainError::PermissionDenied)?;
++    let url = base
++        .join(value)
++        .map_err(|_| DomainError::PermissionDenied)?;
++    let terms = url
++        .query_pairs()
++        .filter(|(key, _)| key == "q")
++        .map(|(_, v)| v.into_owned())
++        .collect::<Vec<_>>();
++    if url.as_str().len() > 8192
++        || url.origin() != base.origin()
++        || url.path() != base.path()
++        || !url.username().is_empty()
++        || url.password().is_some()
++        || url.fragment().is_some()
++        || terms != [query]
++    {
++        return Err(DomainError::PermissionDenied);
++    }
++    Ok(url.to_string())
++}
++pub(super) struct WebAttempt<'a, A> {
++    pub query: &'a str,
++    pub deadline: Instant,
++    pub cancel: &'a mut CancelToken,
++    pub artifacts: &'a mut A,
++    pub evidence: &'a mut Vec<String>,
++    pub call_id: &'a str,
++}
++impl<R: WebResolver> SearchService<R> {
++    async fn web_search_response(
++        &self,
++        url: &str,
++        attempt: &mut WebAttempt<'_, impl ContextArtifactPort>,
++    ) -> Result<WebResponse, DomainError> {
++        let response = self
++            .web
++            .http
++            .fetch_for(
++                url,
++                None,
++                WebPurpose::SearchWeb,
++                attempt.deadline,
++                attempt.cancel,
++            )
++            .await?;
++        let raw = json!({"version":1,"provider":"duckduckgo-web","initialRequestMethod":"GET","initialRequestTarget":url,
++            "searchQuery":attempt.query,"requestedUrl":url,"finalUrl":response.final_url,"redirectChain":response.redirect_chain,
++            "statusCode":response.status,"contentType":response.content_type,"bodyBase64":STANDARD.encode(&response.bytes),
++            "bodySha256":format!("{:x}",Sha256::digest(&response.bytes)),"bodyRepresentation":"decoded-entity","trust":"untrusted"});
++        let artifact = attempt.artifacts.put_evidence(
++            &raw.to_string(),
++            "web-response",
++            &json!({"type":"tool","name":"webSearch","callId":attempt.call_id}),
++            &[],
++            None,
++        )?;
++        attempt.evidence.push(artifact.id);
++        Ok(response)
++    }
++    pub(super) async fn duckduckgo_web(
++        &self,
++        landing: &str,
++        data_endpoint: &str,
++        max: usize,
++        attempt: &mut WebAttempt<'_, impl ContextArtifactPort>,
++    ) -> Result<Vec<websearch::ResultRow>, DomainError> {
++        let query = attempt.query;
++        let url = search_url(landing, query, None);
++        let page = self.web_search_response(&url, attempt).await?;
++        let html = String::from_utf8_lossy(&page.bytes);
++        if page.status != 200 || websearch::duckduckgo_page_status(&html) == "blocked" {
++            return Err(DomainError::Unavailable("DuckDuckGo web blocked".into()));
++        }
++        let link = duckduckgo_web::preload(&html)?;
++        let url = checked_data_url(&link, data_endpoint, query)?;
++        let mut response = self.web_search_response(&url, attempt).await?;
++        if response.status == 202 {
++            let script = String::from_utf8_lossy(&response.bytes);
++            let continuation = duckduckgo_web::arithmetic_continuation(&script)
++                .map_err(|_| DomainError::Unavailable("DuckDuckGo web blocked".into()))?;
++            let url = checked_data_url(&continuation, data_endpoint, query)?;
++            response = self.web_search_response(&url, attempt).await?;
++        }
++        if response.status != 200
++            || websearch::duckduckgo_page_status(&String::from_utf8_lossy(&response.bytes))
++                == "blocked"
++        {
++            return Err(DomainError::Unavailable("DuckDuckGo web blocked".into()));
++        }
++        duckduckgo_web::results(&String::from_utf8_lossy(&response.bytes), max)
++    }
++}
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn continuation_cannot_change_origin_path_or_query() {
++        let endpoint = "https://links.duckduckgo.com/d.js";
++        assert!(checked_data_url("/d.js?q=a%2Bb&jsa=17", endpoint, "a+b").is_ok());
++        for value in [
++            "https://evil.test/d.js?q=a%2Bb",
++            "//127.0.0.1/d.js?q=a%2Bb",
++            "/other?q=a%2Bb",
++            "/d.js?q=other",
++            "/d.js?q=a%2Bb&q=a%2Bb",
++            "https://user@links.duckduckgo.com/d.js?q=a%2Bb",
++            "/d.js?q=a%2Bb#fragment",
++        ] {
++            assert!(checked_data_url(value, endpoint, "a+b").is_err(), "{value}");
++        }
++    }
++}

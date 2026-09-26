@@ -61,8 +61,8 @@ impl Host {
         if self.commands.snapshot()?.scope != *scope || self.commands.client_transition_pending()? {
             return Err(DomainError::Conflict);
         }
-        let slot = self
-            .project
+        let project = self.working_project()?;
+        let slot = project
             .try_lock()
             .map_err(|_| DomainError::QueueFull)?;
         f(slot
@@ -71,8 +71,10 @@ impl Host {
     }
 
     pub(super) fn project_command(&self, action: &str, args: &Value) -> Result<Value> {
-        let mut slot = self
-            .project
+        let workspace = self.working_workspace()?;
+        if !self.folder_selection()?.primary_writable() && !["status", "stop", "log"].contains(&action) { return Err(DomainError::InvalidInput("Project actions require a read/write working folder".into())); }
+        let project = self.working_project()?;
+        let mut slot = project
             .try_lock()
             .map_err(|_| DomainError::QueueFull)?;
         let Some(runtime) = slot.as_mut() else {
@@ -122,7 +124,7 @@ impl Host {
                         ag1_core::projects::Kind::Web | ag1_core::projects::Kind::Tauri
                     ) {
                     let package: Value = serde_json::from_slice(
-                        &self.workspace.snapshot("package.json", 1024 * 1024)?.bytes,
+                        &workspace.snapshot("package.json", 1024 * 1024)?.bytes,
                     )
                     .map_err(json_error)?;
                     if package["scripts"]["dev"]
@@ -166,8 +168,7 @@ impl Host {
                         // Vite serves package.json without HTML transforms. Match
                         // the complete selected manifest, in addition to Runtime's
                         // owned-listener check and strict-port launch.
-                        let identity = self
-                            .workspace
+                        let identity = workspace
                             .snapshot("package.json", 8192)
                             .ok()
                             .and_then(|file| String::from_utf8(file.bytes).ok());

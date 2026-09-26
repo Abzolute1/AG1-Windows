@@ -33,6 +33,17 @@ pub struct ClientMessage {
     pub id: String,
     pub role: String,
     pub blocks: Vec<MessageBlock>,
+    /// Execution identity, independent of result arrival order or display text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tool: Option<ToolResultIdentity>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultIdentity {
+    pub call_id: String,
+    pub name: String,
+    pub failed: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]

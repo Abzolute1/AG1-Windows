@@ -1,4 +1,12 @@
-# Planning handoff
+# Planning documents
+
+The current remaining feature work is indexed in [tasks/README.md](../tasks/README.md), with separate artifact/review, MCP, chat-cleanup and final-verification task files. GitHub is complete; this documentation cleanup does not resume the remaining implementation.
+
+The documents in this directory retain the original architecture decisions, coverage, phase graph and runtime-preservation requirements. They are reference and gate inputs, not the current feature queue. Broader release acceptance remains governed by [P14](../phases/P14-release-and-long-horizon-gates.md).
+
+## Historical planning-stage handoff — 2026-09-04
+
+The following describes the original pre-implementation planning snapshot. Its statements about implementation not having begun and P01 being next are historical.
 
 Start with [ROADMAP](../ROADMAP.md), then the [phase index](../phases/README.md). No implementation phase has run.
 

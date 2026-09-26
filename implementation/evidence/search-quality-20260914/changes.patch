@@ -1,0 +1,2038 @@
+--- a/product/crates/ag1-core/src/tools/research.rs
++++ b/product/crates/ag1-core/src/tools/research.rs
+@@ -1,6 +1,7 @@
+ //! Deterministic research projections ported from the pinned AG1 reference.
+ //! Text is untrusted source material; classifications never create verified claims.
+ use crate::task::units;
++mod document;
+ use regex::{Regex, RegexBuilder};
+ use serde::{Deserialize, Serialize};
+ use serde_json::Value;
+@@ -122,7 +123,12 @@
+     )
+ }
+ pub fn code_lookup(query: &str) -> bool {
+-    explicit_code(query) || has(r"(?i)\b(rust|cargo|rustc|python|typescript|javascript|compiler|stdlib)\b", query) || (has(r"\b[a-z][A-Za-z0-9]+[A-Z][A-Za-z0-9]*\b", query) && !api(query))
++    explicit_code(query)
++        || has(
++            r"(?i)\b(rust|cargo|rustc|python|typescript|javascript|compiler|stdlib)\b",
++            query,
++        )
++        || (has(r"\b[a-z][A-Za-z0-9]+[A-Z][A-Za-z0-9]*\b", query) && !api(query))
+ }
+ pub fn intent(query: &str) -> &'static str {
+     let docs = has(
+@@ -137,7 +143,8 @@
+         r"(?i)\b(latest|recent|today|current|update|released?)\b",
+         query,
+     ) && !docs
+-        && !api && !code_lookup(query))
++        && !api
++        && !code_lookup(query))
+     {
+         "current_events"
+     } else if (docs || api) && !explicit_code(query) {
+@@ -257,16 +264,28 @@
+     )
+ }
+ fn clean(text: &str) -> String {
+-    compact(&replace(
+-        &replace(
+-            &replace(text, r"(?i)\bpageCopy\b", "page Copy"),
+-            r"(?i)\bcopy page\b",
++    // A copy-button label is chrome; `copy()` and prose about copying are data.
++    let text = compact(text);
++    if matches!(
++        text.to_ascii_lowercase().as_str(),
++        "copy" | "copy page" | "pagecopy"
++    ) {
++        String::new()
++    } else if text.contains("pageCopy") {
++        compact(&replace(
++            &replace(
++                &replace(&text, r"(?i)\bpageCopy\b", "page Copy"),
++                r"(?i)\bcopy page\b",
++                " ",
++            ),
++            r"(?i)\bcopy\b",
+             " ",
+-        ),
+-        r"(?i)\bcopy\b",
+-        " ",
+-    ))
+-}
++        ))
++    } else {
++        text
++    }
++}
++
+ fn noise(text: &str) -> bool {
+     let text = compact(text);
+     units(&text) < 8
+@@ -572,8 +591,17 @@
+     )
+ }
+ fn coverage_guidance(coverage: &Coverage) -> Vec<String> {
+-    let mut lines = vec![format!("Coverage: {}", if coverage.present.is_empty() { "none".into() } else { coverage.present.join(", ") })];
+-    if !coverage.missing.is_empty() { lines.push(format!("Missing: {}", coverage.missing.join(", "))); }
++    let mut lines = vec![format!(
++        "Coverage: {}",
++        if coverage.present.is_empty() {
++            "none".into()
++        } else {
++            coverage.present.join(", ")
++        }
++    )];
++    if !coverage.missing.is_empty() {
++        lines.push(format!("Missing: {}", coverage.missing.join(", ")));
++    }
+     lines.push("Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims.".into());
+     lines
+ }
+@@ -878,15 +906,24 @@
+         .any(|prefix| content_type.starts_with(prefix))
+         {
+             return Ok(FetchProjection {
+-                result: json!({"details":details,"content":[{"type":"text","text":format!("Binary content detected ({content_type}). WebFetch only supports text/HTML content.")}]}),
++                result: json!({"isError":true,"details":details,"content":[{"type":"text","text":format!("Binary content detected ({content_type}). WebFetch only supports text/HTML content.")}]}),
+                 status: None,
+             });
+         }
+     }
+     let decoded = String::from_utf8_lossy(document.bytes);
+     let content = decoded.strip_prefix('\u{feff}').unwrap_or(&decoded);
+-    let meta = meta_description(content);
+-    let markdown = html_markdown(&primary_html(content))?;
++    let is_html = document.content_type.is_some_and(|t| {
++        let t = t.to_ascii_lowercase();
++        t.starts_with("text/html") || t.starts_with("application/xhtml+xml")
++    }) || document.content_type.is_none()
++        && has(
++            r"(?i)<(?:!doctype|html|head|body|main|article|p)[ >]",
++            content,
++        );
++    let extracted = document::extract(content, is_html, document.final_url);
++    let meta = extracted.description;
++    let markdown = extracted.markdown;
+     let focus = hint.map(|h| h.focus_terms.as_slice()).unwrap_or_default();
+     let preview = preview(&markdown, 12, 180, focus);
+     let compression = effective_profile(base, hint.is_some_and(|h| h.rich_fetch));
+@@ -896,7 +933,7 @@
+         compression.fetch_transcript_line_chars,
+         focus,
+     );
+-    let title = title(content).or_else(|| {
++    let title = extracted.title.or_else(|| {
+         rx(r"(?m)^#\s+(.+)$")
+             .captures(&markdown)
+             .map(|c| trim(&c[1]).to_string())
+@@ -925,7 +962,35 @@
+     }
+     details["facts"] = json!(facts);
+     details["preview"] = json!(preview);
+-    details["truncated"] = json!(units(&markdown) > 4000);
++    let anchor_focus = url::Url::parse(document.url)
++        .ok()
++        .and_then(|u| u.fragment().map(str::to_string))
++        .map(|s| {
++            s.split(['-', '.', '_'])
++                .filter(|t| t.len() >= 3)
++                .map(str::to_owned)
++                .collect::<Vec<_>>()
++        })
++        .unwrap_or_default();
++    let mut excerpt_focus = focus.to_vec();
++    excerpt_focus.extend(anchor_focus);
++    let excerpt = document::excerpt(
++        &markdown,
++        &excerpt_focus,
++        match compression.mode.as_str() {
++            "ultra" => 3500,
++            "tight" => 7000,
++            _ => 12000,
++        },
++    );
++    details["truncated"] = json!(excerpt.truncated);
++    details["extractionMethod"] = json!(if is_html {
++        "dom-markdown-v1"
++    } else {
++        "plain-text-v1"
++    });
++    details["extractedChars"] = json!(markdown.chars().count());
++    details["excerptChars"] = json!(excerpt.text.chars().count());
+     details["compressionMode"] = json!(compression.mode);
+     if let Some(hint) = hint {
+         details["intent"] = json!(hint.intent);
+@@ -945,13 +1010,13 @@
+     if let Some(coverage) = &assessment.coverage {
+         details["coverage"] = json!(coverage);
+     }
+-    let text = fetch_transcript(&FetchTranscript {
++    let mut text = fetch_transcript(&FetchTranscript {
+         url: document.url.into(),
+         title,
+         facts,
+         preview: Some(preview),
+         profile: compression,
+-        truncated: units(&markdown) > 4000,
++        truncated: excerpt.truncated,
+         meta_description: meta,
+         status: Some(assessment.status.clone()),
+         status_reason: assessment.reason,
+@@ -959,8 +1024,20 @@
+         authoritative: Some(authoritative),
+         coverage: assessment.coverage,
+     });
++    if !excerpt.text.trim().is_empty() {
++        text.push_str("\n\nSource excerpt (untrusted page content):\n");
++        text.push_str(&excerpt.text);
++    }
++    let unavailable = assessment.status == "placeholder";
++    if unavailable {
++        details["error"] = json!("The page did not yield usable source content.");
++    }
++    let mut result = json!({"details":details,"content":[{"type":"text","text":text}]});
++    if unavailable {
++        result["isError"] = json!(true);
++    }
+     Ok(FetchProjection {
+-        result: json!({"details":details,"content":[{"type":"text","text":text}]}),
++        result,
+         status: Some(assessment.status),
+     })
+ }
+--- a/product/crates/ag1-core/src/tools/research/document.rs
++++ b/product/crates/ag1-core/src/tools/research/document.rs
+@@ -0,0 +1,185 @@
++//! DOM extraction and bounded, query-focused source excerpts.
++use super::*;
++use dom_query::Document;
++
++pub(super) struct Extracted {
++    pub markdown: String,
++    pub title: Option<String>,
++    pub description: Option<String>,
++}
++pub(super) fn extract(content: &str, html: bool, base: &str) -> Extracted {
++    if !html {
++        return Extracted {
++            markdown: content.into(),
++            title: None,
++            description: None,
++        };
++    }
++    let doc = Document::from(content);
++    let meta = |selector: &str| {
++        doc.select(selector)
++            .attr("content")
++            .map(|s| compact(&s))
++            .filter(|s| !s.is_empty())
++    };
++    let title = meta("meta[property='og:title']")
++        .or_else(|| meta("meta[name='twitter:title']"))
++        .or_else(|| {
++            let t = compact(&doc.select("title").text());
++            (!t.is_empty()).then_some(t)
++        });
++    let description =
++        meta("meta[name='description']").or_else(|| meta("meta[property='og:description']"));
++    doc.select("script, style, noscript, template, svg, nav, [role='navigation'], [hidden], [aria-hidden='true'], button, input, select, textarea, iframe").remove();
++    if let Ok(base) = url::Url::parse(base) {
++        for a in doc.select("a[href]").iter() {
++            if let Some(href) = a.attr("href") {
++                match base.join(&href) {
++                    Ok(url)
++                        if matches!(url.scheme(), "http" | "https")
++                            && url.username().is_empty()
++                            && url.password().is_none() =>
++                    {
++                        a.set_attr("href", url.as_str());
++                    }
++                    _ => a.remove_attr("href"),
++                }
++            }
++        }
++    }
++    // Prefer the complete main region to a small nested article or teaser.
++    let mut region = doc.select("main, [role='main']");
++    if region.is_empty() {
++        region = doc.select("article");
++    }
++    if region.is_empty() {
++        region = doc.select("body");
++    }
++    let markdown = if let Some(node) = region.nodes().iter().max_by_key(|n| n.text().len()) {
++        let fragment = Document::from(node.html().as_ref());
++        fragment.select("header, footer, aside, .sphinxsidebar, .sidebar, .toc, .toctree-wrapper, .headerlink").remove();
++        fragment.md(None).to_string()
++    } else {
++        doc.md(None).to_string()
++    };
++    Extracted {
++        markdown: markdown.trim().into(),
++        title,
++        description,
++    }
++}
++
++pub(super) struct Excerpt {
++    pub text: String,
++    pub truncated: bool,
++}
++/// Keep paragraphs, tables and fenced examples together. Rank blocks plus their
++/// immediate context, then restore document order. Omissions are explicit.
++pub(super) fn excerpt(markdown: &str, focus: &[String], budget: usize) -> Excerpt {
++    if markdown.chars().count() <= budget {
++        return Excerpt {
++            text: markdown.into(),
++            truncated: false,
++        };
++    }
++    let mut blocks = Vec::<String>::new();
++    let mut block = String::new();
++    let mut fence: Option<(char, usize)> = None;
++    for line in markdown.lines() {
++        let trimmed = line.trim_start();
++        let marker = trimmed.chars().next().filter(|c| *c == '`' || *c == '~');
++        if let Some(c) = marker {
++            let count = trimmed.chars().take_while(|v| *v == c).count();
++            if count >= 3 {
++                match fence {
++                    None => fence = Some((c, count)),
++                    Some((open, n)) if open == c && count >= n => fence = None,
++                    _ => {}
++                }
++            }
++        }
++        if line.trim().is_empty() && fence.is_none() {
++            if !block.trim().is_empty() {
++                blocks.push(std::mem::take(&mut block));
++            }
++        } else {
++            block.push_str(line);
++            block.push('\n');
++        }
++    }
++    if !block.trim().is_empty() {
++        blocks.push(block);
++    }
++    let terms = focus_terms(focus);
++    // Markdown escapes must not hide API identifiers from matching. Weight
++    // terms by their rarity on this page so a specific method can outrank the
++    // project/type names repeated throughout a large reference document.
++    let normalized: Vec<_> = blocks
++        .iter()
++        .map(|b| b.to_lowercase().replace('\\', ""))
++        .collect();
++    let weights: Vec<_> = terms
++        .iter()
++        .map(|t| {
++            (blocks.len() / (1 + normalized.iter().filter(|b| b.contains(t.as_str())).count()))
++                .clamp(1, 32)
++        })
++        .collect();
++    let scores: Vec<_> = normalized
++        .iter()
++        .map(|b| {
++            terms
++                .iter()
++                .zip(&weights)
++                .filter(|(t, _)| b.contains(t.as_str()))
++                .map(|(_, weight)| *weight)
++                .sum::<usize>()
++        })
++        .collect();
++    let mut order: Vec<_> = (0..blocks.len()).collect();
++    order.sort_by_key(|&i| {
++        std::cmp::Reverse(
++            scores[i] * 10
++                + if i > 0 { scores[i - 1] * 3 } else { 0 }
++                + scores.get(i + 1).copied().unwrap_or(0) * 2,
++        )
++    });
++    let mut chosen = BTreeSet::new();
++    // Allow separators and the final omission note within the hard character cap.
++    let mut remaining = budget.saturating_sub(160);
++    for i in order {
++        let size = blocks[i].chars().count() + 40;
++        if size <= remaining {
++            chosen.insert(i);
++            remaining -= size;
++        }
++    }
++    let mut text = String::new();
++    let mut previous = None;
++    for &i in &chosen {
++        if previous.map_or(i != 0, |p| i != p + 1) {
++            text.push_str("\n[Source passage omitted]\n\n");
++        }
++        text.push_str(blocks[i].trim_end());
++        text.push_str("\n\n");
++        previous = Some(i);
++    }
++    if chosen.is_empty() {
++        // An oversized single paragraph/example cannot consume unlimited context.
++        // Preserve a verbatim prefix; explicitly label that it is incomplete.
++        let best = scores
++            .iter()
++            .enumerate()
++            .max_by_key(|(_, s)| **s)
++            .map(|(i, _)| i)
++            .unwrap_or(0);
++        if let Some(b) = blocks.get(best) {
++            text.extend(b.chars().take(budget.saturating_sub(160)));
++        }
++    }
++    text.push_str("\n[Excerpt incomplete; other source content omitted. Raw response retained in network evidence.]");
++    Excerpt {
++        text,
++        truncated: true,
++    }
++}
+--- a/product/crates/ag1-core/src/tools/websearch.rs
++++ b/product/crates/ag1-core/src/tools/websearch.rs
+@@ -1,5 +1,6 @@
+ //! Search planning, ranking and provider response parsing. No network or secrets.
+ pub mod duckduckgo_web;
++mod selection;
+ use super::research::{self, compact, compile, has, replace, rx, trim};
+ use crate::DomainError;
+ use serde::{Deserialize, Serialize};
+@@ -825,7 +826,7 @@
+             .to_string()
+             .strip_suffix('/')
+             .unwrap_or(parsed.as_str())
+-            .to_lowercase()
++            .to_string()
+     } else {
+         trim(url)
+             .strip_suffix('/')
+@@ -1132,18 +1133,28 @@
+     } else {
+         &response.results
+     };
+-    let ranked = diversify(
+-        rank(&plan.effective_query, raw, outcomes)?,
+-        &plan.effective_query,
+-        intent,
+-    );
++    let candidate_count = raw.len();
++    let ranked = selection::select(query, raw, outcomes, max)?;
+     let mut details = json!({"query":query,"effectiveQuery":plan.effective_query,"intent":intent,"searchStrategy":plan.strategy,"followUpQueries":plan.follow_up_queries,"freshness":plan.freshness,"preferCorroboration":strongest(query),"resultCount":ranked.len(),"compressionMode":profile.mode,"cacheHit":response.cache_hit,"searchProvider":if used_fallback{"official-fallback"}else{&response.provider},"searchProviderMode":response.provider_mode,"searchProviderOrder":response.provider_order,"searchAttempts":response.attempts,"fallbackUsed":used_fallback,"sourceUrls":ranked.iter().map(|r|&r.result.url).collect::<Vec<_>>(),"preferredSourceUrls":ranked.iter().filter(|r|r.authoritative||r.score>=4).map(|r|&r.result.url).collect::<Vec<_>>(),"results":ranked});
++    details["candidateCount"] = json!(candidate_count);
++    details["selectionPolicy"] = json!("relevance-source-version-v1");
+     if let Some(domains) = plan.preferred_domains {
+         details["preferredDomains"] = json!(domains);
+     }
+     if let Some(domains) = plan.avoided_domains {
+         details["avoidedDomains"] = json!(domains);
+     }
++    let mut transcript_profile = profile.clone();
++    transcript_profile.search_transcript_results = match profile.mode.as_str() {
++        "ultra" => 2,
++        "tight" => 3,
++        _ => 4,
++    };
++    transcript_profile.search_snippet_chars = match profile.mode.as_str() {
++        "ultra" => 140,
++        "tight" => 220,
++        _ => 320,
++    };
+     let mut text = research::search_transcript(
+         &plan.effective_query,
+         &ranked
+@@ -1155,7 +1166,7 @@
+                 authoritative: r.authoritative,
+             })
+             .collect::<Vec<_>>(),
+-        &profile,
++        &transcript_profile,
+         &research::SearchOptions {
+             intent: Some(intent.into()),
+             prefer_corroboration: strongest(query),
+@@ -1211,11 +1222,7 @@
+                     intent: intent.into(),
+                     rich_fetch: research::rich_fetch(query, intent),
+                     authoritative: Some(r.authoritative),
+-                    focus_terms: if intent == "docs_reference" {
+-                        docs_terms(query).into_iter().take(6).collect()
+-                    } else {
+-                        vec![]
+-                    },
++                    focus_terms: selection::focus_terms(query),
+                     coverage_kind: coverage_kind(query, intent).map(str::to_string),
+                 },
+             )
+--- a/product/crates/ag1-core/src/tools/websearch/selection.rs
++++ b/product/crates/ag1-core/src/tools/websearch/selection.rs
+@@ -0,0 +1,170 @@
++//! Bounded source selection after retrieval. Scores are heuristics, not verification.
++use super::*;
++
++pub(super) fn focus_terms(query: &str) -> Vec<String> {
++    let query = replace(query, r"(?i)-?\b(?:site|filetype|inurl|intitle):\S+", " ");
++    unique(
++        query
++            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
++            .map(str::to_lowercase)
++            .filter(|t| {
++                t.len() >= 3
++                    && !matches!(
++                        t.as_str(),
++                        "the"
++                            | "and"
++                            | "for"
++                            | "with"
++                            | "from"
++                            | "what"
++                            | "how"
++                            | "does"
++                            | "are"
++                            | "can"
++                            | "that"
++                            | "this"
++                            | "official"
++                            | "documentation"
++                            | "docs"
++                            | "reference"
++                            | "api"
++                            | "latest"
++                            | "current"
++                            | "using"
++                            | "use"
++                            | "about"
++                    )
++            }),
++    )
++    .into_iter()
++    .take(12)
++    .collect()
++}
++fn version(url: &str) -> Option<String> {
++    let url = Url::parse(url).ok()?;
++    url.path_segments()?
++        .find(|s| has(r"(?i)^v?\d+(?:\.\d+){1,3}(?:\.x)?$", s))
++        .map(|s| s.trim_start_matches('v').to_string())
++}
++fn coverage(row: &ResultRow, terms: &[String]) -> usize {
++    let text = format!("{} {} {}", row.title, row.url, row.snippet).to_lowercase();
++    terms.iter().filter(|t| text.contains(t.as_str())).count()
++}
++pub(super) fn select(
++    query: &str,
++    raw: &[ResultRow],
++    outcomes: &BTreeMap<String, String>,
++    max: usize,
++) -> Result<Vec<Ranked>, DomainError> {
++    let terms = focus_terms(query);
++    let requested_versions: Vec<_> = rx(r"\b\d+(?:\.\d+){1,3}\b")
++        .find_iter(query)
++        .map(|m| m.as_str())
++        .collect();
++    let intent = research::intent(query);
++    let mut ranked = rank(query, raw, outcomes)?;
++    let primary_domains: Vec<&str> = [
++        ("sqlite", "sqlite.org"),
++        ("postgresql", "postgresql.org"),
++        ("postgres", "postgresql.org"),
++        ("urllib3", "urllib3.readthedocs.io"),
++        ("python", "docs.python.org"),
++        ("rust", "rust-lang.org"),
++        ("node", "nodejs.org"),
++        ("javascript", "developer.mozilla.org"),
++        ("react", "react.dev"),
++        ("typescript", "typescriptlang.org"),
++        ("git", "git-scm.com"),
++        ("go", "go.dev"),
++        ("php", "php.net"),
++    ]
++    .into_iter()
++    .filter(|(topic, _)| {
++        query
++            .to_lowercase()
++            .split(|c: char| !c.is_alphanumeric())
++            .any(|token| token == *topic)
++    })
++    .map(|(_, host)| host)
++    .collect();
++    for row in &mut ranked {
++        let matched = coverage(&row.result, &terms);
++        // Existing domain/path bonuses must not bury topical results beneath a
++        // famous but unrelated documentation page in the larger candidate pool.
++        let position = raw
++            .iter()
++            .position(|r| r.url == row.result.url)
++            .unwrap_or(raw.len());
++        let title = row.result.title.to_lowercase();
++        let title_matches = terms.iter().filter(|t| title.contains(t.as_str())).count();
++        row.score = row.score.clamp(-20, 18)
++            + (matched.min(12) as i64 * 4)
++            + title_matches.min(12) as i64 * 3
++            + 10i64.saturating_sub(position as i64 * 2).max(0);
++        row.score_reasons
++            .push(format!("provider_position:{}", position + 1));
++        if let Some((host, path)) = parsed(&row.result.url) {
++            let primary = primary_domains.iter().any(|domain| host_is(&host, domain))
++                || group(query).is_some_and(|g| g.domains.iter().any(|d| host_is(&host, d)));
++            if primary && matched > 0 {
++                row.score += 18;
++                row.authoritative = true;
++                row.source_kind = "official".into();
++                row.score_reasons
++                    .push("project_primary_documentation".into());
++            }
++            if matches!(intent, "docs_reference" | "code_lookup") {
++                if host_is(&host, "typeerror.org|w3cub.com|gitbooks.io|deepwiki.com") {
++                    row.score -= 10;
++                    row.score_reasons.push("documentation_mirror".into());
++                }
++                if !has(r"(?i)\b(beta|nightly|dev|preview)\b", query)
++                    && (host.starts_with("beta.")
++                        || host.starts_with("dev-doc.")
++                        || has(r"/(beta|nightly|preview)/", &path))
++                {
++                    row.score -= 12;
++                    row.score_reasons.push("prerelease_not_requested".into());
++                }
++            }
++        }
++        if matched == 0 && !terms.is_empty() {
++            row.score -= 40;
++            row.score_reasons.push("no_topical_terms_in_result".into());
++        } else if matched > 0 {
++            row.score_reasons
++                .push(format!("topical_terms:{matched}/{}", terms.len()));
++        }
++        if matches!(intent, "docs_reference" | "code_lookup")
++            && let Some(v) = version(&row.result.url)
++        {
++            if requested_versions
++                .iter()
++                .any(|wanted| v == *wanted || v.starts_with(&format!("{wanted}.")))
++            {
++                row.score += 18;
++                row.score_reasons.push("requested_version_match".into());
++            } else if !requested_versions.is_empty() {
++                row.score -= 18;
++                row.score_reasons.push("different_explicit_version".into());
++            } else if raw.iter().any(|other| {
++                version(&other.url).is_none()
++                    && parsed(&other.url).map(|v| v.0) == parsed(&row.result.url).map(|v| v.0)
++                    && coverage(other, &terms) >= matched
++                    && matched > 0
++            }) {
++                row.score -= 12;
++                row.score_reasons
++                    .push("prefer_unversioned_peer_for_unspecified_version".into());
++            }
++        }
++    }
++    ranked.sort_by_key(|r| std::cmp::Reverse(r.score));
++    // Documentation benefits from related pages on the same official host.
++    // General/news searches still use the existing light domain diversification.
++    if !matches!(intent, "docs_reference" | "code_lookup") {
++        ranked = diversify(ranked, query, intent);
++    }
++    ranked.truncate(max);
++    Ok(ranked)
++}
+--- a/product/crates/ag1-core/tests/search_quality.rs
++++ b/product/crates/ag1-core/tests/search_quality.rs
+@@ -0,0 +1,368 @@
++use ag1_core::tools::{research as r, websearch as w};
++use serde_json::{Value, json};
++use std::collections::BTreeMap;
++fn row(title: &str, url: &str, snippet: &str) -> w::ResultRow {
++    w::ResultRow {
++        title: title.into(),
++        url: url.into(),
++        snippet: snippet.into(),
++    }
++}
++fn search(query: &str, rows: Vec<w::ResultRow>, max: usize) -> Value {
++    w::project(
++        query,
++        2026,
++        max,
++        w::ProviderResponse {
++            attempts: vec![w::Attempt {
++                provider: "duckduckgo-web".into(),
++                url: "https://noai.duckduckgo.com/".into(),
++                status: "ok".into(),
++                result_count: rows.len(),
++                error: None,
++            }],
++            results: rows,
++            provider: "duckduckgo-web".into(),
++            provider_mode: "auto".into(),
++            provider_order: vec!["duckduckgo".into()],
++            cache_hit: false,
++        },
++        r::profile(90000., 0.),
++        &BTreeMap::new(),
++    )
++    .unwrap()
++    .result
++}
++fn fetch(body: &str, content_type: &str, focus: &[&str], window: f64) -> Value {
++    r::fetch_projection(
++        r::FetchedDocument {
++            url: "https://example.org/docs",
++            final_url: "https://example.org/docs",
++            status_code: 200,
++            content_type: Some(content_type),
++            cache_hit: false,
++            bytes: body.as_bytes(),
++        },
++        r::profile(window, 0.),
++        Some(&r::UrlHint {
++            intent: "docs_reference".into(),
++            focus_terms: focus.iter().map(|s| s.to_string()).collect(),
++            ..Default::default()
++        }),
++    )
++    .unwrap()
++    .result
++}
++fn text(v: &Value) -> &str {
++    v["content"][0]["text"].as_str().unwrap()
++}
++#[test]
++fn strong_relevant_source_beyond_original_cutoff_is_selected() {
++    let mut rows: Vec<_> = (0..8)
++        .map(|i| {
++            row(
++                "Python tutorials",
++                &format!("https://example.org/tutorial/{i}"),
++                "General programming examples",
++            )
++        })
++        .collect();
++    rows.push(row(
++        "asyncio TaskGroup cancellation",
++        "https://docs.python.org/3/library/asyncio-task.html",
++        "TaskGroup uses cancellation internally and raises ExceptionGroup.",
++    ));
++    let v = search("Python TaskGroup cancellation documentation", rows, 3);
++    assert_eq!(v["details"]["candidateCount"], 9);
++    assert_eq!(v["details"]["resultCount"], 3);
++    assert_eq!(
++        v["details"]["results"][0]["url"],
++        "https://docs.python.org/3/library/asyncio-task.html"
++    );
++    assert!(text(&v).contains("ExceptionGroup"));
++}
++#[test]
++fn unrelated_official_docs_do_not_outrank_a_relevant_source() {
++    let v = search(
++        "urllib3 Retry backoff documentation",
++        vec![
++            row(
++                "Python language reference",
++                "https://docs.python.org/3/reference/",
++                "Complete language reference",
++            ),
++            row(
++                "Retry backoff",
++                "https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html",
++                "urllib3 Retry backoff factor and status codes",
++            ),
++        ],
++        2,
++    );
++    assert!(
++        v["details"]["results"][0]["url"]
++            .as_str()
++            .unwrap()
++            .contains("urllib3")
++    );
++}
++#[test]
++fn version_preference_preserves_explicit_old_version_requests() {
++    let rows = vec![
++        row(
++            "Rust Iterator docs",
++            "https://doc.rust-lang.org/1.26.1/std/iter/trait.Iterator.html",
++            "Rust Iterator collect examples",
++        ),
++        row(
++            "Rust Iterator docs",
++            "https://doc.rust-lang.org/stable/std/iter/trait.Iterator.html",
++            "Rust Iterator collect examples",
++        ),
++    ];
++    let current = search("Rust Iterator collect documentation", rows.clone(), 1);
++    assert!(
++        current["details"]["results"][0]["url"]
++            .as_str()
++            .unwrap()
++            .contains("/stable/")
++    );
++    let old = search("Rust 1.26.1 Iterator collect documentation", rows, 1);
++    assert!(
++        old["details"]["results"][0]["url"]
++            .as_str()
++            .unwrap()
++            .contains("/1.26.1/")
++    );
++}
++#[test]
++fn duplicates_drop_tracking_but_preserve_case_sensitive_paths_and_query_values() {
++    let v = search(
++        "case sensitive API documentation",
++        vec![
++            row(
++                "API",
++                "https://example.org/API?key=Abc&utm_source=test",
++                "case sensitive",
++            ),
++            row(
++                "Duplicate",
++                "https://example.org/API?key=Abc",
++                "case sensitive",
++            ),
++            row(
++                "Other path",
++                "https://example.org/api?key=Abc",
++                "case sensitive",
++            ),
++            row(
++                "Other key",
++                "https://example.org/API?key=abc",
++                "case sensitive",
++            ),
++        ],
++        4,
++    );
++    assert_eq!(v["details"]["resultCount"], 3);
++}
++#[test]
++fn dom_extraction_preserves_code_tables_entities_and_removes_navigation() {
++    let v = fetch(
++        r#"<html><head><meta content="A &amp; B" property="og:title"></head><body><nav>Navigation junk</nav><main><h1>Retry examples</h1><p>Use <code>copy()</code> to preserve an object.</p><pre><code class="language-python">if retries &lt; 3:
++    client.copy()
++
++    return "&#x1F980;"</code></pre><table><tr><th>Option</th><th>Meaning</th></tr><tr><td>backoff_factor</td><td>Seconds to wait</td></tr></table><script>hostile()</script><div hidden>Hidden junk</div></main></body></html>"#,
++        "text/html",
++        &["retry"],
++        90000.,
++    );
++    let t = text(&v);
++    assert_eq!(v["details"]["title"], "A & B");
++    assert!(
++        t.contains("if retries < 3:\n    client.copy()\n\n    return \"🦀\""),
++        "{t}"
++    );
++    assert!(t.contains("```python"));
++    assert!(t.contains(r"| backoff\_factor | Seconds to wait |"), "{t}");
++    assert!(t.contains("`copy()`"));
++    assert!(
++        !t.contains("Navigation junk") && !t.contains("hostile()") && !t.contains("Hidden junk")
++    );
++    assert_eq!(v["details"]["truncated"], false);
++}
++#[test]
++fn plain_text_keeps_angle_brackets_and_code_whitespace() {
++    let source = "Vec<T>\nif x < 3:\n    print('<main>literal</main>')\n";
++    let v = fetch(source, "text/plain", &[], 90000.);
++    assert!(text(&v).contains(source));
++    assert_eq!(v["details"]["extractionMethod"], "plain-text-v1");
++}
++#[test]
++fn focused_excerpt_reaches_late_passages_and_keeps_code_blocks_whole() {
++    let mut source=(0..200).map(|i|format!("## Background {i}\n\nUnrelated discussion of installation and everyday usage, paragraph number {i}.\n\n")).collect::<String>();
++    source.push_str("## Cancellation semantics\n\nTaskGroup propagates cancellation after children finish.\n\n```python\nasync with TaskGroup() as group:\n    group.create_task(work())\n\n    await checkpoint()\n```\n\nExceptionGroup collects the remaining failures.\n");
++    for (window, budget) in [(90000., 12000), (50000., 7000), (16000., 3500)] {
++        let v = fetch(
++            &source,
++            "text/markdown",
++            &["TaskGroup", "cancellation"],
++            window,
++        );
++        let t = text(&v);
++        assert!(t.contains("TaskGroup propagates cancellation"));
++        assert!(t.contains("group.create_task(work())\n\n    await checkpoint()"));
++        assert!(t.contains("Source passage omitted"));
++        assert_eq!(v["details"]["truncated"], true);
++        assert!(
++            v["details"]["excerptChars"].as_u64().unwrap() <= budget,
++            "{v}"
++        );
++    }
++}
++#[test]
++fn binary_and_placeholder_are_errors_and_source_material_stays_untrusted() {
++    let binary = fetch("%PDF-1.7", "application/pdf", &[], 90000.);
++    assert_eq!(binary["isError"], true);
++    let blocked = fetch(
++        "<html><body>Please enable JavaScript to continue</body></html>",
++        "text/html",
++        &[],
++        90000.,
++    );
++    assert_eq!(blocked["isError"], true, "{blocked}");
++    assert!(text(&blocked).contains("untrusted page content"));
++    assert_eq!(blocked["details"]["authoritative"], false);
++}
++#[test]
++fn html_nested_main_keeps_all_articles_and_decodes_entities_once() {
++    let v = fetch(
++        "<main><article><h2>First article</h2><p>&amp;lt;tag&amp;gt; is escaped source.</p></article><article><h2>Second article</h2><p>Another useful source paragraph.</p></article></main>",
++        "text/html",
++        &[],
++        90000.,
++    );
++    assert!(text(&v).contains("First article") && text(&v).contains("Second article"));
++    assert!(text(&v).contains("&lt;tag&gt;"));
++    assert_ne!(v["isError"], json!(true));
++}
++
++#[test]
++fn primary_documentation_beats_mirrors_with_extra_query_keywords() {
++    let v = search(
++        "SQLite WAL checkpoint SQLITE_BUSY official documentation",
++        vec![
++            row(
++                "Checkpoint a database - SQLite",
++                "https://sqlite.org/c3ref/wal_checkpoint_v2.html",
++                "sqlite3_wal_checkpoint_v2 runs a checkpoint operation",
++            ),
++            row(
++                "SQLite Documentation",
++                "https://typeerror.org/docs/sqlite/checkpoint",
++                "SQLite WAL checkpoint SQLITE_BUSY official documentation",
++            ),
++            row(
++                "SQLite Database Locked",
++                "https://example.org/sqlite",
++                "SQLite WAL checkpoint SQLITE_BUSY explained",
++            ),
++        ],
++        3,
++    );
++    assert_eq!(
++        v["details"]["results"][0]["url"],
++        "https://sqlite.org/c3ref/wal_checkpoint_v2.html"
++    );
++    assert_eq!(v["details"]["results"][0]["sourceKind"], "official");
++}
++#[test]
++fn links_resolve_against_page_but_cannot_embed_credentials_or_scripts() {
++    let v = fetch(
++        "<main><p>Read the <a href='../reference'>reference</a> and <a href='javascript:alert(1)'>bad target</a> or <a href='https://u:p@example.org'>credentials</a>.</p></main>",
++        "text/html",
++        &[],
++        90000.,
++    );
++    assert!(text(&v).contains("https://example.org/reference"));
++    assert!(!text(&v).contains("javascript:") && !text(&v).contains("https://u:p"));
++}
++
++#[test]
++#[ignore = "Offline replay of retained live bodies supplied through AG1_SEARCH_QUALITY_EVIDENCE"]
++fn retained_live_pages_keep_the_requested_api_details() {
++    use base64::Engine;
++    let directory = std::path::PathBuf::from(std::env::var("AG1_SEARCH_QUALITY_EVIDENCE").unwrap());
++    let responses: Vec<Value> = serde_json::from_slice(
++        &std::fs::read(directory.join("live-final-responses.json")).unwrap(),
++    )
++    .unwrap();
++    let results: Vec<Value> =
++        serde_json::from_slice(&std::fs::read(directory.join("live-final-results.json")).unwrap())
++            .unwrap();
++    let expected = [
++        vec![
++            "allowed_methods",
++            "backoff_factor",
++            "DEFAULT_ALLOWED_METHODS",
++        ],
++        vec!["SQLITE_BUSY", "SQLITE_CHECKPOINT_FULL"],
++        vec!["collect", "FromIterator"],
++        vec!["AbortSignal.timeout", "delay"],
++    ];
++    let mut replayed = vec![];
++    for (index, result) in results.iter().take(4).enumerate() {
++        let url = result["fetch"]["details"]["url"].as_str().unwrap();
++        let response = responses.iter().find(|r| r["requestedUrl"] == url).unwrap();
++        let body = base64::engine::general_purpose::STANDARD
++            .decode(response["bodyBase64"].as_str().unwrap())
++            .unwrap();
++        let query = result["search"]["details"]["query"].as_str().unwrap();
++        let raw = vec![
++            serde_json::from_value::<w::ResultRow>(
++                result["search"]["details"]["results"][0].clone(),
++            )
++            .unwrap(),
++        ];
++        let hints = w::project(
++            query,
++            2026,
++            1,
++            w::ProviderResponse {
++                results: raw,
++                attempts: vec![],
++                provider: "replay".into(),
++                provider_mode: "duckduckgo".into(),
++                provider_order: vec![],
++                cache_hit: false,
++            },
++            r::profile(90000., 0.),
++            &BTreeMap::new(),
++        )
++        .unwrap()
++        .hints;
++        let projected = r::fetch_projection(
++            r::FetchedDocument {
++                url,
++                final_url: response["finalUrl"].as_str().unwrap(),
++                status_code: 200,
++                content_type: response["contentType"].as_str(),
++                cache_hit: false,
++                bytes: &body,
++            },
++            r::profile(90000., 0.),
++            Some(&hints[0].1),
++        )
++        .unwrap()
++        .result;
++        let content = text(&projected).replace('\\', "");
++        for term in &expected[index] {
++            assert!(content.contains(term), "{url}: missing {term}");
++        }
++        assert!(projected["details"]["excerptChars"].as_u64().unwrap() <= 12000);
++        replayed.push(projected);
++    }
++    println!(
++        "REPLAYED_FETCHES={}",
++        serde_json::to_string(&replayed).unwrap()
++    );
++}
+--- a/product/crates/ag1-platform/src/web_tools.rs
++++ b/product/crates/ag1-platform/src/web_tools.rs
+@@ -367,7 +367,7 @@
+ }
+ fn error(url: &str, message: &str) -> AdapterOutcome {
+     AdapterOutcome {
+-        result: json!({"details":{"url":url,"error":message},"content":[{"type":"text","text":format!("Fetch Error: {message}")}]}),
++        result: json!({"isError":true,"details":{"url":url,"error":message,"status":"error"},"content":[{"type":"text","text":format!("Fetch Error: {message}")}]}),
+         effect: Effect::None,
+         artifact_page: false,
+     }
+--- a/product/crates/ag1-platform/src/web_tools/search.rs
++++ b/product/crates/ag1-platform/src/web_tools/search.rs
+@@ -55,8 +55,9 @@
+     }
+ }
+ struct SearchCache {
+-    key: (String, usize, u32),
++    key: (String, u32),
+     at: u64,
++    ttl: u64,
+     response: ProviderResponse,
+     evidence: Vec<String>,
+     cost: usize,
+@@ -66,6 +67,7 @@
+     config: SearchConfig,
+     target: String,
+     cache: Mutex<VecDeque<SearchCache>>,
++    pending: tokio::sync::Mutex<()>,
+     // Provider-wide rather than per query: rephrasing cannot fix a challenge.
+     blocked_until: Mutex<Option<Instant>>,
+ }
+@@ -110,6 +112,7 @@
+             config,
+             target,
+             cache: Mutex::new(VecDeque::new()),
++            pending: tokio::sync::Mutex::new(()),
+             blocked_until: Mutex::new(None),
+         })
+     }
+@@ -180,37 +183,38 @@
+         }
+         let max = maximum.min(4.) as usize;
+         let plan = websearch::plan(query, year)?;
+-        let key = (query.to_string(), max, year);
++        // Cache the bounded candidate pool, independent of presentation count.
++        // Waiting callers recheck the cache after the owner completes, so an
++        // identical concurrent search does not spend another provider request.
++        let _pending = match search_slot(&self.pending, deadline, cancel).await {
++            Ok(slot) => slot,
++            Err(DomainError::Cancelled) => return Ok(search_cancelled(query, true)),
++            Err(DomainError::TimedOut) => return Ok(search_cancelled(query, false)),
++            Err(error) => return Err(error),
++        };
++        let key = (plan.effective_query.clone(), year);
+         let cached = {
+             let mut cache = self
+                 .cache
+                 .lock()
+                 .map_err(|_| DomainError::Unavailable("search cache".into()))?;
+-            cache.retain(|v| {
+-                now() >= v.at
+-                    && now() - v.at
+-                        < if v.response.results.is_empty() {
+-                            60000
+-                        } else {
+-                            TTL
+-                        }
+-            });
++            cache.retain(|v| now() >= v.at && now() - v.at < v.ttl);
+             cache
+                 .iter()
+                 .find(|v| v.key == key)
+-                .map(|v| (v.response.clone(), v.evidence.clone()))
++                .map(|v| (v.response.clone(), v.evidence.clone(), now() - v.at))
+         };
+-        let (mut response, evidence) = if let Some((mut response, evidence)) = cached {
++        let (response, evidence, cache_age) = if let Some((mut response, evidence, age)) = cached {
+             response.cache_hit = true;
+             for id in &evidence {
+                 artifacts.get(id)?;
+             }
+-            (response, evidence)
++            (response, evidence, age)
+         } else {
+             let fetched = self
+                 .providers(
+                     &plan.effective_query,
+-                    max,
++                    24,
+                     deadline,
+                     cancel,
+                     artifacts,
+@@ -234,7 +238,9 @@
+                 .len()
+                 + evidence.iter().map(String::len).sum::<usize>()
+                 + key.0.len();
+-            if cost <= 2 * 1024 * 1024 {
++            let successful = response.attempts.iter().any(|a| a.status == "ok")
++                && !response.attempts.iter().any(|a| a.status == "blocked");
++            if successful && cost <= 2 * 1024 * 1024 {
+                 let mut cache = self
+                     .cache
+                     .lock()
+@@ -247,14 +253,26 @@
+                 cache.push_back(SearchCache {
+                     key,
+                     at: now(),
++                    ttl: if response.results.is_empty()
++                        || ag1_core::tools::research::intent(query) == "current_events"
++                        || query.split_whitespace().any(|t| {
++                            matches!(
++                                t.to_ascii_lowercase().as_str(),
++                                "latest" | "current" | "today" | "recent"
++                            )
++                        }) {
++                        60_000
++                    } else {
++                        TTL
++                    },
+                     response: response.clone(),
+                     evidence: evidence.clone(),
+                     cost,
+                 });
+             }
+-            (response, evidence)
++            (response, evidence, 0)
+         };
+-        response.results.truncate(max);
++        drop(_pending);
+         let outcomes = {
+             let mut memory = self
+                 .web
+@@ -280,6 +298,7 @@
+                 .remember_hints(scope, std::slice::from_ref(url), hint, now())?;
+         }
+         let mut result = projection.result;
++        result["details"]["cacheAgeMs"] = json!(cache_age);
+         result["details"]["networkEvidence"] =
+             json!({"trust":"untrusted","artifactIds":evidence,"fallbackUrlsFetched":false});
+         Ok(AdapterOutcome {
+@@ -445,7 +464,11 @@
+                 let url = search_url(
+                     endpoint,
+                     query,
+-                    if name == "brave" { Some(max) } else { None },
++                    if name == "brave" {
++                        Some(max.min(20))
++                    } else {
++                        None
++                    },
+                 );
+                 if name == "brave" && self.config.brave.is_none() {
+                     attempts.push(Attempt {
+--- a/product/crates/ag1-platform/tests/web_http_contract.rs
++++ b/product/crates/ag1-platform/tests/web_http_contract.rs
+@@ -769,7 +769,7 @@
+ }
+ 
+ #[tokio::test]
+-async fn compressed_entities_are_bounded_after_decoding_and_match_reference_projections() {
++async fn compressed_entities_preserve_reference_bytes_and_expose_bounded_source_excerpts() {
+     let _case = WEB_CASE.lock().await;
+     use ag1_core::tools::research;
+     use base64::{Engine, engine::general_purpose::STANDARD};
+@@ -829,13 +829,42 @@
+                 None,
+             )
+             .unwrap();
+-            let mut expected = row["output"].clone();
+-            let text = expected["content"][0]["text"].as_str().unwrap();
+-            expected["content"][0]["text"] = serde_json::json!(text.replace(
+-                "This source summary is likely sufficient to answer or cite without refetching.",
+-                "This source extract is available as evidence for the active task."
+-            ));
+-            assert_eq!(projected.result, expected, "decoded projection {index}");
++            // Frozen transport oracle remains intact. Extraction intentionally
++            // adds source passages and measures truncation against their budget.
++            let actual = &projected.result;
++            for field in [
++                "url",
++                "finalUrl",
++                "statusCode",
++                "contentType",
++                "cacheHit",
++                "facts",
++                "preview",
++                "authoritative",
++                "status",
++            ] {
++                assert_eq!(
++                    actual["details"][field], row["output"]["details"][field],
++                    "decoded field {field}, case {index}"
++                );
++            }
++            let text = actual["content"][0]["text"].as_str().unwrap();
++            let excerpt = text
++                .split_once("Source excerpt (untrusted page content):\n")
++                .unwrap()
++                .1;
++            assert!(excerpt.chars().count() <= 12000);
++            assert_eq!(
++                actual["details"]["extractedChars"],
++                serde_json::json!(String::from_utf8_lossy(&response.bytes).chars().count())
++            );
++            if String::from_utf8_lossy(&response.bytes).chars().count() <= 12000 {
++                assert_eq!(excerpt, String::from_utf8_lossy(&response.bytes));
++                assert_eq!(actual["details"]["truncated"], false);
++            } else {
++                assert_eq!(actual["details"]["truncated"], true);
++                assert!(excerpt.contains("Excerpt incomplete"));
++            }
+         }
+         task.join().unwrap();
+     }
+@@ -1322,7 +1351,7 @@
+         let request = input.to_lowercase();
+         assert!(request.contains("x-subscription-token: fixture-key"));
+         assert!(request.contains("accept: application/json"));
+-        assert!(input.starts_with("GET /search?q=React%20parameter%20official%20docs&count=3 "));
++        assert!(input.starts_with("GET /search?q=React%20parameter%20official%20docs&count=20 "));
+         let body=json!({"web":{"results":[{"title":"React parameter reference","url":"https://react.dev/reference/react/useEffect","description":"The setup parameter returns a cleanup function."}]}}).to_string();
+         let mut response = ok(body.as_bytes());
+         let text = String::from_utf8(response)
+@@ -1412,18 +1441,18 @@
+     };
+     use serde_json::json;
+     let fixture = ToolFixture::new();
+-    let (port, task) = server(6, |index, input| {
++    let (port, task) = server(5, |index, input| {
+         assert!(input.to_lowercase().contains("user-agent: mozilla/5.0"));
+         assert!(
+             input
+                 .to_lowercase()
+                 .contains("accept: text/html,application/xhtml+xml")
+         );
+-        if index < 2 {
++        if index == 0 {
+             assert!(input.starts_with("POST /html "));
+             ok(b"<a class=\"result__a\" href=\"https://react.dev/reference/item\">React API</a><a class=\"result__snippet\">The parameter returns a useful value.</a><a class=\"result__a\" href=\"https://react.dev/learn/other\">Other API</a><a class=\"result__snippet\">Another useful source.</a>")
+         } else {
+-            ok(b"No fixture results")
++            ok(b"<div class=no-results>No results found</div>")
+         }
+     });
+     let origin = format!("http://127.0.0.1:{port}");
+@@ -1453,7 +1482,7 @@
+     .unwrap();
+     for (operation, query, max, now, cache, count) in [
+         ("one", "React parameter", 1, 12, false, 1),
+-        ("more", "React parameter", 3, 13, false, 2),
++        ("more", "React parameter", 3, 13, true, 2),
+         ("cached", "React parameter", 3, 14, true, 2),
+         ("empty", "Unknown search fixture", 3, 15, false, 0),
+         ("empty-cached", "Unknown search fixture", 3, 59999, true, 0),
+@@ -1508,9 +1537,9 @@
+         );
+     }
+     let requests = task.join().unwrap();
+-    assert_eq!(requests.len(), 6);
+-    assert!(requests[3].starts_with("POST /lite "));
+-    assert!(requests[5].starts_with("POST /lite "));
++    assert_eq!(requests.len(), 5);
++    assert!(requests[2].starts_with("POST /lite "));
++    assert!(requests[4].starts_with("POST /lite "));
+ }
+ 
+ #[tokio::test]
+@@ -1889,7 +1918,8 @@
+             );
+         }
+         if index == 2 {
+-            assert_eq!(result["details"]["cacheHit"], true);
++            // Failed searches are not cached as successful retrievals. Cooldown still prevents requests.
++            assert_eq!(result["details"]["cacheHit"], false);
+         }
+     }
+     assert_eq!(task.join().unwrap().len(), 1);
+@@ -2324,3 +2354,219 @@
+     ));
+     assert_eq!(task.join().unwrap().len(), 1);
+ }
++
++#[tokio::test]
++async fn search_candidates_are_ranked_before_trimming_and_concurrent_counts_share_cache() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::tools::research;
++    use ag1_platform::web_tools::{
++        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
++    };
++    use serde_json::json;
++    let fixture = ToolFixture::new();
++    let (port, task) = server(1, |_, _| {
++        std::thread::sleep(Duration::from_millis(50));
++        let mut body=(0..8).map(|i|format!("<div class=result><a class=result__a href='https://example.org/{i}'>Python tutorials</a><div class=result__snippet>General Python examples</div></div>")).collect::<String>();
++        body.push_str("<div class=result><a class=result__a href='https://docs.python.org/3/library/asyncio-task.html'>TaskGroup cancellation</a><div class=result__snippet>Python TaskGroup cancellation raises ExceptionGroup.</div></div>");
++        ok(body.as_bytes())
++    });
++    let origin = format!("http://127.0.0.1:{port}");
++    let web = Arc::new(
++        WebService::new(
++            WebHttp::new(WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap()),
++            fixture.scope.clone(),
++            "quality-web",
++            Default::default(),
++        )
++        .unwrap(),
++    );
++    let search = SearchService::new(
++        web,
++        SearchConfig {
++            mode: "duckduckgo".into(),
++            endpoints: SearchEndpoints {
++                web: None,
++                html: format!("{origin}/html"),
++                lite: format!("{origin}/lite"),
++                ..Default::default()
++            },
++            brave: None,
++        },
++        "quality-search",
++    )
++    .unwrap();
++    let run = |id: &'static str, max| {
++        let fixture = &fixture;
++        let search = &search;
++        async move {
++            let ticket = fixture.ticket(
++                id,
++                "webSearch",
++                json!({"query":"Python TaskGroup cancellation documentation","maxResults":max}),
++                search.target_revision(),
++                12,
++            );
++            let mut artifacts = fixture.artifacts(id);
++            let (_source, mut cancel) = cancellation();
++            search
++                .execute(
++                    ticket,
++                    WebExecution {
++                        registry: &fixture.registry,
++                        scope: &fixture.scope,
++                        policy_revision: 1,
++                        now: || 12,
++                        deadline: Instant::now() + Duration::from_secs(3),
++                        cancel: &mut cancel,
++                        profile: research::profile(90000., 0.),
++                    },
++                    2026,
++                    &mut artifacts,
++                )
++                .await
++                .unwrap()
++                .result
++        }
++    };
++    let (first, second) = tokio::join!(run("pool-one", 1), run("pool-four", 4));
++    assert_eq!(first["details"]["cacheHit"], false);
++    assert_eq!(second["details"]["cacheHit"], true);
++    assert_eq!(first["details"]["resultCount"], 1);
++    assert_eq!(second["details"]["resultCount"], 4);
++    for r in [&first, &second] {
++        assert_eq!(r["details"]["candidateCount"], 9);
++        assert_eq!(
++            r["details"]["results"][0]["url"],
++            "https://docs.python.org/3/library/asyncio-task.html"
++        );
++        assert_eq!(r["details"]["networkEvidence"]["trust"], "untrusted");
++    }
++    assert_eq!(
++        first["details"]["networkEvidence"],
++        second["details"]["networkEvidence"]
++    );
++    assert_eq!(task.join().unwrap().len(), 1);
++}
++
++#[tokio::test]
++#[ignore = "Explicit bounded search-to-page quality probe, no model or desktop"]
++async fn search_quality_live_research() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::{
++        context::ContextArtifactPort,
++        tools::{executor::ExecutionArtifacts, research},
++    };
++    use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
++    use serde_json::json;
++    let fixture = ToolFixture::new();
++    let web = Arc::new(
++        WebService::new(
++            WebHttp::new(WebPolicy::default()),
++            fixture.scope.clone(),
++            "research-web",
++            Default::default(),
++        )
++        .unwrap(),
++    );
++    let search =
++        SearchService::new(web.clone(), SearchConfig::default(), "research-search").unwrap();
++    let mut results = vec![];
++    let mut responses = vec![];
++    for (i, query) in [
++        "urllib3 Retry backoff_factor allowed_methods documentation",
++        "SQLite WAL checkpoint SQLITE_BUSY official documentation",
++        "Rust Iterator collect documentation",
++        "site:nodejs.org api AbortSignal timeout documentation",
++        "Oslo airport train Flytoget tickets",
++        "\"ag1-no-such-phrase-8cf271e9c4\"",
++    ]
++    .iter()
++    .enumerate()
++    {
++        let id = format!("quality-{i}");
++        let ticket = fixture.ticket(
++            &id,
++            "webSearch",
++            json!({"query":query,"maxResults":4}),
++            search.target_revision(),
++            12,
++        );
++        let mut artifacts = fixture.artifacts(&id);
++        let (_source, mut cancel) = cancellation();
++        let started = Instant::now();
++        let mut result = search
++            .execute(
++                ticket,
++                WebExecution {
++                    registry: &fixture.registry,
++                    scope: &fixture.scope,
++                    policy_revision: 1,
++                    now: || 12,
++                    deadline: Instant::now() + Duration::from_secs(20),
++                    cancel: &mut cancel,
++                    profile: research::profile(90000., 0.),
++                },
++                2026,
++                &mut artifacts,
++            )
++            .await
++            .unwrap()
++            .result;
++        result["details"]["probeElapsedMs"] = json!(started.elapsed().as_millis());
++        for id in result["details"]["networkEvidence"]["artifactIds"]
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter_map(serde_json::Value::as_str)
++        {
++            responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
++        }
++        let mut fetched = serde_json::Value::Null;
++        if i < 4
++            && let Some(url) = result["details"]["results"][0]["url"].as_str()
++        {
++            let id = format!("read-{i}");
++            let ticket = fixture.ticket(
++                &id,
++                "webFetch",
++                json!({"url":url}),
++                web.target_revision(),
++                12,
++            );
++            let mut artifacts = fixture.artifacts(&id);
++            fetched = web
++                .execute(
++                    ticket,
++                    WebExecution {
++                        registry: &fixture.registry,
++                        scope: &fixture.scope,
++                        policy_revision: 1,
++                        now: || 12,
++                        deadline: Instant::now() + Duration::from_secs(20),
++                        cancel: &mut cancel,
++                        profile: research::profile(90000., 0.),
++                    },
++                    &mut artifacts,
++                )
++                .await
++                .unwrap()
++                .result;
++            if let Some(id) = fetched["details"]["networkEvidence"]["artifactId"].as_str() {
++                responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
++            }
++        }
++        let blocked = result["details"]["status"] == "blocked";
++        results.push(json!({"search":result,"fetch":fetched}));
++        if blocked {
++            break;
++        }
++    }
++    println!(
++        "QUALITY_RESULTS={}",
++        serde_json::to_string(&results).unwrap()
++    );
++    println!(
++        "QUALITY_RESPONSES={}",
++        serde_json::to_string(&responses).unwrap()
++    );
++}
+--- a/product/crates/ag1-platform/tests/session_contract.rs
++++ b/product/crates/ag1-platform/tests/session_contract.rs
+@@ -5,9 +5,17 @@
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn shared_native_runner_dates_tool_artifacts_by_their_actual_turn() {
+     let (origin, server) = server(vec![
+-        calls(vec![("first-clock-call", "bash", json!({"command":"printf first-turn-output"}))]),
++        calls(vec![(
++            "first-clock-call",
++            "bash",
++            json!({"command":"printf first-turn-output"}),
++        )]),
+         stop(),
+-        calls(vec![("second-clock-call", "bash", json!({"command":"printf second-turn-output"}))]),
++        calls(vec![(
++            "second-clock-call",
++            "bash",
++            json!({"command":"printf second-turn-output"}),
++        )]),
+         stop(),
+     ]);
+     let fixture = fixture(&origin, "disabled");
+@@ -17,23 +25,49 @@
+     let mut first = input();
+     first.command = "first-clock-turn".into();
+     first.timestamp = first_time.into();
+-    fixture.host.run(first, &Resolver::new(false), runner.clone(), &ignore).await.unwrap();
+-    let first_catalog = fixture.store.artifact_catalog("session", None, 128, Some("terminal-raw-output")).unwrap();
++    fixture
++        .host
++        .run(first, &Resolver::new(false), runner.clone(), &ignore)
++        .await
++        .unwrap();
++    let first_catalog = fixture
++        .store
++        .artifact_catalog("session", None, 128, Some("terminal-raw-output"))
++        .unwrap();
+     assert_eq!(first_catalog.len(), 1);
+     let original = first_catalog[0].record.clone();
+     let mut second = input();
+     second.command = "second-clock-turn".into();
+     second.timestamp = second_time.into();
+-    fixture.host.run(second, &Resolver::new(false), runner, &ignore).await.unwrap();
++    fixture
++        .host
++        .run(second, &Resolver::new(false), runner, &ignore)
++        .await
++        .unwrap();
+     assert_eq!(server.join().unwrap().len(), 4);
+-    let catalog = fixture.store.artifact_catalog("session", None, 128, Some("terminal-raw-output")).unwrap();
++    let catalog = fixture
++        .store
++        .artifact_catalog("session", None, 128, Some("terminal-raw-output"))
++        .unwrap();
+     assert_eq!(catalog.len(), 2);
+-    let older = catalog.iter().find(|r| r.record["producer"]["callId"] == "first-clock-call").unwrap();
+-    let newer = catalog.iter().find(|r| r.record["producer"]["callId"] == "second-clock-call").unwrap();
+-    assert_eq!(older.record, original, "later turns must not rewrite immutable metadata");
++    let older = catalog
++        .iter()
++        .find(|r| r.record["producer"]["callId"] == "first-clock-call")
++        .unwrap();
++    let newer = catalog
++        .iter()
++        .find(|r| r.record["producer"]["callId"] == "second-clock-call")
++        .unwrap();
++    assert_eq!(
++        older.record, original,
++        "later turns must not rewrite immutable metadata"
++    );
+     assert_eq!(older.record["createdAt"], first_time);
+     assert_eq!(newer.record["createdAt"], second_time);
+-    assert_eq!(catalog[0].record, newer.record, "catalog remains newest first");
++    assert_eq!(
++        catalog[0].record, newer.record,
++        "catalog remains newest first"
++    );
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+@@ -47,16 +81,34 @@
+     ]);
+     let fixture = fixture(&origin, "disabled");
+     std::fs::write(fixture.root.join("input.txt"), "composite identity works").unwrap();
+-    let result = fixture.host.run(input(), &Resolver::new(false), fixture.files.clone(), &|_: &SessionEvent| {}).await.unwrap();
++    let result = fixture
++        .host
++        .run(
++            input(),
++            &Resolver::new(false),
++            fixture.files.clone(),
++            &|_: &SessionEvent| {},
++        )
++        .await
++        .unwrap();
+     assert_eq!(result.generations, 2);
+     assert!(fixture.host.settled().unwrap());
+     let requests = server.join().unwrap();
+     assert_eq!(requests.len(), 2);
+-    let state = fixture.store.journal_snapshot(&SessionId::new("session").unwrap()).unwrap();
++    let state = fixture
++        .store
++        .journal_snapshot(&SessionId::new("session").unwrap())
++        .unwrap();
+     let branch = ag1_core::task::branch_values(&state).unwrap();
+-    let results: Vec<_> = branch.iter().filter(|e| e["message"]["role"] == "toolResult").collect();
++    let results: Vec<_> = branch
++        .iter()
++        .filter(|e| e["message"]["role"] == "toolResult")
++        .collect();
+     assert_eq!(results.len(), 2);
+-    assert_eq!(results[0]["message"]["toolCallId"], "call_missing|fc_missing");
++    assert_eq!(
++        results[0]["message"]["toolCallId"],
++        "call_missing|fc_missing"
++    );
+     assert_eq!(results[0]["message"]["isError"], true);
+     assert_eq!(results[1]["message"]["toolCallId"], "call_read|fc_read");
+     assert_eq!(results[1]["message"]["isError"], false);
+@@ -182,7 +234,13 @@
+     let final_context = final_messages.last().unwrap();
+     assert_eq!(final_context["role"], "tool");
+     assert_eq!(final_context["tool_call_id"], "read-two");
+-    assert_eq!(final_messages.iter().filter(|m| m["role"] == "user").count(), 1);
++    assert_eq!(
++        final_messages
++            .iter()
++            .filter(|m| m["role"] == "user")
++            .count(),
++        1
++    );
+     let final_user = ag1_core::context::hygiene::content(final_context, "\n");
+     assert!(final_user.contains("Inspection evidence indexes"));
+     assert!(final_user.contains("result=tool-call:read-two"));
+@@ -650,7 +708,10 @@
+     let events = events.lock().unwrap();
+     // Phase telemetry surrounds retry recovery; it is not a retry transition.
+     assert!(events.iter().any(|event| event["type"] == "request_phase"));
+-    let events: Vec<_> = events.iter().filter(|event| event["type"] != "request_phase").collect();
++    let events: Vec<_> = events
++        .iter()
++        .filter(|event| event["type"] != "request_phase")
++        .collect();
+     assert_eq!(
+         events
+             .iter()
+@@ -2671,6 +2732,19 @@
+         socket.read_exact(&mut byte).unwrap();
+         bytes.push(byte[0]);
+         if bytes.ends_with(b"\r\n\r\n") {
++            let headers = String::from_utf8(bytes.clone()).unwrap();
++            let length = headers
++                .lines()
++                .find_map(|line| {
++                    let (name, value) = line.split_once(':')?;
++                    name.eq_ignore_ascii_case("content-length")
++                        .then(|| value.trim().parse::<usize>().unwrap())
++                })
++                .unwrap_or(0);
++            assert!(length <= 16384);
++            let mut body = vec![0; length];
++            socket.read_exact(&mut body).unwrap();
++            bytes.extend_from_slice(&body);
+             return String::from_utf8(bytes).unwrap();
+         }
+         assert!(bytes.len() < 16384);
+@@ -3008,8 +3082,17 @@
+             .join("\n")
+     };
+     assert!(!system(0).contains("Preserve tuned native runtimes"));
+-    for index in 1..requests.len() { assert_eq!(system(index),system(0)); }
+-    let tail = |index: usize| requests[index]["messages"].as_array().unwrap().last().unwrap().to_string();
++    for index in 1..requests.len() {
++        assert_eq!(system(index), system(0));
++    }
++    let tail = |index: usize| {
++        requests[index]["messages"]
++            .as_array()
++            .unwrap()
++            .last()
++            .unwrap()
++            .to_string()
++    };
+     assert!(tail(1).contains("Preserve tuned native runtimes"));
+     assert!(tail(3).contains("Preserve native model settings"));
+     assert!(!tail(3).contains("Preserve tuned native runtimes"));
+@@ -4182,8 +4265,11 @@
+     let spools = fixture._directory.path().join("repo-spools");
+     std::fs::create_dir(&spools).unwrap();
+     let mut git_service = GitService::new(
+-        env!("CARGO_BIN_EXE_ag1-process-host").as_ref(), git, &spools,
+-    ).unwrap();
++        env!("CARGO_BIN_EXE_ag1-process-host").as_ref(),
++        git,
++        &spools,
++    )
++    .unwrap();
+     if let Some(path) = bubblewrap {
+         git_service = git_service.with_bubblewrap(path);
+     }
+@@ -4474,9 +4560,9 @@
+     )
+     .unwrap();
+     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+-    let runner = native_repo_runner_with_bubblewrap(
+-        &fixture, "/usr/bin/git".as_ref(), Some(&executable),
+-    ).await;
++    let runner =
++        native_repo_runner_with_bubblewrap(&fixture, "/usr/bin/git".as_ref(), Some(&executable))
++            .await;
+     let host = fixture.host.clone();
+     let running = tokio::spawn(async move {
+         host.run(input(), &Resolver::new(false), runner, &ignore)
+@@ -7488,29 +7574,66 @@
+ async fn native_retrieve_returns_exact_context_and_bounded_authenticated_continuations() {
+     let fixture = fixture("http://127.0.0.1:1", "disabled");
+     let runner = native_artifact_runner(&fixture).await;
+-    let source = format!("{}before\nUNIQUE_EVIDENCE_123\nafter\n{}", "old line\n".repeat(80), "🧪\\\"evidence\n".repeat(900));
++    let source = format!(
++        "{}before\nUNIQUE_EVIDENCE_123\nafter\n{}",
++        "old line\n".repeat(80),
++        "🧪\\\"evidence\n".repeat(900)
++    );
+     let id = retained_artifact(&fixture, 9123, &source, "tool-output");
+-    let result = execute_artifact(&fixture, &runner, "retrieve-search", json!({"action":"retrieve","query":"UNIQUE_EVIDENCE_123","maxBytes":2048}));
++    let result = execute_artifact(
++        &fixture,
++        &runner,
++        "retrieve-search",
++        json!({"action":"retrieve","query":"UNIQUE_EVIDENCE_123","maxBytes":2048}),
++    );
+     assert!(!result.outcome.result["isError"].as_bool().unwrap_or(false));
+     assert!(result.outcome.result.to_string().len() <= 2048);
+-    let mut page: Value = serde_json::from_str(result.outcome.result["content"][0]["text"].as_str().unwrap()).unwrap();
++    let mut page: Value = serde_json::from_str(
++        result.outcome.result["content"][0]["text"]
++            .as_str()
++            .unwrap(),
++    )
++    .unwrap();
+     assert_eq!(page["id"], id);
+     assert_eq!(page["sha256"], ag1_storage::digest(source.as_bytes()));
+-    assert!(page["text"].as_str().unwrap().contains("before\nUNIQUE_EVIDENCE_123\nafter"));
++    assert!(
++        page["text"]
++            .as_str()
++            .unwrap()
++            .contains("before\nUNIQUE_EVIDENCE_123\nafter")
++    );
+     let start = page["range"]["startByte"].as_u64().unwrap() as usize;
+     let mut exact = page["text"].as_str().unwrap().to_owned();
+     let mut count = 0;
+     while page.get("nextCall").is_some() {
+-        let result = execute_artifact(&fixture, &runner, &format!("retrieve-next-{count}"), page["nextCall"].clone());
++        let result = execute_artifact(
++            &fixture,
++            &runner,
++            &format!("retrieve-next-{count}"),
++            page["nextCall"].clone(),
++        );
+         assert!(result.outcome.result.to_string().len() <= 2048);
+-        page = serde_json::from_str(result.outcome.result["content"][0]["text"].as_str().unwrap()).unwrap();
+-        assert_eq!(page["range"]["startByte"].as_u64().unwrap() as usize, start + exact.len());
++        page = serde_json::from_str(
++            result.outcome.result["content"][0]["text"]
++                .as_str()
++                .unwrap(),
++        )
++        .unwrap();
++        assert_eq!(
++            page["range"]["startByte"].as_u64().unwrap() as usize,
++            start + exact.len()
++        );
+         exact.push_str(page["text"].as_str().unwrap());
+         count += 1;
+         assert!(count < 100);
+     }
+     assert_eq!(exact, source[start..]);
+-    let bad = execute_artifact(&fixture, &runner, "retrieve-bad-cursor", json!({"action":"retrieve","cursor":"ac2.forged","maxBytes":2048}));
++    let bad = execute_artifact(
++        &fixture,
++        &runner,
++        "retrieve-bad-cursor",
++        json!({"action":"retrieve","cursor":"ac2.forged","maxBytes":2048}),
++    );
+     assert_eq!(bad.outcome.result["isError"], true);
+ }
+ 
+@@ -7519,23 +7642,75 @@
+     let original = "before\n";
+     let edits = json!([{"oldText":"before","newText":"after"}]);
+     let (endpoint, server) = server(vec![
+-        calls(vec![("preview-call","edit",json!({"path":"input.txt","mode":"preview","edits":edits}))]),
+-        calls(vec![("read-before","read",json!({"path":"input.txt"}))]),
+-        calls(vec![("concurrent-write","write",json!({"path":"input.txt","content":"before\nintervening work\n"}))]),
+-        calls(vec![("stale-apply","edit",json!({"path":"input.txt","mode":"apply","edits":edits,"expectedSha256":ag1_storage::digest(original.as_bytes())}))]),
++        calls(vec![(
++            "preview-call",
++            "edit",
++            json!({"path":"input.txt","mode":"preview","edits":edits}),
++        )]),
++        calls(vec![("read-before", "read", json!({"path":"input.txt"}))]),
++        calls(vec![(
++            "concurrent-write",
++            "write",
++            json!({"path":"input.txt","content":"before\nintervening work\n"}),
++        )]),
++        calls(vec![(
++            "stale-apply",
++            "edit",
++            json!({"path":"input.txt","mode":"apply","edits":edits,"expectedSha256":ag1_storage::digest(original.as_bytes())}),
++        )]),
+         stop(),
+     ]);
+-    let fixture = fixture_configured_tools(&endpoint, "disabled", vec![], None, None, 1, &["read","write","edit"]);
++    let fixture = fixture_configured_tools(
++        &endpoint,
++        "disabled",
++        vec![],
++        None,
++        None,
++        1,
++        &["read", "write", "edit"],
++    );
+     std::fs::write(fixture.root.join("input.txt"), original).unwrap();
+-    fixture.host.run(input(), &Resolver::new(false), fixture.files.clone(), &ignore).await.unwrap();
+-    assert_eq!(std::fs::read_to_string(fixture.root.join("input.txt")).unwrap(), "before\nintervening work\n");
+-    let branch = ag1_core::task::branch_values(&fixture.store.journal_snapshot(&SessionId::new("session").unwrap()).unwrap()).unwrap();
+-    let results: Vec<_> = branch.iter().filter(|e| e["message"]["role"] == "toolResult").map(|e| &e["message"]).collect();
++    fixture
++        .host
++        .run(
++            input(),
++            &Resolver::new(false),
++            fixture.files.clone(),
++            &ignore,
++        )
++        .await
++        .unwrap();
++    assert_eq!(
++        std::fs::read_to_string(fixture.root.join("input.txt")).unwrap(),
++        "before\nintervening work\n"
++    );
++    let branch = ag1_core::task::branch_values(
++        &fixture
++            .store
++            .journal_snapshot(&SessionId::new("session").unwrap())
++            .unwrap(),
++    )
++    .unwrap();
++    let results: Vec<_> = branch
++        .iter()
++        .filter(|e| e["message"]["role"] == "toolResult")
++        .map(|e| &e["message"])
++        .collect();
+     assert_eq!(results.len(), 4);
+     assert_eq!(results[0]["details"]["mode"], "preview");
+-    assert!(results[1]["content"][0]["text"].as_str().unwrap().contains("before"));
++    assert!(
++        results[1]["content"][0]["text"]
++            .as_str()
++            .unwrap()
++            .contains("before")
++    );
+     assert_eq!(results[3]["isError"], true);
+-    assert!(results[3].to_string().contains("changed since this preview") || results[3].to_string().contains("Conflict"));
++    assert!(
++        results[3]
++            .to_string()
++            .contains("changed since this preview")
++            || results[3].to_string().contains("Conflict")
++    );
+     server.join().unwrap();
+ }
+ 
+@@ -7545,37 +7720,71 @@
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn repository_inspection_accepts_missing_optional_info_without_host_changes() {
+     for linked in [false, true] {
+-        for missing in [vec!["info"], vec!["objects/info"], vec!["info", "objects/info"]] {
++        for missing in [
++            vec!["info"],
++            vec!["objects/info"],
++            vec!["info", "objects/info"],
++        ] {
+             let fixture = fixture("http://127.0.0.1:1", "disabled");
+             let common_root = if linked {
+                 let main = fixture._directory.path().join("main-repo");
+                 std::fs::create_dir(&main).unwrap();
+                 owned_repo_git(&main, &["init", "-b", "main"]);
+                 owned_repo_git(&main, &["commit", "--allow-empty", "-m", "baseline"]);
+-                owned_repo_git(&main, &["worktree", "add", "-b", "linked", fixture.root.to_str().unwrap()]);
++                owned_repo_git(
++                    &main,
++                    &[
++                        "worktree",
++                        "add",
++                        "-b",
++                        "linked",
++                        fixture.root.to_str().unwrap(),
++                    ],
++                );
+                 main.join(".git")
+             } else {
+                 owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+                 fixture.root.join(".git")
+             };
+-            for name in &missing { std::fs::remove_dir_all(common_root.join(name)).unwrap(); }
++            for name in &missing {
++                std::fs::remove_dir_all(common_root.join(name)).unwrap();
++            }
+             owned_repo_git(&fixture.root, &["status", "--porcelain"]);
+-            fn tree(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
++            fn tree(
++                root: &std::path::Path,
++            ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+                 let mut result = std::collections::BTreeMap::new();
+                 for entry in std::fs::read_dir(root).unwrap() {
+                     let path = entry.unwrap().path();
+-                    result.insert(path.clone(), if path.is_dir() { vec![] } else { std::fs::read(&path).unwrap() });
+-                    if path.is_dir() { result.extend(tree(&path)); }
++                    result.insert(
++                        path.clone(),
++                        if path.is_dir() {
++                            vec![]
++                        } else {
++                            std::fs::read(&path).unwrap()
++                        },
++                    );
++                    if path.is_dir() {
++                        result.extend(tree(&path));
++                    }
+                 }
+                 result
+             }
+             let before = tree(&common_root);
+             let runner = native_repo_runner(&fixture, "/usr/bin/git".as_ref()).await;
+             let result = execute_repo(&fixture, &runner, "optional-info", "status");
+-            assert_ne!(result["isError"], true, "linked={linked}, missing={missing:?}: {result}");
+-            assert_eq!(result["details"]["branch"], if linked { "linked" } else { "main" });
++            assert_ne!(
++                result["isError"], true,
++                "linked={linked}, missing={missing:?}: {result}"
++            );
++            assert_eq!(
++                result["details"]["branch"],
++                if linked { "linked" } else { "main" }
++            );
+             assert_eq!(tree(&common_root), before);
+-            for name in &missing { assert!(!common_root.join(name).exists()); }
++            for name in &missing {
++                assert!(!common_root.join(name).exists());
++            }
+         }
+     }
+ }
+@@ -7594,8 +7803,16 @@
+         let runner = native_repo_runner(&fixture, "/usr/bin/git".as_ref()).await;
+         let result = execute_repo(&fixture, &runner, "symlink-info", "status");
+         assert_eq!(result["isError"], true, "{name}: {result}");
+-        assert!(std::fs::symlink_metadata(target).unwrap().file_type().is_symlink());
+-        assert_eq!(std::fs::read_to_string(outside.join("marker")).unwrap(), "private");
++        assert!(
++            std::fs::symlink_metadata(target)
++                .unwrap()
++                .file_type()
++                .is_symlink()
++        );
++        assert_eq!(
++            std::fs::read_to_string(outside.join("marker")).unwrap(),
++            "private"
++        );
+     }
+ }
+ 
+@@ -7606,27 +7823,46 @@
+         let fixture = fixture("http://127.0.0.1:1", "disabled");
+         owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+         let info = fixture.root.join(".git/info");
+-        if initially_missing { std::fs::remove_dir_all(&info).unwrap(); }
++        if initially_missing {
++            std::fs::remove_dir_all(&info).unwrap();
++        }
+         let gate = fixture._directory.path().join("release-git");
+         let launcher = fixture._directory.path().join("gated-bwrap");
+         std::fs::write(&launcher, format!("#!/bin/sh\nprintf ready >&2\nwhile test ! -e '{}'; do sleep 0.01; done\nexec /usr/bin/bwrap \"$@\"\n", gate.display())).unwrap();
+         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+-        let runner = native_repo_runner_with_bubblewrap(&fixture, "/usr/bin/git".as_ref(), Some(&launcher)).await;
++        let runner =
++            native_repo_runner_with_bubblewrap(&fixture, "/usr/bin/git".as_ref(), Some(&launcher))
++                .await;
+         std::thread::scope(|scope| {
+             let running = scope.spawn(|| execute_repo(&fixture, &runner, "changed-info", "status"));
+             let deadline = std::time::Instant::now() + Duration::from_secs(3);
+             loop {
+-                let ready = std::fs::read_dir(fixture._directory.path().join("repo-spools")).unwrap()
+-                    .filter_map(Result::ok).any(|entry| std::fs::read_to_string(entry.path().join("stderr.log")).is_ok_and(|text| text == "ready"));
+-                if ready { break; }
+-                assert!(std::time::Instant::now() < deadline, "launcher did not reach execution");
++                let ready = std::fs::read_dir(fixture._directory.path().join("repo-spools"))
++                    .unwrap()
++                    .filter_map(Result::ok)
++                    .any(|entry| {
++                        std::fs::read_to_string(entry.path().join("stderr.log"))
++                            .is_ok_and(|text| text == "ready")
++                    });
++                if ready {
++                    break;
++                }
++                assert!(
++                    std::time::Instant::now() < deadline,
++                    "launcher did not reach execution"
++                );
+                 std::thread::sleep(Duration::from_millis(5));
+             }
+-            if !initially_missing { std::fs::rename(&info, info.with_file_name("info-before")).unwrap(); }
++            if !initially_missing {
++                std::fs::rename(&info, info.with_file_name("info-before")).unwrap();
++            }
+             std::fs::create_dir(&info).unwrap();
+             std::fs::write(&gate, "release").unwrap();
+             let result = running.join().unwrap();
+-            assert_eq!(result["isError"], true, "missing={initially_missing}: {result}");
++            assert_eq!(
++                result["isError"], true,
++                "missing={initially_missing}: {result}"
++            );
+         });
+     }
+ }

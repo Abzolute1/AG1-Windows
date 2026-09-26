@@ -31,7 +31,7 @@ pub fn static_guard(command: &str) -> Option<String> {
         .map(re)
         .into()
     });
-    PATTERNS.iter().any(|p|p.is_match(&normalize(command))).then(|| "Refused: do not start a static file server to take verification screenshots. For static HTML/CSS/JS, pass the file path (e.g. index.html). Do not start a Python, Node, or PHP server just to take a screenshot. Use screenshot_url or verify_ui with the HTML path. Start a server only for apps that actually need one (Vite, Next, an API).".into())
+    PATTERNS.iter().any(|p|p.is_match(&normalize(command))).then(|| "Refused: do not start a static file server just to take screenshots. Browser verification requires a ready AG1-owned web target started through preview start or the host Runtime UI; bash/job servers and local HTML paths do not grant browser access. Use read to preview local images, including simple vector SVG. Use the editor Preview for static HTML. Start a server only for apps that actually need one (Vite, Next, an API).".into())
 }
 pub fn archive_guard(command: &str) -> Option<String> {
     static PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
@@ -78,31 +78,145 @@ pub fn guard(command: &str, job: bool) -> Result<(), DomainError> {
         .or_else(|| (!job).then(|| install_guard(command)).flatten());
     reason.map_or(Ok(()), |reason| Err(DomainError::InvalidInput(reason)))
 }
+/// Literal outer-shell destinations for advisory post-command file hints.
+/// This is not an exhaustive effect tracker: do not interpret quoted programs,
+/// substitutions or here-document bodies as commands of the outer shell.
 pub fn write_targets(command: &str) -> Vec<String> {
-    static TARGET: LazyLock<Regex> = LazyLock::new(|| re(r"(>>|>)\s*([^\s;&|<>]+)"));
+    let bytes = command.as_bytes();
     let mut targets = vec![];
-    for capture in TARGET.captures_iter(command) {
-        let operator = capture.get(1).unwrap();
-        if operator.as_str() == ">"
-            && operator.start() > 0
-            && command.as_bytes()[operator.start() - 1].is_ascii_digit()
-        {
+    let (mut at, mut quote, mut here_document) = (0, None, false);
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if quote == Some(b'\'') {
+            if byte == b'\'' {
+                quote = None;
+            }
+            at += 1;
             continue;
         }
-        if operator.as_str() == ">"
-            && operator.start() > 0
-            && command.as_bytes()[operator.start() - 1] == b'&'
-        {
+        if byte == b'\\' {
+            at = (at + 2).min(bytes.len());
             continue;
         }
-        let target = capture[2]
-            .trim_start_matches(['\'', '"'])
-            .trim_end_matches(['\'', '"']);
-        if !target.is_empty() && target != "/dev/null" && !targets.iter().any(|s| s == target) {
-            targets.push(target.into());
+        // Expansion bodies can contain nested quotes and literal `>` bytes.
+        // Their grammar cannot be inferred from the outer quote state.
+        if bytes[at..].starts_with(b"$(")
+            || bytes[at..].starts_with(b"${")
+            || bytes[at..].starts_with(b"$'")
+            || bytes[at..].starts_with(b"$\"")
+            || byte == b'`'
+        {
+            break;
+        }
+        if let Some(delimiter) = quote {
+            if byte == delimiter {
+                quote = None;
+            }
+            at += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+            at += 1;
+            continue;
+        }
+        if here_document && byte == b'\n' {
+            break;
+        }
+        if byte == b'#'
+            && (at == 0 || bytes[at - 1].is_ascii_whitespace() || b";|&()".contains(&bytes[at - 1]))
+        {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+            continue;
+        }
+        // These constructs need a shell grammar to distinguish comparisons and
+        // nested programs from redirects. Omitting an advisory hint is safer
+        // than inventing a destination. Nothing here authorizes execution.
+        if bytes[at..].starts_with(b"<(")
+            || bytes[at..].starts_with(b">(")
+            || bytes[at..].starts_with(b"((")
+            || bytes[at..].starts_with(b"[[")
+        {
+            break;
+        }
+        if bytes[at..].starts_with(b"<<") {
+            here_document = true;
+        }
+        if byte != b'>' {
+            at += 1;
+            continue;
+        }
+        let append = bytes.get(at + 1) == Some(&b'>');
+        let prefixed = at > 0 && (bytes[at - 1].is_ascii_digit() || bytes[at - 1] == b'&');
+        at += if append { 2 } else { 1 };
+        let (target, end) = literal_redirect_target(bytes, at);
+        at = end;
+        // Preserve the existing descriptor-redirection scope of these hints.
+        if !append && prefixed {
+            continue;
+        }
+        if let Some(target) = target
+            && target != "/dev/null"
+            && !targets.contains(&target)
+        {
+            targets.push(target);
         }
     }
     targets
+}
+
+fn literal_redirect_target(bytes: &[u8], mut at: usize) -> (Option<String>, usize) {
+    while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+        at += 1;
+    }
+    let (mut text, mut quote, mut dynamic) = (vec![], None, false);
+    while let Some(&byte) = bytes.get(at) {
+        if quote == Some(b'\'') {
+            if byte == b'\'' {
+                quote = None;
+            } else {
+                text.push(byte);
+            }
+        } else if byte == b'\\' {
+            let Some(&next) = bytes.get(at + 1) else {
+                return (None, bytes.len());
+            };
+            if quote != Some(b'"') || b"$`\"\\\n".contains(&next) {
+                at += 1;
+                if next != b'\n' {
+                    text.push(next);
+                }
+            } else {
+                text.push(byte);
+            }
+        } else if quote == Some(b'"') {
+            if byte == b'"' {
+                quote = None;
+            } else {
+                if matches!(byte, b'$' | b'`') {
+                    return (None, bytes.len());
+                }
+                text.push(byte);
+            }
+        } else if matches!(byte, b'\'' | b'"') {
+            quote = Some(byte);
+        } else if byte.is_ascii_whitespace() || b";&|<>()".contains(&byte) {
+            break;
+        } else {
+            if matches!(byte, b'$' | b'`') {
+                return (None, bytes.len());
+            }
+            dynamic |= matches!(byte, b'*' | b'?' | b'[' | b'~');
+            text.push(byte);
+        }
+        at += 1;
+    }
+    let target = (!dynamic && quote.is_none() && !text.is_empty())
+        .then(|| String::from_utf8(text).ok())
+        .flatten();
+    (target, at)
 }
 pub fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))

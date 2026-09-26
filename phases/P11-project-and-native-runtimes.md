@@ -8,7 +8,7 @@ Deliver project create/load/files/install/build/run/preview/log/stop/history wor
 
 Require P10 runtime and P04 early preview/platform evidence. P03 process/PTY and P09 policy remain the only OS/tool ownership primitives. Implement platform target adapters, core target/diagnostic DTOs and desktop preview boundary in fixture projects. No Pro implementation, user repo rollback, model backend changes or embedded Chromium requirement.
 
-For a new thread, first read the [P11 handoff](../implementation/P11-HANDOFF.md): it records the verified P10 checkpoint, dependency check, concrete integration APIs, unfinished target/gate work and L01–L08 preservation requirements. Reverify its observations against the current checkout.
+For a new thread, first read the [P11 handoff](../implementation/evidence/implementation-records/phases/P11-HANDOFF.md): it records the verified P10 checkpoint, dependency check, concrete integration APIs, unfinished target/gate work and L01–L08 preservation requirements. Reverify its observations against the current checkout.
 
 ## Work and authority
 
@@ -41,4 +41,4 @@ Measure run-ready/log-display/stop timings separately from dependency download a
 
 Stop only owned fixture groups, retain user-generated state and record failed teardown. TS desktop stays available; no live authority transfer. P12 receives real runtime targets/capabilities to render, including truthful native preview limitations.
 
-Write `implementation/P12-HANDOFF.md` before finishing so the next thread has entry checks, completion evidence, delivered APIs, residual gaps and all L01–L08 constraints without relying on this conversation.
+Write `implementation/evidence/implementation-records/phases/P12-HANDOFF.md` before finishing so the next thread has entry checks, completion evidence, delivered APIs, residual gaps and all L01–L08 constraints without relying on this conversation.

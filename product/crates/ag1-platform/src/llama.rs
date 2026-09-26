@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 pub mod custody;
 pub mod discovery;
 pub mod lifecycle;
+mod materials;
 #[cfg(target_os = "linux")]
 pub mod native;
 pub mod observation;

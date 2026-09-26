@@ -18,6 +18,20 @@ pub struct AppliedEdits {
 fn err(s: impl Into<String>) -> DomainError {
     DomainError::InvalidInput(s.into())
 }
+/// Preserve ordinary non-overlapping counts while detecting an otherwise
+/// hidden second overlapping location. Two linear searches suffice for the
+/// ambiguous single-count case; matching must never guess a target location.
+pub(super) fn occurrences(content: &str, old: &str) -> usize {
+    let count = content.matches(old).count();
+    if count == 1 && !old.is_empty() {
+        let at = content.find(old).expect("one counted match");
+        let next = at + old.chars().next().unwrap().len_utf8();
+        if content[next..].contains(old) {
+            return 2;
+        }
+    }
+    count
+}
 pub fn normalize_lf(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
@@ -126,10 +140,10 @@ pub fn apply(
             if normalized_old.is_empty() {
                 normalized_base.encode_utf16().count().saturating_sub(1)
             } else {
-                normalized_base.matches(&normalized_old).count()
+                occurrences(&normalized_base, &normalized_old)
             }
         } else {
-            base.matches(&e.old_text).count()
+            occurrences(base, &e.old_text)
         };
         if occurrences > 1 {
             return Err(err(if edits.len() == 1 {

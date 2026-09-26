@@ -270,6 +270,15 @@ pub struct Snapshot {
     contributions: Paths,
     extension_notes: Vec<(Kind, usize, Diagnostic)>,
 }
+impl Snapshot {
+    pub(crate) fn skill_bodies(&self) -> Vec<(ag1_core::resources::skills::Skill, String)> {
+        self.catalog.skills.iter().filter_map(|skill| {
+            self.captured.iter().find(|c| c.kind == Kind::Skill && c.canonical_path == skill.file_path)
+                .and_then(|c| String::from_utf8(c.bytes.clone()).ok())
+                .map(|body| (skill.clone(), body))
+        }).collect()
+    }
+}
 pub struct ResourceLoader {
     overrides: Option<crate::resource_overrides::RegisteredOverride>,
     fs: ResourceFs,

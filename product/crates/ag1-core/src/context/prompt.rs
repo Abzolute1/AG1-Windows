@@ -129,7 +129,7 @@ pub fn routing(tools: &[String]) -> String {
         .iter()
         .any(|s| has(s))
     {
-        lines.push("- verify UI you built: verify_ui (concrete claim) or screenshot_url (HTML path or localhost URL); interact_then_screenshot after clicks/fills. Do not start a server just to screenshot static HTML.".into());
+        lines.push("- verify UI you built: verify_ui or screenshot_url require a ready AG1-owned web target started through Runtime; interact_then_screenshot after clicks/fills. These tools do not accept arbitrary websites or local file previews. Show local images (including simple vector SVG) with read; do not start a server just to show an image.".into());
     } else if has("verify") {
         lines.push("- verify a claim: verify".into());
     }

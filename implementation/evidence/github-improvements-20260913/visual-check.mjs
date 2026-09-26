@@ -1,0 +1,26 @@
+const {chromium} = await import(process.env.AG1_PLAYWRIGHT_MODULE || '/tmp/ag1-github-visual/node_modules/playwright-core/index.mjs');
+import fs from 'node:fs/promises';
+const browser = await chromium.launch({headless:true, executablePath:'/home/alex/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome'});
+const page=await browser.newPage({viewport:{width:1600,height:1000}});
+const errors=[];page.on('pageerror',e=>errors.push(e.message));
+await page.route('**/*', route=>route.request().url().startsWith('http://127.0.0.1:1431/') ? route.continue() : route.abort());
+await page.goto('http://127.0.0.1:1431/github-improvements-fixture.html');
+await page.getByRole('button',{name:'Browse repositories',exact:true}).waitFor();
+const results=[];
+async function shot(name){await page.screenshot({path:`/tmp/ag1-github-visual/${name}.png`,fullPage:true});results.push({name,...await page.evaluate(()=>({width:innerWidth,scrollWidth:document.documentElement.scrollWidth,contentWidth:document.querySelector('.settings-content').getBoundingClientRect().width,errors:[...document.querySelectorAll('[role=alert]')].map(e=>e.textContent)}))});}
+await page.getByRole('button',{name:'Refresh API quota'}).click();await page.getByText('4920 / 5000 remaining',{exact:false}).waitFor();await shot('overview-wide');
+await page.getByRole('button',{name:'Browse repositories',exact:true}).click();await shot('repositories-wide');
+await page.getByRole('button',{name:'owned/project',exact:true}).click();await page.getByRole('button',{name:'Improve repository workflows',exact:true}).waitFor();await shot('items-wide');
+await page.getByText('Repository settings',{exact:true}).click();await page.getByRole('button',{name:'Load repository settings'}).click();await page.getByLabel('Description',{exact:true}).waitFor();await shot('configuration-wide');
+await page.getByRole('button',{name:'Variables & secrets',exact:true}).click();await page.getByRole('button',{name:'Load variables',exact:true}).click();await page.getByText('BUILD_PROFILE',{exact:true}).waitFor();await shot('variables-wide');
+await page.setViewportSize({width:760,height:900});await shot('variables-narrow');
+await page.getByRole('button',{name:'Access',exact:true}).click();await page.getByRole('button',{name:'Load collaborators'}).click();await page.getByText('colleague',{exact:true}).waitFor();await shot('access-narrow');
+await page.getByRole('button',{name:'Overview',exact:true}).click();await shot('overview-narrow');
+await page.setViewportSize({width:480,height:800});await shot('overview-small');
+await page.goto('http://127.0.0.1:1431/github-improvements-fixture.html?mode=empty');await page.getByRole('button',{name:'Browse repositories',exact:true}).click();await page.getByText('No repositories on this page.',{exact:false}).waitFor();await shot('repositories-empty');
+await page.goto('http://127.0.0.1:1431/github-improvements-fixture.html?mode=loading');await page.getByRole('button',{name:'Browse repositories',exact:true}).click();await page.getByText('Working with GitHub…',{exact:true}).waitFor();await shot('loading');
+await page.goto('http://127.0.0.1:1431/github-improvements-fixture.html?mode=error');await page.getByRole('button',{name:'Refresh API quota'}).click();await page.getByRole('alert').waitFor();await shot('quota-error');
+await fs.writeFile('/tmp/ag1-github-visual/results.json',JSON.stringify({results,errors,calls:await page.evaluate(()=>window.__fixtureCalls)},null,2));
+await browser.close();
+if(errors.length || results.some(r=>r.scrollWidth>r.width)) throw Error(JSON.stringify({errors,results}));
+console.log(JSON.stringify(results));

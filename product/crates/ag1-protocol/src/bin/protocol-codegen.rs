@@ -156,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BridgeFrame,
         MessageBlock,
         ClientMessage,
+        ToolResultIdentity,
         ClientDetails,
         ClientView,
         WireMessage

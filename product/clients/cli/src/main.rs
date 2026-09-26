@@ -9,8 +9,11 @@ use std::{
 };
 fn write(out: &Arc<Mutex<std::io::Stdout>>, frame: &w::WireMessage) -> Result<()> {
     let bytes = w::encode(frame).map_err(|e| format!("{e:?}"))?;
+    write_encoded(out, &bytes)
+}
+fn write_encoded(out: &Arc<Mutex<std::io::Stdout>>, bytes: &[u8]) -> Result<()> {
     let mut out = out.lock().map_err(|_| "stdout unavailable")?;
-    out.write_all(&bytes)
+    out.write_all(bytes)
         .and_then(|_| out.write_all(b"\n"))
         .and_then(|_| out.flush())
         .map_err(|e| e.to_string())
@@ -44,6 +47,7 @@ async fn run() -> Result<u8> {
     let mut trust = false;
     let mut export = None;
     let mut list_models = false;
+    let mut subscription_session = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -117,6 +121,7 @@ async fn run() -> Result<u8> {
                 ))
             }
             "--list-models" => list_models = true,
+            "--discover-openai-subscription" => subscription_session = Some(PathBuf::from(args.next().ok_or("--discover-openai-subscription requires the private Codex session file")?)),
             "--" => {
                 prompt.extend(args);
                 break;
@@ -132,6 +137,11 @@ async fn run() -> Result<u8> {
     };
     if !["print", "jsonl"].contains(&mode.as_str()) {
         return Err("--mode requires jsonl or print".into());
+    }
+    if let Some(path) = subscription_session {
+        let models = ag1_platform::provider::codex_subscription::discover(&path).await.map_err(|e| format!("{e:?}"))?;
+        println!("{}", serde_json::to_string(&models).map_err(|e| e.to_string())?);
+        return Ok(0);
     }
     let path = config.ok_or("--config is required; no implicit user profile writes")?;
     let bytes = fs::read(path).map_err(|e| e.to_string())?;
@@ -298,7 +308,7 @@ async fn run() -> Result<u8> {
         }
     });
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(16));
-    let mut last = String::new();
+    let mut last = Vec::new();
     let mut eof = false;
     loop {
         tokio::select! {
@@ -315,8 +325,12 @@ async fn run() -> Result<u8> {
             },
             _=tick.tick()=>{
                 let view=host.settled_view().await.map_err(|e|format!("{e:?}"))?;
-                let serialized=serde_json::to_string(&view).map_err(|e|e.to_string())?;
-                if serialized!=last {last=serialized;write(&out,&w::WireMessage::Client(Box::new(view.clone())))?;}
+                // Compare the exact encoded frame and reuse it for output. A
+                // changed view needs neither a second encoding nor a deep clone.
+                let frame = w::WireMessage::Client(Box::new(view));
+                let serialized = w::encode(&frame).map_err(|e| format!("{e:?}"))?;
+                if serialized != last { write_encoded(&out, &serialized)?; last = serialized; }
+                let w::WireMessage::Client(view) = frame else { unreachable!("constructed client frame") };
                 if eof {
                     if !view.snapshot.pending.is_empty() {host.shutdown().await.map_err(|e|format!("{e:?}"))?;return Err("Input closed with pending approval; cancelled owned work".into());}
                     if view.snapshot.status=="idle" {if let Some(error)=view.error {host.shutdown().await.map_err(|e|format!("{e:?}"))?;return Err(error);}break;}

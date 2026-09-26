@@ -165,7 +165,7 @@ impl Port for CheckPort {
             && record.exits.iter().all(|e| *e == Some(0))
             && current_revision == record.source_revision;
         Ok(AdapterOutcome {
-            result: json!({"content":[{"type":"text","text":serde_json::to_string(&record).unwrap()}],"isError":!passed,"details":{"passed":passed,"commands":record.commands,"exits":record.exits,"sourceRevision":record.source_revision,"currentRevision":current_revision,"logs":logs,"runtimeProof":false,"visualProof":false}}),
+            result: json!({"content":[{"type":"text","text":serde_json::to_string(&record).unwrap()}],"isError":!passed,"details":{"passed":passed,"commands":record.commands,"exits":record.exits,"diagnostics":record.diagnostics,"lifecycle":record.lifecycle,"sourceRevision":record.source_revision,"currentRevision":current_revision,"logs":logs,"runtimeProof":false,"visualProof":false}}),
             effect: Effect::Committed,
             artifact_page: false,
         })
@@ -321,6 +321,7 @@ pub enum ProjectPort {
     Visual(Box<VisualPort>),
 }
 pub enum ProjectPlan {
+    Preview(super::PreviewPlan),
     Check(Plan),
     Visual(VisualPlan),
 }
@@ -336,6 +337,7 @@ impl Port for ProjectPort {
     }
     fn binding(&self, p: &ProjectPlan) -> Binding {
         match p {
+            ProjectPlan::Preview(p) => p.binding.clone(),
             ProjectPlan::Check(p) => p.binding.clone(),
             ProjectPlan::Visual(p) => p.binding.clone(),
         }
@@ -470,7 +472,7 @@ pub struct SharedProject {
 }
 impl SharedProject {
     pub fn names(&self) -> Vec<String> {
-        let mut names = vec![];
+        let mut names = vec!["preview".into()];
         if self.check.available() {
             names.push("check".into());
         }
@@ -482,6 +484,10 @@ impl SharedProject {
             );
         }
         names
+    }
+    fn with_runtime<T>(&self, call: impl FnOnce(&mut Runtime) -> Result<T, DomainError>) -> Result<T, DomainError> {
+        let mut slot = self.check.runtime.try_lock().map_err(|_| DomainError::QueueFull)?;
+        call(slot.as_mut().ok_or_else(|| DomainError::Unavailable("Project runtime is not configured".into()))?)
     }
     fn with_visual<T>(
         &self,
@@ -539,7 +545,9 @@ impl SharedProject {
 impl Port for SharedProject {
     type Plan = ProjectPlan;
     fn prepare(&mut self, r: &Request, c: &ScanControl<'_>) -> Result<ProjectPlan, DomainError> {
-        if r.name() == "check" {
+        if r.name() == "preview" {
+            self.with_runtime(|runtime| runtime.prepare_model_preview(r.arguments(), c)).map(ProjectPlan::Preview)
+        } else if r.name() == "check" {
             self.check.prepare(r, c).map(ProjectPlan::Check)
         } else {
             self.with_visual(|p| p.prepare(r, c))
@@ -548,12 +556,14 @@ impl Port for SharedProject {
     }
     fn binding(&self, p: &ProjectPlan) -> Binding {
         match p {
+            ProjectPlan::Preview(p) => p.binding.clone(),
             ProjectPlan::Check(p) => p.binding.clone(),
             ProjectPlan::Visual(p) => p.binding.clone(),
         }
     }
     fn display(&self, p: &ProjectPlan) -> Value {
         match p {
+            ProjectPlan::Preview(p) => p.display.clone(),
             ProjectPlan::Check(p) => self.check.display(p),
             ProjectPlan::Visual(p) => {
                 json!({"target":p.binding.target,"origin":p.grant.origin,"capabilities":p.binding.capabilities})
@@ -562,6 +572,7 @@ impl Port for SharedProject {
     }
     fn revalidate(&mut self, p: &ProjectPlan, c: &ScanControl<'_>) -> Result<(), DomainError> {
         match p {
+            ProjectPlan::Preview(p) => self.with_runtime(|runtime| runtime.revalidate_model_preview(p, c)),
             ProjectPlan::Check(p) => self.check.revalidate(p, c),
             ProjectPlan::Visual(p) => self.with_visual(|port| port.revalidate(p, c)),
         }
@@ -574,6 +585,7 @@ impl Port for SharedProject {
         a: &mut A,
     ) -> Result<AdapterOutcome, DomainError> {
         match p {
+            ProjectPlan::Preview(p) => self.with_runtime(|runtime| runtime.execute_model_preview(p, c)),
             ProjectPlan::Check(p) => self.check.execute(p, r, c, a),
             ProjectPlan::Visual(p) => self.with_visual(|port| port.execute(p, r, c, a)),
         }

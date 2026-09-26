@@ -1,0 +1,35 @@
+// Native owned binary downloads; exact saved bytes, no real GitHub or inference.
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import {createHash} from 'node:crypto';
+import {runNativeFixture} from './p14_native_startup_smoke.mjs';
+let generations=0;const errors=[];
+function handleRequest(request,response){let body='';request.on('data',b=>{body+=b;if(body.length>4*1024*1024)request.destroy();});request.on('end',()=>{try{
+ const data=JSON.parse(body),first=generations++===0;assert.ok(generations<=2);
+ if(!first){const reply=data.messages.find(m=>m.role==='tool'&&m.tool_call_id==='owned-download');assert.ok(reply);assert.ok(JSON.stringify(reply).includes('download-'));assert.ok(!JSON.stringify(reply).includes('base64'));}
+ const delta=first?{tool_calls:[{index:0,id:'owned-download',type:'function',function:{name:'github',arguments:JSON.stringify({operation:'actions.download_artifact',repo:'owned/fixture',parameters:{artifact_id:77}})}}]}:{content:'The owned artifact is ready to save from its native receipt.'};
+ response.writeHead(200,{'Content-Type':'text/event-stream',Connection:'close'});response.end(`data: ${JSON.stringify({choices:[{delta,finish_reason:first?'tool_calls':'stop'}],usage:{prompt_tokens:80,completion_tokens:25}})}\n\ndata: [DONE]\n\n`);
+ }catch(e){errors.push(String(e));response.writeHead(400);response.end('{}');}});}
+await runNativeFixture(process.argv[2],{prefix:'download-',githubFixture:true,handleRequest,async exercise({work,probe,wait,requests}){
+ const js=script=>probe({script});
+ const click=label=>wait(()=>js(`(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.getClientRects().length&&(b.getAttribute('aria-label')===${JSON.stringify(label)}||b.textContent.trim()===${JSON.stringify(label)}));if(!b||b.disabled)return false;b.click();return true})()`),`click ${label}`);
+ const select=value=>js(`(()=>{const e=document.querySelector('[aria-label="GitHub repository view"]');e.value=${JSON.stringify(value)};e.dispatchEvent(new Event('change',{bubbles:true}));return true})()`);
+ const row=name=>wait(()=>js(`(()=>{const b=[...document.querySelectorAll('.github-browser .github-items button')].find(b=>b.querySelector('strong')?.textContent===${JSON.stringify(name)});if(!b)return false;b.click();return true})()`),`row ${name}`);
+ const calls=()=>{const p=path.join(work,'state/github-requests.jsonl');return fs.existsSync(p)?fs.readFileSync(p,'utf8').split('\n').slice(0,-1).filter(Boolean).map(JSON.parse):[];};
+ const downloads=path.join(work,'downloads');fs.mkdirSync(downloads,{mode:0o700});fs.writeFileSync(path.join(work,'xdg-config','user-dirs.dirs'),`XDG_DOWNLOAD_DIR="${downloads}"\n`);
+ const binary=Buffer.from(Array.from({length:300000},(_,n)=>n%256));const log=Buffer.from('Owned job log\n<script>literal log</script>\r\n');
+ const save=async(name,expected)=>{assert.ok(!fs.existsSync(path.join(downloads,name)));await click('Save downloaded file');await wait(()=>fs.existsSync(path.join(downloads,name))&&fs.statSync(path.join(downloads,name)).size===expected.length,`saved ${name}`);assert.deepEqual(fs.readFileSync(path.join(downloads,name)),expected);};
+ await click('GitHub');await click('owned/fixture');await js(`(()=>{[...document.querySelectorAll('summary')].find(s=>s.textContent==='Code, workflows, releases, projects and notifications').click();return true})()`);
+ await select('actions.runs');await click('Load view');await row('Owned workflow');await click('Download run logs');await save('actions-download_logs-55.zip',binary);
+ await click('Inspect jobs');await row('Owned job');await click('Download job log');await click('Preview log text');await wait(()=>js(`document.querySelector('.github-download pre')?.textContent.includes('<script>literal log</script>')`),'literal log preview');assert.equal(await js(`!!document.querySelector('.github-download script')`),false);
+ await probe({size:[900,700]});await wait(()=>js('innerWidth===900'),'narrow downloads');await js(`document.querySelector('.github-download').scrollIntoView({block:'center'});true`);assert.ok(await js('document.documentElement.scrollWidth<=901'));await probe({screenshot:'job-log-900.png'});await save('actions-download_job_log-66.txt',log);
+ await select('actions.runs');await click('Refresh view');await row('Owned workflow');await click('Inspect run artifacts');await row('Owned artifact');await click('Download file');await save('actions-download_artifact-77.zip',binary);
+ await select('releases.list');await click('Load view');await row('Owned release');await click('Inspect release assets');await row('owned-release.bin');await click('Download file');await save('releases-download_asset-99.bin',binary);
+ await click('Back to chat');const project=path.join(work,'project');fs.mkdirSync(project);await js(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'o',ctrlKey:true,bubbles:true}));true`);await wait(()=>js(`!!document.querySelector('input[aria-label="Project folder"]')`),'project dialog');await js(`(()=>{const e=document.querySelector('input[aria-label="Project folder"]');Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,${JSON.stringify(project)});e.dispatchEvent(new Event('input',{bubbles:true}));return true})()`);await click('Open project');await wait(()=>js(`!document.querySelector('input[aria-label="Project folder"]')`),'project selected');await js(`(()=>{const e=document.querySelector('textarea[aria-label="Message AG1"]');Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set.call(e,'Download the artifact from the owned offline GitHub fixture.');e.dispatchEvent(new Event('input',{bubbles:true}));return true})()`);await click('Send message');
+ await wait(()=>js(`!!document.querySelector('.approval-review')`),'model download approval');assert.equal(calls().filter(c=>c.operation.id==='actions.download_artifact').length,1);await click('Allow this operation');await wait(()=>generations===2,'scripted model completion');await wait(()=>js(`!!document.querySelector('.github-result-card .github-download')`),'model retained download');
+ // Remove only our first fixture download so the same exact filename can prove model save.
+ fs.unlinkSync(path.join(downloads,'actions-download_artifact-77.zip'));await save('actions-download_artifact-77.zip',binary);
+ assert.deepEqual(errors,[]);assert.equal(requests.length,2);assert.ok(calls().every(c=>c.operation.risk==='read'));
+ return{promptsSubmitted:1,providerRequests:requests,githubCalls:calls(),savedFiles:fs.readdirSync(downloads).map(name=>({name,sha256:createHash('sha256').update(fs.readFileSync(path.join(downloads,name))).digest('hex')})),checks:['run archives, artifact archives and release assets save exact 300000 non-text bytes across native pages','job log exact CRLF bytes and bounded literal preview','model receives a receipt only after native approval, and can save through same custody','no fixture API mutation, live GitHub, automatic extraction or live inference']};
+}});

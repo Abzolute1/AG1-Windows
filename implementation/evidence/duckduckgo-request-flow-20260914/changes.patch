@@ -1,0 +1,394 @@
+--- before/product/crates/ag1-platform/src/web_http.rs
++++ after/product/crates/ag1-platform/src/web_http.rs
+@@ -294,6 +294,24 @@
+             return Err(DomainError::PermissionDenied);
+         }
+         let requested_url = url.to_string();
++        // DuckDuckGo's HTML/lite forms submit q and the empty submit field b by
++        // POST. GET query URLs can receive a challenge even when the form works.
++        // Keep the logical URL for provenance; send query terms only in the body.
++        let mut search_form = if matches!(purpose, WebPurpose::SearchHtml) {
++            let fields = url
++                .query_pairs()
++                .map(|(k, v)| (k.into_owned(), v.into_owned()))
++                .collect::<Vec<_>>();
++            url.set_query(None);
++            url.query_pairs_mut()
++                .extend_pairs(fields)
++                .append_pair("b", "");
++            let body = url.query().unwrap_or_default().to_owned();
++            url.set_query(None);
++            Some(body)
++        } else {
++            None
++        };
+         let deadline = deadline.min(Instant::now() + Duration::from_secs(30));
+         let mut chain = vec![];
+         for hop in 0..=5 {
+@@ -349,6 +367,18 @@
+                         reqwest::header::ACCEPT,
+                         HeaderValue::from_static("text/html,application/xhtml+xml"),
+                     );
++                    if search_form.is_some() {
++                        headers.insert(
++                            reqwest::header::CONTENT_TYPE,
++                            HeaderValue::from_static("application/x-www-form-urlencoded"),
++                        );
++                        headers.insert(
++                            reqwest::header::REFERER,
++                            HeaderValue::from_str(url.as_str()).map_err(|_| {
++                                DomainError::InvalidInput("search form referer".into())
++                            })?,
++                        );
++                    }
+                 }
+                 WebPurpose::SearchJson => {
+                     headers.insert(
+@@ -357,11 +387,17 @@
+                     );
+                 }
+             }
++            let request = if let Some(body) = &search_form {
++                client.post(url.clone()).body(body.clone())
++            } else {
++                client.get(url.clone())
++            }
++            .headers(headers);
+             let mut response = tokio::select! {
+                 biased;
+                 _=cancel.wait()=>return Err(DomainError::Cancelled),
+                 _=tokio::time::sleep_until(deadline)=>return Err(DomainError::TimedOut),
+-                response=client.get(url.clone()).headers(headers).send()=>response.map_err(|e| if e.is_timeout() { DomainError::TimedOut } else { DomainError::Unavailable("web connection failed".into()) })?,
++                response=request.send()=>response.map_err(|e| if e.is_timeout() { DomainError::TimedOut } else { DomainError::Unavailable("web connection failed".into()) })?,
+             };
+             if response.status().is_redirection() {
+                 if hop == 5 {
+@@ -380,6 +416,17 @@
+                 let next = url
+                     .join(location)
+                     .map_err(|_| DomainError::InvalidInput("web redirect URL".into()))?;
++                if search_form.is_some() {
++                    // Do not forward a search form to another origin. Normal
++                    // same-origin 301/302/303 navigation becomes GET; 307/308
++                    // preserve POST. The next hop still passes DNS/TLS policy.
++                    if next.origin() != url.origin() {
++                        return Err(DomainError::PermissionDenied);
++                    }
++                    if matches!(response.status().as_u16(), 301..=303) {
++                        search_form = None;
++                    }
++                }
+                 chain.push(url.to_string());
+                 url = parse_url(next.as_str())?;
+                 continue;
+--- before/product/crates/ag1-platform/src/web_tools/search.rs
++++ after/product/crates/ag1-platform/src/web_tools/search.rs
+@@ -3,6 +3,22 @@
+ use crate::web_http::WebPurpose;
+ use ag1_core::tools::websearch::{self, Attempt, ProviderResponse};
+ use std::time::Duration;
++// Serialize public DuckDuckGo searches across native services in this process.
++// No fixed success delay: DDG publishes no verified HTML/lite request quota.
++static DUCKDUCKGO_SEARCH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
++
++async fn search_slot<'a>(
++    gate: &'a tokio::sync::Mutex<()>,
++    deadline: Instant,
++    cancel: &mut CancelToken,
++) -> Result<tokio::sync::MutexGuard<'a, ()>, DomainError> {
++    tokio::select! {
++        biased;
++        _=cancel.wait()=>Err(DomainError::Cancelled),
++        _=tokio::time::sleep_until(deadline)=>Err(DomainError::TimedOut),
++        value=gate.lock()=>Ok(value),
++    }
++}
+ #[derive(Clone)]
+ pub struct SearchEndpoints {
+     pub html: String,
+@@ -295,6 +311,37 @@
+             }
+             if matches!(name.as_str(), "serpapi" | "tavily" | "exa") {
+                 attempts.push(Attempt{provider:name.clone(),url:format!("provider:{name}:{query}"),status:"skipped".into(),result_count:0,error:Some(format!("{name} provider is not implemented yet; AG1_{}_API_KEY is optional and DuckDuckGo fallback remains available",name.to_uppercase()))});
++                continue;
++            }
++            // Trusted local fixture endpoints exercise the same transport
++            // without participating in the public-service serialization.
++            let public_ddg = name == "duckduckgo"
++                && reqwest::Url::parse(&self.config.endpoints.html)
++                    .ok()
++                    .and_then(|u| u.host_str().map(str::to_owned))
++                    .is_some_and(|host| {
++                        host == "duckduckgo.com" || host.ends_with(".duckduckgo.com")
++                    });
++            let _search_slot = if public_ddg {
++                Some(search_slot(&DUCKDUCKGO_SEARCH, deadline, cancel).await?)
++            } else {
++                None
++            };
++            // Another queued call may have encountered a challenge meanwhile.
++            if public_ddg
++                && self
++                    .blocked_until
++                    .lock()
++                    .map_err(|_| DomainError::Unavailable("search cooldown".into()))?
++                    .is_some_and(|until| Instant::now() < until)
++            {
++                attempts.push(Attempt {
++                    provider: name.clone(),
++                    url: "provider:duckduckgo".into(),
++                    status: "blocked".into(),
++                    result_count: 0,
++                    error: Some("DuckDuckGo is paused after a blocked request.".into()),
++                });
+                 continue;
+             }
+             let endpoints = if name == "brave" {
+@@ -346,7 +393,7 @@
+                     .await;
+                 match fetched {
+                     Ok(response) => {
+-                        let raw = json!({"version":1,"requestedUrl":url,"finalUrl":response.final_url,"redirectChain":response.redirect_chain,"statusCode":response.status,"contentType":response.content_type,"bodyBase64":STANDARD.encode(&response.bytes),"bodySha256":format!("{:x}",Sha256::digest(&response.bytes)),"bodyRepresentation":"decoded-entity","trust":"untrusted"});
++                        let raw = json!({"version":1,"initialRequestMethod":if name=="duckduckgo"{"POST"}else{"GET"},"initialRequestTarget":if name=="duckduckgo"{endpoint.as_str()}else{url.as_str()},"searchQuery":query,"requestedUrl":url,"finalUrl":response.final_url,"redirectChain":response.redirect_chain,"statusCode":response.status,"contentType":response.content_type,"bodyBase64":STANDARD.encode(&response.bytes),"bodySha256":format!("{:x}",Sha256::digest(&response.bytes)),"bodyRepresentation":"decoded-entity","trust":"untrusted"});
+                         let artifact = artifacts.put_evidence(
+                             &raw.to_string(),
+                             "web-response",
+@@ -534,3 +581,44 @@
+         artifact_page: false,
+     }
+ }
++
++#[cfg(test)]
++mod serialization_tests {
++    use super::*;
++    use crate::provider::http::cancellation;
++    #[tokio::test]
++    async fn search_serialization_has_no_padding_and_honors_cancellation_and_deadline() {
++        let gate = tokio::sync::Mutex::new(());
++        let (_source, mut cancel) = cancellation();
++        for _ in 0..2 {
++            let mut slot = Box::pin(search_slot(
++                &gate,
++                Instant::now() + Duration::from_secs(1),
++                &mut cancel,
++            ));
++            // An uncontended call must resolve on its first poll, without a timer.
++            std::future::poll_fn(|cx| {
++                assert!(slot.as_mut().poll(cx).is_ready());
++                std::task::Poll::Ready(())
++            })
++            .await;
++        }
++        let held = gate.lock().await;
++        assert!(matches!(
++            search_slot(
++                &gate,
++                Instant::now() + Duration::from_millis(10),
++                &mut cancel
++            )
++            .await,
++            Err(DomainError::TimedOut)
++        ));
++        let (source, mut cancel) = cancellation();
++        source.cancel();
++        assert!(matches!(
++            search_slot(&gate, Instant::now() + Duration::from_secs(1), &mut cancel).await,
++            Err(DomainError::Cancelled)
++        ));
++        drop(held);
++    }
++}
+--- before/product/crates/ag1-platform/tests/web_http_contract.rs
++++ after/product/crates/ag1-platform/tests/web_http_contract.rs
+@@ -27,6 +27,22 @@
+         assert!(count > 0);
+         bytes.extend_from_slice(&buffer[..count]);
+         assert!(bytes.len() < 32768);
++    }
++    let header_end = bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
++    let headers = String::from_utf8_lossy(&bytes[..header_end]);
++    let length = headers
++        .lines()
++        .find_map(|line| {
++            line.split_once(':')
++                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
++                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
++        })
++        .unwrap_or(0);
++    assert!(length <= 32768);
++    while bytes.len() < header_end + length {
++        let count = stream.read(&mut buffer).unwrap();
++        assert!(count > 0);
++        bytes.extend_from_slice(&buffer[..count]);
+     }
+     String::from_utf8(bytes).unwrap()
+ }
+@@ -1198,9 +1214,9 @@
+         let fixture = ToolFixture::new();
+         let (port, task) = server(if fallback { 2 } else { 1 }, move |index, request| {
+             assert!(request.starts_with(if index == 0 {
+-                "GET /html?"
++                "POST /html "
+             } else {
+-                "GET /lite?"
++                "POST /lite "
+             }));
+             if fallback && index == 0 {
+                 return ok(b"No results");
+@@ -1402,7 +1418,7 @@
+                 .contains("accept: text/html,application/xhtml+xml")
+         );
+         if index < 2 {
+-            assert!(input.starts_with("GET /html?"));
++            assert!(input.starts_with("POST /html "));
+             ok(b"<a class=\"result__a\" href=\"https://react.dev/reference/item\">React API</a><a class=\"result__snippet\">The parameter returns a useful value.</a><a class=\"result__a\" href=\"https://react.dev/learn/other\">Other API</a><a class=\"result__snippet\">Another useful source.</a>")
+         } else {
+             ok(b"No fixture results")
+@@ -1490,8 +1506,8 @@
+     }
+     let requests = task.join().unwrap();
+     assert_eq!(requests.len(), 6);
+-    assert!(requests[3].starts_with("GET /lite?"));
+-    assert!(requests[5].starts_with("GET /lite?"));
++    assert!(requests[3].starts_with("POST /lite "));
++    assert!(requests[5].starts_with("POST /lite "));
+ }
+ 
+ #[tokio::test]
+@@ -1888,13 +1904,13 @@
+     );
+     let fixture = ToolFixture::new();
+     let (port, task) = server(2, |i, request| {
+-        assert!(request.contains("q=site%3Aexample.org%20Retry"));
++        assert!(request.contains("q=site%3Aexample.org+Retry"));
+         assert!(!request.contains("official"));
+         if i == 0 {
+-            assert!(request.starts_with("GET /html?"));
++            assert!(request.starts_with("POST /html "));
+             return ok(b"<html><body>Unexpected service page</body></html>");
+         }
+-        assert!(request.starts_with("GET /lite?"));
++        assert!(request.starts_with("POST /lite "));
+         ok(br#"<table><tr><td><a href="https://example.org/retry" class="result-link">Retry documentation</a></td></tr><tr><td class="result-snippet">Retry parameters and allowed methods.</td></tr></table>"#)
+     });
+     let origin = format!("http://127.0.0.1:{port}");
+@@ -1981,6 +1997,7 @@
+     );
+     let search = SearchService::new(web, SearchConfig::default(), "live-search").unwrap();
+     let mut results = vec![];
++    let mut responses = vec![];
+     for (index, query) in [
+         "site:urllib3.readthedocs.io Retry allowed_methods",
+         "Rust ownership borrowing documentation",
+@@ -2017,6 +2034,15 @@
+             .await
+             .unwrap()
+             .result;
++        use ag1_core::{context::ContextArtifactPort, tools::executor::ExecutionArtifacts};
++        for id in result["details"]["networkEvidence"]["artifactIds"]
++            .as_array()
++            .into_iter()
++            .flatten()
++            .filter_map(serde_json::Value::as_str)
++        {
++            responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
++        }
+         let blocked = result["details"]["status"] == "blocked";
+         results.push(result);
+         if blocked {
+@@ -2027,6 +2053,10 @@
+     println!(
+         "LIVE_SEARCH_RESULTS={}",
+         serde_json::to_string(&results).unwrap()
++    );
++    println!(
++        "LIVE_SEARCH_RESPONSES={}",
++        serde_json::to_string(&responses).unwrap()
+     );
+     assert!(!results.is_empty());
+     for r in results {
+@@ -2036,3 +2066,73 @@
+         }
+     }
+ }
++
++#[tokio::test]
++async fn duckduckgo_form_submission_encodes_terms_and_obeys_redirect_methods() {
++    let _case = WEB_CASE.lock().await;
++    for status in [303, 307] {
++        let (port, task) = server(2, move |i, req| {
++            if i == 0 {
++                assert!(req.starts_with("POST /html/ HTTP/1.1"));
++                assert!(
++                    req.to_lowercase()
++                        .contains("content-type: application/x-www-form-urlencoded")
++                );
++                assert!(req.contains("referer: http://127.0.0.1:"));
++                assert!(req.ends_with("q=site%3Aexample.org+%22a%2Bb%22+%26+c&b="));
++                return format!("HTTP/1.1 {status} Redirect\r\nLocation: /results\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
++            }
++            if status == 303 {
++                assert!(req.starts_with("GET /results HTTP/1.1"));
++                assert!(!req.contains("q="));
++            } else {
++                assert!(req.starts_with("POST /results HTTP/1.1"));
++                assert!(req.ends_with("q=site%3Aexample.org+%22a%2Bb%22+%26+c&b="));
++            }
++            ok(b"results")
++        });
++        let origin = format!("http://127.0.0.1:{port}");
++        let http = WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap());
++        let logical = format!("{origin}/html/?q=site%3Aexample.org%20%22a%2Bb%22%20%26%20c");
++        let (_source, mut cancel) = cancellation();
++        let r = http
++            .fetch_for(
++                &logical,
++                None,
++                WebPurpose::SearchHtml,
++                Instant::now() + Duration::from_secs(3),
++                &mut cancel,
++            )
++            .await
++            .unwrap();
++        assert_eq!(r.requested_url, logical);
++        assert_eq!(r.final_url, format!("{origin}/results"));
++        assert_eq!(task.join().unwrap().len(), 2);
++    }
++}
++
++#[tokio::test]
++async fn duckduckgo_form_body_is_never_forwarded_to_a_different_origin() {
++    let _case = WEB_CASE.lock().await;
++    let (port, task) = server(1, |_, _| {
++        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
++    });
++    let origin = format!("http://127.0.0.1:{port}");
++    let http = WebHttp::new(
++        WebPolicy::with_private_origins(&[origin.clone(), "http://127.0.0.1:9".into()]).unwrap(),
++    );
++    let (_source, mut cancel) = cancellation();
++    assert_eq!(
++        http.fetch_for(
++            &format!("{origin}/html/?q=private-query"),
++            None,
++            WebPurpose::SearchHtml,
++            Instant::now() + Duration::from_secs(3),
++            &mut cancel
++        )
++        .await
++        .err(),
++        Some(DomainError::PermissionDenied)
++    );
++    assert_eq!(task.join().unwrap().len(), 1);
++}
+--- before/product/crates/ag1-platform/tests/session_contract.rs
++++ after/product/crates/ag1-platform/tests/session_contract.rs
+@@ -2755,7 +2755,7 @@
+         .await
+         .unwrap();
+     let requests = web.join().unwrap();
+-    assert!(requests[0].starts_with("GET /html?"));
++    assert!(requests[0].starts_with("POST /html "));
+     assert!(requests[1].starts_with("GET /article "));
+     let model_requests = model.join().unwrap();
+     assert!(

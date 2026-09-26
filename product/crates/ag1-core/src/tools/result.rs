@@ -350,6 +350,7 @@ fn byte_tail(text: &str, limit: usize, after: usize) -> &str {
     &text[start..]
 }
 fn preview(text: &str, tool: &str, record: &ContextArtifact, next: &Value, cap: usize) -> String {
+    if tool=="github" {if let Some(summary)=github_preview(text,record,next,cap){return summary;}}
     let is_write = tool.eq_ignore_ascii_case("write");
     let head = byte_head(text, if is_write { 1000 } else { 6000 });
     let tail = byte_tail(text, if is_write { 500 } else { 2000 }, head.len());
@@ -363,6 +364,28 @@ fn preview(text: &str, tool: &str, record: &ContextArtifact, next: &Value, cap: 
         (text.len() - tail.len()) as u64,
     )
 }
+// Native JSON summaries retain useful list entries and quota/pagination metadata.
+// Full original bytes were already stored by externalize; recovery is local.
+fn github_preview(text:&str,record:&ContextArtifact,next:&Value,cap:usize)->Option<String>{
+    let value:Value=serde_json::from_str(text).ok()?;
+    let data=&value["data"];
+    let items=data.as_array().or_else(||["items","workflow_runs","workflows","artifacts","jobs"].iter().find_map(|key|data[*key].as_array()))?;
+    let mut summary=json!({"summary_only":true,"artifact_pointer":format!("artifact: {}",record.id),"retention":crate::context::compiler::EXACT,"returned_items":items.len(),"full_result":{"artifact_id":record.id,"bytes":record.bytes,"readCall":next,"local_only":true,"github_requests":0},
+        "guidance":"Read full_result.readCall with the artifact tool for omitted fields; this reads local stored bytes and consumes no GitHub quota. For another GitHub page, repeat the same operation and filters using next. Narrow q/filters/per_page to reduce network results."});
+    for key in ["status","outcome","next","rate_resource","rate_remaining","rate_limit","rate_reset"] {if let Some(v)=value.get(key){summary[key]=v.clone();}}
+    if let Some(v)=data.get("total_count"){summary["total_count"]=v.clone();}
+    let selected:Vec<_>=items.iter().take(20).map(|row|{
+        let mut item=json!({});
+        for key in ["id","number","full_name","name","title","path","type","state","status","conclusion","sha","html_url","tag_name"] {
+            if let Some(v)=row.get(key){item[key]=if let Some(s)=v.as_str(){json!(s.chars().take(160).collect::<String>())}else if v.is_number()||v.is_boolean()||v.is_null(){v.clone()}else{continue};}
+        }
+        item
+    }).collect();
+    summary["items"]=json!(selected);
+    while units(&summary.to_string())>cap && !summary["items"].as_array()?.is_empty(){summary["items"].as_array_mut()?.pop();}
+    let text=summary.to_string();(units(&text)<=cap).then_some(text)
+}
+
 fn preview_segments(
     tool: &str,
     record: &ContextArtifact,

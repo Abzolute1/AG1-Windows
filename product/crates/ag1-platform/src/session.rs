@@ -48,6 +48,8 @@ pub mod print;
 mod prompt;
 mod recovery;
 pub mod registry;
+#[cfg(target_os = "linux")]
+pub mod mcp;
 pub mod repetition;
 pub mod restart;
 pub mod runtime_commands;
@@ -90,6 +92,20 @@ pub trait ProviderResolver: Send + Sync {
 /// receipts. Implementations own policy/preflight and concurrency; they must
 /// drain accepted effects even if cancellation is requested.
 pub trait ToolRunner: Send + Sync {
+    #[cfg(target_os = "linux")]
+    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> { None }
+    /// Capture an immutable native MCP selection for this one request/batch.
+    #[cfg(target_os = "linux")]
+    fn mcp_request_runner(&self, _scope:&Scope) -> Result<Option<Arc<dyn ToolRunner>>,DomainError> { Ok(None) }
+    #[cfg(target_os = "linux")]
+    fn mcp_request_definitions(&self) -> Option<Vec<ag1_core::tools::mcp::SelectedDefinition>> { None }
+    /// Request-local MCP schemas are host-owned and rechecked after async work.
+    #[cfg(target_os = "linux")]
+    fn prepare_mcp_request(&self, _scope:&Scope, tools:&[Value]) -> Result<Vec<Value>,DomainError> { Ok(tools.to_vec()) }
+    #[cfg(target_os = "linux")]
+    fn validate_mcp_request(&self, _scope:&Scope, _tools:&[Value]) -> Result<(),DomainError> { Ok(()) }
+
+    fn folder_access(&self) -> Option<(Arc<crate::folder_access::FolderAccess>, u64)> { None }
     fn client_activity(&self) -> Result<Value, DomainError> {
         Ok(serde_json::json!({}))
     }
@@ -242,6 +258,7 @@ pub struct NativeSession {
     state: Arc<Mutex<SessionRuntime>>,
     last_context: Mutex<Value>,
     working_set: Mutex<Option<working_set::WorkingSet>>,
+    workspace_snapshot: Option<String>,
     store: Arc<Store>,
     origin: String,
     workspace: String,
@@ -254,6 +271,7 @@ pub struct NativeSession {
     changed: Arc<tokio::sync::Notify>,
     revision: Arc<AtomicU64>,
     transport: Mutex<Option<Ticket>>,
+    waiting_for_inference: AtomicBool,
     compacting: Mutex<Option<ActiveTurn>>,
     recovery: Mutex<ag1_core::runtime::recovery::Recovery>,
     tool_owner: Mutex<Option<std::sync::Weak<tool_journal::ToolJournal>>>,
@@ -273,6 +291,7 @@ pub struct NativeSession {
 }
 struct TurnLease<'a> {
     session: &'a NativeSession,
+    completed: bool,
 }
 struct CommitWait {
     state: Arc<Mutex<SessionRuntime>>,
@@ -297,7 +316,12 @@ impl Drop for TurnLease<'_> {
         if let Ok(mut active) = self.session.active.lock()
             && let Some(turn) = active.take()
         {
-            turn.cancelled.store(true, Ordering::Release);
+            // A command may own several successful turns (print recovery or
+            // planning). Draining this turn must not cancel that parent command.
+            // Failed or abandoned futures still cancel all work sharing its token.
+            if !self.completed {
+                turn.cancelled.store(true, Ordering::Release);
+            }
             turn.source.cancel();
         }
         self.session.changed.notify_waiters();
@@ -358,7 +382,12 @@ impl NativeSession {
                 1,
             )?
             .is_empty();
+        let workspace_snapshot = match &state.configuration().prompt {
+            Some(prompt) => prompt.workspace_snapshot().map(str::to_owned),
+            None => prompt::workspace_snapshot(&workspace)?,
+        };
         Ok(Self {
+            workspace_snapshot,
             last_context: Mutex::new(Value::Null),
             working_set: Mutex::new(None),
             state: Arc::new(Mutex::new(state)),
@@ -374,6 +403,7 @@ impl NativeSession {
             changed: Arc::new(tokio::sync::Notify::new()),
             revision,
             transport: Mutex::new(None),
+            waiting_for_inference: AtomicBool::new(false),
             compacting: Mutex::new(None),
             recovery: Mutex::new(Default::default()),
             tool_owner: Mutex::new(None),
@@ -730,12 +760,22 @@ impl NativeSession {
             .append_task_state(command, id, timestamp, task)?;
         self.commit(action, listener).await
     }
+    pub fn waiting_for_inference(&self) -> bool {
+        self.waiting_for_inference.load(Ordering::Acquire)
+    }
     async fn permit(
         &self,
         endpoint: &str,
         operation: &str,
         cancelled: &AtomicBool,
     ) -> Result<(Ticket, GenerationPermit), DomainError> {
+        struct Waiting<'a>(&'a AtomicBool);
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _waiting = Waiting(&self.waiting_for_inference);
         let mut queue = QueuedTicket {
             scheduler: self.scheduler.clone(),
             ticket: self
@@ -751,6 +791,7 @@ impl NativeSession {
                 queue.started = true;
                 return Ok((queue.ticket.clone(), permit));
             }
+            self.waiting_for_inference.store(true, Ordering::Release);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
@@ -906,7 +947,7 @@ impl NativeSession {
                 source: Arc::new(source),
             });
         }
-        let _lease = TurnLease { session: self };
+        let mut lease = TurnLease { session: self, completed: false };
         let serial = NEXT_TURN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| DomainError::Conflict)?;
@@ -929,11 +970,13 @@ impl NativeSession {
                 .await?
                 && callbacks::transform_input(&mut input.message, &result)?
             {
-                return Ok(TurnResult {
+                let result = TurnResult {
                     generations: 0,
                     journal_revision: self.journal_revision()?,
                     assistant: Value::Null,
-                });
+                };
+                lease.completed = true;
+                return Ok(result);
             }
         }
         let mut start = if !continuation && !self.delegated {
@@ -1064,6 +1107,7 @@ impl NativeSession {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
+            Self::emit(listener, SessionEvent::Recovery(json!({"type":"request_phase","phase":"preparing"})));
             let prepared = self.state()?.prepare_request();
             let mut preparation = match prepared {
                 Ok(action) => preparation::RequestPreparation::new(action,self.state.clone(),self.changed.clone()),
@@ -1073,6 +1117,18 @@ impl NativeSession {
                 }
                 Err(error) => return Err(error),
             };
+            #[cfg(target_os = "linux")]
+            let mcp_scope=Scope {workspace:self.workspace.clone(),session:preparation.stamp().session().as_str().into(),epoch:preparation.stamp().epoch(),revision:preparation.journal_revision()};
+            #[cfg(target_os = "linux")]
+            let request_tools=tools.mcp_request_runner(&mcp_scope)?.unwrap_or_else(||tools.clone());
+            #[cfg(not(target_os = "linux"))]
+            let request_tools=tools.clone();
+            #[cfg(target_os = "linux")]
+            {
+                let view=request_tools.prepare_mcp_request(&mcp_scope,&preparation.configuration().tools)?;
+                if let Some(definitions)=request_tools.mcp_request_definitions() { preparation.set_mcp_tools(&definitions,view)?; }
+                else if view!=preparation.configuration().tools { preparation.set_tools(view)?; }
+            }
             if let Some(planning) = mode.and_then(|lease| lease.planning.as_ref())
                 && let Err(error) = planning.prepare(&mut preparation)
             {
@@ -1083,7 +1139,7 @@ impl NativeSession {
                 let _=self.state()?.admit_request(preparation.into_action(),Err(error.clone()));
                 return Err(error);
             }
-            let prepared_context = self.prepare_context(&preparation,&operation,&input.timestamp, mode.and_then(|lease| lease.verification_command.as_deref()), mode.and_then(|lease| lease.controlled.as_ref()).cloned(),
+            let prepared_context = self.prepare_context(&preparation,&operation,&input.timestamp, mode.and_then(|lease| lease.verification_command.as_deref()), mode.and_then(|lease| lease.controlled.as_ref()).cloned(), mode.map(|lease| lease.completion.clone()),
                 tools.handles_session_event("context").then(|| (tools.clone(), cancelled.clone()))).await
                 .and_then(|context| {preparation.set_system_prompt(context.system_prompt.clone())?;Ok(context)});
             let context::PreparedContext {projection,witness,loaded_memory,working_set,..} = match prepared_context {
@@ -1180,6 +1236,13 @@ impl NativeSession {
                 }
             };
             let admission = {
+                #[cfg(target_os = "linux")]
+                if let Err(error)=request_tools.validate_mcp_request(&mcp_scope,&preparation.configuration().tools) {
+                    permit.terminal()?;
+                    let _=self.state()?.admit_request(preparation.into_action(),Err(error.clone()));
+                    if error==DomainError::Conflict && retry_replay.is_none() {continue;}
+                    return Err(error);
+                }
                 let current=self.context_current(witness).await;
                 if current.as_ref().is_err() || current == Ok(false) {
                     permit.terminal()?;
@@ -1218,6 +1281,7 @@ impl NativeSession {
                     return Err(error);
                 }
             };
+            Self::emit(listener, SessionEvent::Recovery(json!({"type":"request_phase","phase":"waiting"})));
             retry_replay = None;
             generations = generations.checked_add(1).ok_or(DomainError::Conflict)?;
             *self.transport.lock().map_err(|_| DomainError::Conflict)? = Some(ticket);
@@ -1318,7 +1382,7 @@ impl NativeSession {
                     && !cancelled.load(Ordering::Acquire)
                     && (!input.compaction.enabled || !ag1_core::runtime::retry::overflow(&message, generation.configuration().context_limit()))
                 {
-                    let names = state.configuration().tools.iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+                    let names = generation.configuration().tools.iter().filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect::<Vec<_>>();
                     match xml_fallback.prepare(&mut message, &names, &operation) {
                         Ok(prepared) => prepared,
                         Err(error) => {
@@ -1360,7 +1424,7 @@ impl NativeSession {
                     state.pending_tools().iter().cloned().collect::<Vec<_>>(),
                     ToolSelection {
                         journal: None,
-                        names: state.configuration().tools.iter()
+                        names: generation.configuration().tools.iter()
                             .filter_map(|tool| tool["name"].as_str().map(str::to_owned)).collect(),
                         research_profile: context::research_profile(&state)?,
                         loaded_memory,
@@ -1372,6 +1436,7 @@ impl NativeSession {
             }
             let has_calls = !calls.is_empty();
             if has_calls {
+                Self::emit(listener, SessionEvent::Recovery(json!({"type":"request_phase","phase":"executing"})));
                 repetition.start_turn()?;
                 let failed = error.is_some()
                     || matches!(snapshot.stop_reason, Some(StopReason::Error | StopReason::Aborted));
@@ -1383,12 +1448,12 @@ impl NativeSession {
                 *self.tool_owner.lock().map_err(|_| DomainError::Conflict)? = Some(Arc::downgrade(&journal));
                 if cancelled.load(Ordering::Acquire) { journal.cancel_batch(); }
                 let control_guard = tool_journal::ControlGuard(journal.clone());
-                let runner = tools.clone();
+                let runner = request_tools.clone();
                 let current_revision = self.revision.clone();
                 let batch_operation = format!("{prefix}-tools-{generations}");
                 let expected = calls
                     .iter()
-                    .map(|call| (call.id.clone(), call.name.clone()))
+                    .map(|call| (call.id.clone(), call.name.clone(), ag1_core::tools::surface::route(&call.name, &call.block["arguments"], &[]).ok().flatten().map(|(name,_)| name)))
                     .collect::<Vec<_>>();
                 let execution = self
                     .pool
@@ -1419,9 +1484,10 @@ impl NativeSession {
                     }
                 };
                 if outcomes.len() != expected.len()
-                    || outcomes.iter().zip(&expected).any(|(terminal, (id, name))| {
+                    || outcomes.iter().zip(&expected).any(|(terminal, (id, name, canonical))| {
                         let outcome = &terminal.outcome;
-                        outcome.record.call_id != *id || outcome.record.tool != *name
+                        outcome.record.call_id != *id || (outcome.record.tool != *name
+                            && !(canonical.as_ref() == Some(&outcome.record.tool) && journal.published(outcome).unwrap_or(false)))
                     })
                 {
                     return Err(DomainError::Conflict);
@@ -1631,6 +1697,7 @@ impl NativeSession {
                 ),
             );
         }
+        lease.completed = outcome.is_ok();
         outcome
     }
 }

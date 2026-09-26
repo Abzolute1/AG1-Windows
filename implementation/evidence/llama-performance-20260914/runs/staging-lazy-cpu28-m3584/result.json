@@ -1,0 +1,3342 @@
+{
+  "name": "staging-lazy-cpu28-m3584",
+  "config": {
+    "name": "staging-lazy-cpu28-m3584",
+    "flags": {
+      "--batch-size": 1024,
+      "--ubatch-size": 1024,
+      "--threads": 6,
+      "--cpu-range": "6-11",
+      "--log-verbosity": 4,
+      "--n-cpu-moe": 28,
+      "--moe-cache": "3584",
+      "--load-mode": "mmap"
+    },
+    "environment": {
+      "GGML_CUDA_MOE_CACHE_BUDGET_MB": "3584",
+      "GGML_CUDA_MOE_CACHE_RESERVE_MB": "512",
+      "GGML_CUDA_MOE_CACHE_STATS": "10000",
+      "GGML_CUDA_MOE_CACHE_HOT_USES": "1073741824",
+      "GGML_CUDA_MOE_STAGING": "1",
+      "GGML_CUDA_MOE_STAGING_CHUNK_MB": "8",
+      "GGML_CUDA_MOE_STAGING_SLOTS": "2",
+      "GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB": "512",
+      "LLAMA_MMAP_KEEP_CPU_MOE_HOST": "0",
+      "LLAMA_MMAP_NO_PREFETCH": "1",
+      "LLAMA_MMAP_RELEASE_COPIED": "1"
+    },
+    "workloads": [
+      "short",
+      "medium",
+      "ag1_code",
+      "quality"
+    ],
+    "repetitions": 2,
+    "api_smoke": true,
+    "n_predict": 512,
+    "binary": "/home/alex/Projects/llama-perf-20260914/staging-lazy/runtime/llama-server"
+  },
+  "requests": [
+    {
+      "workload": "short",
+      "repeat": 0,
+      "ttft_seconds": 1.2880607989936834,
+      "wall_seconds": 7.0988141060006456,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 957,
+        "prompt_ms": 1287.079,
+        "prompt_per_token_ms": 1.3449101358411704,
+        "prompt_per_second": 743.5441025764542,
+        "predicted_n": 512,
+        "predicted_ms": 5810.667,
+        "predicted_per_token_ms": 11.348958984375,
+        "predicted_per_second": 88.1138086212822
+      },
+      "output": "The provided `fetch_with_retry` implementation is fundamentally flawed for production use, particularly given the operational context of services requiring strict deadline adherence, idempotency, and connection efficiency. Below is a detailed review of the critical failures and the necessary corrections.\n\n**Deadline Handling**\nThe original code ignores the `deadline` parameter entirely. It uses a fixed `timeout=30` for every request, which is arbitrary and likely exceeds the service-specific `timeout_ms` values (ranging from 300ms to 650ms in the context). Furthermore, it does not track elapsed time. In a high-concurrency environment, retries must respect the global deadline. If the remaining time is insufficient for a new request plus backoff, the retry should be aborted to prevent cascading timeouts. The corrected implementation must calculate `remaining_time = deadline - time.time()` before each attempt and ensure the request timeout is set to this remaining value, capped at a reasonable maximum.\n\n**Idempotency**\nThe code uses `session.post`, which is a non-idempotent method. The operational context specifies that services accept \"idempotent reads and tagged writes.\" Using `POST` for retries is dangerous because if the first request succeeded but the response was lost, a retry will cause duplicate side effects. The implementation should ideally use `GET` for reads or ensure that `POST` requests are strictly idempotent via unique request IDs or tags. For the purpose of this review, assuming the operation is a read (as implied by `response.json()` return), switching to `GET` is safer. If it must be a write, a unique `X-Request-ID` header must be included to allow the server to deduplicate.\n\n**Backoff and Jitter**\nThe original code uses a rigid exponential backoff (`2 ** attempt`) without jitter. This causes \"thundering herd\" problems where multiple clients retry simultaneously, overwhelming the server. The context explicitly requires applying jitter. A corrected approach involves adding random noise to the backoff duration (e.g., `base * 2^attempt * (0.5 + random.random())`). Additionally, the code must honor the `Retry-After` header if present in the response, which takes precedence over calculated backoff.\n\n**Error Propagation**\nThe function returns `None` after five failed attempts. This is poor error propagation. It hides the root cause of the failure (e.g., network error, HTTP 500, timeout). The",
+      "prompt_tokens": 957,
+      "prompt_sha256": "fc774dcd33029d5528b2589dd46cee01f1bfceb8cf923e53a041a787e4f3a785",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 49.5,
+          "max": 51.0
+        },
+        "gpu_memory_pct": {
+          "median": 6.5,
+          "max": 7.0
+        },
+        "vram_mib": {
+          "median": 15273.0,
+          "max": 15273.0
+        },
+        "rss_mib": {
+          "median": 8828.890625,
+          "max": 11434.234375
+        },
+        "cpu_pct": {
+          "median": 93.86573868676996,
+          "max": 99.94377323979693
+        },
+        "gpu_temp": {
+          "median": 55.0,
+          "max": 56.0
+        },
+        "gpu_watts": {
+          "median": 75.43,
+          "max": 82.74
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 10870898.0,
+          "max": 12354541
+        },
+        "pcie_tx_kibs": {
+          "median": 1313817.5,
+          "max": 1448876
+        },
+        "rss_hwm_mib": {
+          "median": 8831.845703125,
+          "max": 11437.0390625
+        },
+        "sys_available_mib": {
+          "median": 57760.66796875,
+          "max": 57764.78125
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.16796875,
+          "max": 1178.16796875
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 2232.835
+        },
+        "cpu_temp_tctl": {
+          "median": 51.25,
+          "max": 51.375
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 66.5,
+          "max": 72.0
+        },
+        "gpu_memory_pct": {
+          "median": 46.5,
+          "max": 52.0
+        },
+        "vram_mib": {
+          "median": 15287.0,
+          "max": 15287.0
+        },
+        "rss_mib": {
+          "median": 13134.607421875,
+          "max": 13234.1328125
+        },
+        "cpu_pct": {
+          "median": 604.3292603633912,
+          "max": 627.6081795874243
+        },
+        "gpu_temp": {
+          "median": 59.0,
+          "max": 61.0
+        },
+        "gpu_watts": {
+          "median": 153.425,
+          "max": 160.57
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1023974.0,
+          "max": 4788281
+        },
+        "pcie_tx_kibs": {
+          "median": 395116.5,
+          "max": 1047509
+        },
+        "rss_hwm_mib": {
+          "median": 13137.970703125,
+          "max": 13238.1484375
+        },
+        "sys_available_mib": {
+          "median": 57637.1875,
+          "max": 57651.0859375
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2828.75425,
+          "max": 3517.6655
+        },
+        "cpu_temp_tctl": {
+          "median": 65.6875,
+          "max": 68.625
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 13561584,
+        "Pss": 13514996,
+        "Pss_Dirty": 874616,
+        "Pss_Anon": 585408,
+        "Pss_File": 12702220,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 12604476,
+        "Private_Dirty": 874616,
+        "Referenced": 13561584,
+        "Anonymous": 585408,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 327680,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 874,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 0,
+          "last_cpu": 6,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 0,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 590,
+          "last_cpu": 5,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 590,
+          "last_cpu": 16,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 590,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 590,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 590,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 79,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "short",
+      "repeat": 1,
+      "ttft_seconds": 0.9468511770028272,
+      "wall_seconds": 6.519977759002359,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 957,
+        "prompt_ms": 945.917,
+        "prompt_per_token_ms": 0.9884190177638453,
+        "prompt_per_second": 1011.7166728159024,
+        "predicted_n": 512,
+        "predicted_ms": 5572.973,
+        "predicted_per_token_ms": 10.884712890625,
+        "predicted_per_second": 91.87196851662479
+      },
+      "output": "The provided `fetch_with_retry` implementation is fundamentally flawed for production use, particularly given the operational context of services requiring strict deadline adherence, idempotency, and connection efficiency. Below is a detailed analysis of the deficiencies across the requested dimensions, followed by a corrected pseudocode implementation.\n\n**Deadline Handling**\nThe original code ignores the `deadline` parameter entirely. It uses a fixed `timeout=30` for the HTTP request, which is arbitrary and likely exceeds the service-specific `timeout_ms` values (ranging from 300ms to 650ms in the context). Furthermore, it does not track elapsed time. In a high-concurrency environment, retries must cease if the remaining time is insufficient to complete the request and process the response. The current logic risks hanging indefinitely or exhausting system resources by retrying long after the logical deadline has passed.\n\n**Idempotency**\nThe code uses `session.post`, which implies a write operation. The operational context states that services accept \"idempotent reads and tagged writes.\" Using `POST` for retries is dangerous if the operation is not strictly idempotent. If the first request succeeded but the response was lost, a retry could cause duplicate side effects. The implementation should ideally use `GET` for reads or ensure the `POST` payload includes a unique idempotency key. The current code does not manage or propagate such keys, violating the safety guarantees required by the services.\n\n**Backoff and Jitter**\nThe original code implements a naive exponential backoff (`2 ** attempt`) without jitter. This leads to the \"thundering herd\" problem, where multiple clients retry simultaneously, overwhelming the server. The context explicitly requires applying jitter. Additionally, it ignores the `Retry-After` header, which is a standard HTTP mechanism for servers to indicate when a client should retry. Ignoring this header can lead to unnecessary load and slower recovery times.\n\n**Error Propagation**\nThe function returns `None` after five failed attempts. This is poor error propagation because it hides the root cause of the failure. The caller cannot distinguish between a transient network error, a server overload (429), or a permanent configuration error. Proper error handling should raise an exception or return a structured error object containing the last known status and error details, allowing upstream services to make informed decisions.\n\n**Connection Reuse**\nThe code relies on a `session` object, which is good for connection reuse. However, the fixed timeout and lack",
+      "prompt_tokens": 957,
+      "prompt_sha256": "fc774dcd33029d5528b2589dd46cee01f1bfceb8cf923e53a041a787e4f3a785",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 45.0,
+          "max": 45.0
+        },
+        "gpu_memory_pct": {
+          "median": 6.0,
+          "max": 6.0
+        },
+        "vram_mib": {
+          "median": 15287.0,
+          "max": 15287.0
+        },
+        "rss_mib": {
+          "median": 13177.31640625,
+          "max": 13177.31640625
+        },
+        "cpu_pct": {
+          "median": 98.48557795585153,
+          "max": 98.48557795585153
+        },
+        "gpu_temp": {
+          "median": 56.0,
+          "max": 56.0
+        },
+        "gpu_watts": {
+          "median": 120.15,
+          "max": 120.15
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 15634472,
+          "max": 15634472
+        },
+        "pcie_tx_kibs": {
+          "median": 1681982,
+          "max": 1681982
+        },
+        "rss_hwm_mib": {
+          "median": 13239.8984375,
+          "max": 13239.8984375
+        },
+        "sys_available_mib": {
+          "median": 57718.25390625,
+          "max": 57718.25390625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 2232.835
+        },
+        "cpu_temp_tctl": {
+          "median": 68.5,
+          "max": 68.5
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 70.0,
+          "max": 73.0
+        },
+        "gpu_memory_pct": {
+          "median": 49.0,
+          "max": 53.0
+        },
+        "vram_mib": {
+          "median": 15319.0,
+          "max": 15319.0
+        },
+        "rss_mib": {
+          "median": 13270.7734375,
+          "max": 13297.52734375
+        },
+        "cpu_pct": {
+          "median": 606.5209123922571,
+          "max": 609.2863144368101
+        },
+        "gpu_temp": {
+          "median": 60.0,
+          "max": 61.0
+        },
+        "gpu_watts": {
+          "median": 154.43,
+          "max": 159.35
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1219799.0,
+          "max": 1896972
+        },
+        "pcie_tx_kibs": {
+          "median": 422021.0,
+          "max": 466748
+        },
+        "rss_hwm_mib": {
+          "median": 13273.896484375,
+          "max": 13300.84375
+        },
+        "sys_available_mib": {
+          "median": 57642.1328125,
+          "max": 57658.01953125
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2842.5967499999997,
+          "max": 3482.9525
+        },
+        "cpu_temp_tctl": {
+          "median": 69.25,
+          "max": 69.625
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 13625340,
+        "Pss": 13578752,
+        "Pss_Dirty": 891844,
+        "Pss_Anon": 600588,
+        "Pss_File": 12750796,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 12651004,
+        "Private_Dirty": 891844,
+        "Referenced": 13625340,
+        "Anonymous": 600588,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 339968,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 1523,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 0,
+          "last_cpu": 6,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 1149,
+          "last_cpu": 16,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 1148,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 1149,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 1149,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 1148,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 135,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "medium",
+      "repeat": 0,
+      "ttft_seconds": 8.16309313000238,
+      "wall_seconds": 14.60449509099999,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9154,
+        "prompt_ms": 8139.26,
+        "prompt_per_token_ms": 0.8891479134804458,
+        "prompt_per_second": 1124.6722675034339,
+        "predicted_n": 512,
+        "predicted_ms": 6440.987,
+        "predicted_per_token_ms": 12.580052734375,
+        "predicted_per_second": 79.4909227421201
+      },
+      "output": "The provided retry implementation is fundamentally flawed and violates the core constraints defined in the service inventory for all specified services (svc-003, svc-021, svc-047, svc-075, and svc-089). The inventory explicitly mandates that retries must occur \"only within the remaining deadline,\" require \"jitter,\" and \"honor Retry-After\" headers. The current code ignores all these requirements, leading to potential cascading failures, timeout violations, and non-idempotent write risks.\n\n### Comparison of Service Policies\n\nFirst, let us extract the specific parameters for the requested services from the inventory:\n\n*   **svc-003**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-021**: `timeout_ms=800`, `retry_budget=1`\n*   **svc-047**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-075**: `timeout_ms=750`, `retry_budget=3`\n*   **svc-089**: `timeout_ms=350`, `retry_budget=1`\n\nThe current implementation uses a hardcoded `timeout=30` (30,000 ms) for the HTTP session. This is catastrophic for services like **svc-089** (timeout 350ms) and **svc-003** (timeout 450ms). A 30-second timeout exceeds the allowed deadline by nearly two orders of magnitude. If the service is slow but not dead, the client will wait 30 seconds, violating the SLA and potentially causing the upstream caller to timeout, leading to duplicate requests. Furthermore, the `retry_budget` values (ranging from 1 to 3) suggest a probabilistic or budgeted retry strategy, likely tied to the remaining deadline or a global error budget, which the current code completely ignores by blindly retrying up to 5 times.\n\n### Concrete Correctness Fixes\n\n1.  **Dynamic Timeout Calculation**: The `timeout` parameter in the HTTP request must be calculated dynamically based on the `deadline` passed to the function. The timeout for each attempt should be `min(service_timeout_ms, remaining_deadline)`. If `remaining_deadline` is less than the service's configured `timeout_ms`, the client must respect the tighter constraint to ensure the overall request completes",
+      "prompt_tokens": 9154,
+      "prompt_sha256": "c6beb492673bfc61981c120101c5e23fd5706eb8b92e5005b5f412b889e0feb4",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 72.0,
+          "max": 82.0
+        },
+        "gpu_memory_pct": {
+          "median": 10.0,
+          "max": 29.0
+        },
+        "vram_mib": {
+          "median": 15321.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14006.71875,
+          "max": 14169.3046875
+        },
+        "cpu_pct": {
+          "median": 99.77851148145749,
+          "max": 389.8264530544309
+        },
+        "gpu_temp": {
+          "median": 59.0,
+          "max": 65.0
+        },
+        "gpu_watts": {
+          "median": 113.8,
+          "max": 146.9
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 14031201,
+          "max": 16833642
+        },
+        "pcie_tx_kibs": {
+          "median": 1577783,
+          "max": 1833105
+        },
+        "rss_hwm_mib": {
+          "median": 14010.14453125,
+          "max": 14172.5859375
+        },
+        "sys_available_mib": {
+          "median": 57552.2890625,
+          "max": 57566.2421875
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 2910.67
+        },
+        "cpu_temp_tctl": {
+          "median": 68.875,
+          "max": 69.5
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 64.0,
+          "max": 71.0
+        },
+        "gpu_memory_pct": {
+          "median": 42.0,
+          "max": 48.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14241.921875,
+          "max": 14243.484375
+        },
+        "cpu_pct": {
+          "median": 610.6073201157241,
+          "max": 616.6085303998877
+        },
+        "gpu_temp": {
+          "median": 61.0,
+          "max": 62.0
+        },
+        "gpu_watts": {
+          "median": 151.71,
+          "max": 158.03
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 967089,
+          "max": 2029541
+        },
+        "pcie_tx_kibs": {
+          "median": 420361,
+          "max": 482617
+        },
+        "rss_hwm_mib": {
+          "median": 14245.15625,
+          "max": 14246.84375
+        },
+        "sys_available_mib": {
+          "median": 57422.578125,
+          "max": 57488.18359375
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2838.6925,
+          "max": 3537.3475
+        },
+        "cpu_temp_tctl": {
+          "median": 69.125,
+          "max": 70.25
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 14589408,
+        "Pss": 14542820,
+        "Pss_Dirty": 1101864,
+        "Pss_Anon": 810608,
+        "Pss_File": 13504844,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13405052,
+        "Private_Dirty": 1101864,
+        "Referenced": 14589408,
+        "Anonymous": 810608,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 544768,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 2977,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 1793,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 1793,
+          "last_cpu": 17,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 1793,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 1793,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 1793,
+          "last_cpu": 0,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 224,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "medium",
+      "repeat": 1,
+      "ttft_seconds": 8.090102148002188,
+      "wall_seconds": 14.55129854700499,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9154,
+        "prompt_ms": 8087.215,
+        "prompt_per_token_ms": 0.8834624207996504,
+        "prompt_per_second": 1131.9100580360482,
+        "predicted_n": 512,
+        "predicted_ms": 6460.87,
+        "predicted_per_token_ms": 12.61888671875,
+        "predicted_per_second": 79.2462934558349
+      },
+      "output": "The provided retry implementation is fundamentally flawed and violates the core constraints defined in the service inventory for `svc-003`, `svc-021`, `svc-047`, `svc-075`, and `svc-089`. The inventory explicitly mandates that retries must occur \"only within the remaining deadline,\" require \"jitter,\" and \"honor Retry-After\" headers. The current code ignores all these requirements, leading to potential cascading failures, timeout violations, and poor resource utilization.\n\n### Comparison of Service Policies\n\nFirst, let us extract the specific parameters for the requested services from the inventory:\n\n*   **svc-003**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-021**: `timeout_ms=800`, `retry_budget=1`\n*   **svc-047**: `timeout_ms=450`, `retry_budget=3`\n*   **svc-075**: `timeout_ms=750`, `retry_budget=3`\n*   **svc-089**: `timeout_ms=350`, `retry_budget=1`\n\nThe current implementation uses a hardcoded `timeout=30` (30,000 ms) for the HTTP session. This is catastrophic for services like `svc-089` (350 ms timeout) and `svc-003` (450 ms timeout). The client will wait up to 30 seconds for a response, completely ignoring the service's configured deadline. This violates the \"remaining deadline\" constraint, as the retry logic does not track or respect the initial request's time budget.\n\nFurthermore, the implementation uses a fixed exponential backoff (`2 ** attempt`) without jitter. The inventory requires jitter to prevent thundering herd problems. Additionally, it ignores the `Retry-After` header, which is a critical requirement for handling rate-limiting (429 errors) gracefully. The `retry_budget` values (1, 3) indicate the maximum number of retries allowed or the budget for retry attempts, but the code blindly attempts 5 retries regardless of the budget or the remaining time.\n\n### Concrete Correctness Fixes\n\n1.  **Respect Service Timeout**: The HTTP request timeout must be dynamically calculated based on the remaining deadline. If the initial deadline is `D` and time `t` has elapsed, the new timeout should",
+      "prompt_tokens": 9154,
+      "prompt_sha256": "c6beb492673bfc61981c120101c5e23fd5706eb8b92e5005b5f412b889e0feb4",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 73.0,
+          "max": 75.0
+        },
+        "gpu_memory_pct": {
+          "median": 10.0,
+          "max": 11.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14119.3671875,
+          "max": 14182.15234375
+        },
+        "cpu_pct": {
+          "median": 99.74215727220471,
+          "max": 100.05542874113844
+        },
+        "gpu_temp": {
+          "median": 60.0,
+          "max": 67.0
+        },
+        "gpu_watts": {
+          "median": 114.75,
+          "max": 130.52
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 14551489.0,
+          "max": 17111035
+        },
+        "pcie_tx_kibs": {
+          "median": 1644433.0,
+          "max": 1972509
+        },
+        "rss_hwm_mib": {
+          "median": 14244.984375,
+          "max": 14244.984375
+        },
+        "sys_available_mib": {
+          "median": 57602.337890625,
+          "max": 57609.35546875
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 2912.2035
+        },
+        "cpu_temp_tctl": {
+          "median": 70.0,
+          "max": 70.125
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 65.0,
+          "max": 71.0
+        },
+        "gpu_memory_pct": {
+          "median": 43.0,
+          "max": 48.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14245.015625,
+          "max": 14248.6171875
+        },
+        "cpu_pct": {
+          "median": 610.3176151793334,
+          "max": 617.3093758893771
+        },
+        "gpu_temp": {
+          "median": 63.0,
+          "max": 63.0
+        },
+        "gpu_watts": {
+          "median": 154.45999999999998,
+          "max": 163.1
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1422118.5,
+          "max": 2191748
+        },
+        "pcie_tx_kibs": {
+          "median": 390917.5,
+          "max": 535839
+        },
+        "rss_hwm_mib": {
+          "median": 14248.35546875,
+          "max": 14252.04296875
+        },
+        "sys_available_mib": {
+          "median": 57485.650390625,
+          "max": 57496.6015625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 3156.6324999999997,
+          "max": 3611.296
+        },
+        "cpu_temp_tctl": {
+          "median": 70.0625,
+          "max": 70.625
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 14594092,
+        "Pss": 14547504,
+        "Pss_Dirty": 1102708,
+        "Pss_Anon": 811452,
+        "Pss_File": 13508684,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13408892,
+        "Private_Dirty": 1102708,
+        "Referenced": 14594092,
+        "Anonymous": 811452,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 544768,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 4426,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 0,
+          "last_cpu": 6,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 23,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 2,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 2439,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 2439,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 2440,
+          "last_cpu": 5,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 2439,
+          "last_cpu": 0,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 2439,
+          "last_cpu": 16,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 316,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "ag1_code",
+      "repeat": 0,
+      "ttft_seconds": 6.191690400002699,
+      "wall_seconds": 12.033139983999718,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 6274,
+        "prompt_ms": 6147.429,
+        "prompt_per_token_ms": 0.9798261077462544,
+        "prompt_per_second": 1020.5892577205852,
+        "predicted_n": 512,
+        "predicted_ms": 5841.017,
+        "predicted_per_token_ms": 11.408236328125,
+        "predicted_per_second": 87.65596813020747
+      },
+      "output": "### Review of AG1 Local-Model Loading Source Files\n\nThe provided source files (`lifecycle.rs`, `model_loading.rs`, and `ModelLoadControl.tsx`) implement a robust, state-machine-driven approach to loading local LLM models. The architecture separates the low-level process lifecycle management from the high-level command admission logic, ensuring that model loading is atomic, observable, and safe for concurrent access.\n\n#### Cancellation and Admission Behavior\n\n**Admission Control (`model_loading.rs`):**\nThe system employs a strict admission control mechanism via `self.store.admit_client_command`. This ensures idempotency and prevents race conditions. If a client retries a load request (e.g., due to network blip), the system detects the existing intent and returns the cached result rather than initiating a duplicate load. This is critical for resource conservation.\n\nFurthermore, the system respects a global \"generation slot.\" The `load_local_model` function checks `scheduler.status(&origin)?.quarantined` and waits for active generations to complete (`permit.terminal()`) before proceeding. This prevents the model from being unloaded or reloaded while it is actively serving inference requests, which would cause crashes or data corruption. The 900-second (15-minute) deadline for acquiring a slot prevents indefinite blocking if the scheduler is stuck.\n\n**Cancellation (`lifecycle.rs`):**\nCancellation is handled through the `RuntimeController`. If a load times out (`timeout_loading`), the controller explicitly calls `stop_owned_runtime`, which transitions the state to `Stopping` and invokes the host's `stop` method. Crucially, the `reap_exited_owned_runtime` method ensures that even if a process dies unexpectedly, the handle is not released until the supervisor confirms the exit. This prevents \"zombie\" handles from being reused for new processes, a common source of security and stability bugs.\n\n#### Readiness Checks and Progress Reporting\n\n**Readiness (`lifecycle.rs`):**\nReadiness is not a simple boolean but a verification of identity. The `ModelIdentity.matches` function performs a rigorous check:\n1.  **Path/Alias Matching:** It verifies that the loaded model's path or alias matches the requested `LaunchPlan`. It prioritizes the explicit path over aliases to avoid loading the wrong weights if an alias is reused.\n2.  **Context Window Validation:** It ensures the loaded model's context window is sufficient (`loaded >= plan.requested_context`) and not excessively larger than requested (`loaded - plan.requested_context",
+      "prompt_tokens": 6274,
+      "prompt_sha256": "b2b9b8e1e4214adba3c2bf69ecb12db43ce4b7cbabc884a17dd645a46bb4837b",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 73.0,
+          "max": 83.0
+        },
+        "gpu_memory_pct": {
+          "median": 10.0,
+          "max": 29.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14553.71484375,
+          "max": 14657.546875
+        },
+        "cpu_pct": {
+          "median": 99.70896697473688,
+          "max": 101.44305251671024
+        },
+        "gpu_temp": {
+          "median": 60.0,
+          "max": 62.0
+        },
+        "gpu_watts": {
+          "median": 114.89,
+          "max": 132.68
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 15226318,
+          "max": 17759570
+        },
+        "pcie_tx_kibs": {
+          "median": 1674853,
+          "max": 1801171
+        },
+        "rss_hwm_mib": {
+          "median": 14557.34375,
+          "max": 14661.22265625
+        },
+        "sys_available_mib": {
+          "median": 57320.21875,
+          "max": 57336.0078125
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 3465.8329999999996
+        },
+        "cpu_temp_tctl": {
+          "median": 70.125,
+          "max": 70.375
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 71.0,
+          "max": 73.0
+        },
+        "gpu_memory_pct": {
+          "median": 49.0,
+          "max": 51.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14724.89453125,
+          "max": 14726.48828125
+        },
+        "cpu_pct": {
+          "median": 606.5176407945628,
+          "max": 609.6635730012388
+        },
+        "gpu_temp": {
+          "median": 62.0,
+          "max": 62.0
+        },
+        "gpu_watts": {
+          "median": 163.325,
+          "max": 168.62
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1195507.5,
+          "max": 1591308
+        },
+        "pcie_tx_kibs": {
+          "median": 405956.5,
+          "max": 457519
+        },
+        "rss_hwm_mib": {
+          "median": 14728.5,
+          "max": 14730.125
+        },
+        "sys_available_mib": {
+          "median": 57211.8671875,
+          "max": 57221.94140625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 3167.30525,
+          "max": 3571.13
+        },
+        "cpu_temp_tctl": {
+          "median": 70.4375,
+          "max": 71.0
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 15083776,
+        "Pss": 15037188,
+        "Pss_Dirty": 1398856,
+        "Pss_Anon": 1107600,
+        "Pss_File": 13702220,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13602428,
+        "Private_Dirty": 1398856,
+        "Referenced": 15083776,
+        "Anonymous": 1107600,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 837632,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 5623,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 1,
+          "last_cpu": 8,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 23,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 2,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 1,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 3024,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 3024,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 3024,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 3024,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 3023,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 375,
+          "last_cpu": 8,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "ag1_code",
+      "repeat": 1,
+      "ttft_seconds": 6.131522345000121,
+      "wall_seconds": 11.919603956004721,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 6274,
+        "prompt_ms": 6129.198,
+        "prompt_per_token_ms": 0.9769203060248646,
+        "prompt_per_second": 1023.6249506052831,
+        "predicted_n": 512,
+        "predicted_ms": 5787.633,
+        "predicted_per_token_ms": 11.303970703125,
+        "predicted_per_second": 88.46448971453442
+      },
+      "output": "### Review of AG1 Local-Model Loading Source Files\n\nThe provided source files (`lifecycle.rs`, `model_loading.rs`, and `ModelLoadControl.tsx`) implement a robust, state-machine-driven approach to loading local LLM models. The architecture separates the low-level process lifecycle management from the high-level command admission logic, ensuring that model loading is atomic, observable, and safe for concurrent access.\n\n#### Cancellation and Admission Behavior\n\n**Admission Control (`model_loading.rs`):**\nThe system employs a strict admission control mechanism via `self.store.admit_client_command`. This ensures idempotency; if a client retries a load request, the system returns the previous result rather than initiating a duplicate load. This is critical for preventing race conditions where multiple threads might attempt to load the same model simultaneously. The admission key is derived from the session and command ID, ensuring uniqueness per operation.\n\n**Concurrency and Scheduling:**\nThe `load_local_model` function does not load the model immediately. Instead, it submits a ticket to a `scheduler`. This scheduler acts as a gatekeeper, ensuring that only one model is loaded or generating at a time. The code explicitly waits for any active generation to complete (`scheduler.start(&ticket)`) before proceeding with the load. This \"shared generation admission\" prevents resource contention and ensures that the model binary is not swapped out while inference is occurring.\n\n**Cancellation:**\nCancellation is handled at two levels.\n1.  **Scheduler Level:** If the scheduler is busy or quarantined, the load ticket is cancelled (`scheduler.cancel(&ticket)`), and the operation fails with `DomainError::Unavailable`.\n2.  **Runtime Level:** In `lifecycle.rs`, the `RuntimeController` manages the actual process. If a load times out (`timeout_loading`), it calls `stop_owned_runtime`, which verifies the process exit before resetting the state. The `reap_exited_owned_runtime` function ensures that even if a process dies unexpectedly, the handle is cleaned up before admitting new requests, preventing stale state issues.\n\n#### Readiness Checks and Progress Reporting\n\n**Readiness Verification (`lifecycle.rs`):**\nThe `RuntimeController` uses a `poll_ready` method that relies on the `RuntimeHost` trait. The host observes the running process (likely via HTTP health checks or IPC) to determine if the model is `Healthy`. The `ModelIdentity.matches` function performs a rigorous check: it verifies that the loaded model's path, alias, context window,",
+      "prompt_tokens": 6274,
+      "prompt_sha256": "b2b9b8e1e4214adba3c2bf69ecb12db43ce4b7cbabc884a17dd645a46bb4837b",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 75.0,
+          "max": 79.0
+        },
+        "gpu_memory_pct": {
+          "median": 10.0,
+          "max": 20.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14601.5234375,
+          "max": 14664.29296875
+        },
+        "cpu_pct": {
+          "median": 99.50117529311211,
+          "max": 102.07294006569967
+        },
+        "gpu_temp": {
+          "median": 58.0,
+          "max": 62.0
+        },
+        "gpu_watts": {
+          "median": 113.965,
+          "max": 120.94
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 14554589.0,
+          "max": 16883886
+        },
+        "pcie_tx_kibs": {
+          "median": 1653002.5,
+          "max": 1985156
+        },
+        "rss_hwm_mib": {
+          "median": 14726.86328125,
+          "max": 14726.86328125
+        },
+        "sys_available_mib": {
+          "median": 57336.453125,
+          "max": 57343.48828125
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 3582.835
+        },
+        "cpu_temp_tctl": {
+          "median": 70.3125,
+          "max": 70.625
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 71.0,
+          "max": 75.0
+        },
+        "gpu_memory_pct": {
+          "median": 49.0,
+          "max": 52.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14728.09375,
+          "max": 14730.734375
+        },
+        "cpu_pct": {
+          "median": 606.8134958971315,
+          "max": 611.1483460510476
+        },
+        "gpu_temp": {
+          "median": 60.0,
+          "max": 60.0
+        },
+        "gpu_watts": {
+          "median": 161.45,
+          "max": 165.34
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 962841,
+          "max": 1850878
+        },
+        "pcie_tx_kibs": {
+          "median": 426513,
+          "max": 477392
+        },
+        "rss_hwm_mib": {
+          "median": 14731.84765625,
+          "max": 14734.28515625
+        },
+        "sys_available_mib": {
+          "median": 57196.671875,
+          "max": 57206.3125
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2896.3244999999997,
+          "max": 3585.957
+        },
+        "cpu_temp_tctl": {
+          "median": 70.875,
+          "max": 71.0
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 15087908,
+        "Pss": 15041320,
+        "Pss_Dirty": 1399788,
+        "Pss_Anon": 1108532,
+        "Pss_File": 13705420,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13605628,
+        "Private_Dirty": 1399788,
+        "Referenced": 15087908,
+        "Anonymous": 1108532,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 837632,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 6810,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 1,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 2,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 1,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 2,
+          "last_cpu": 17,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 3603,
+          "last_cpu": 5,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 3603,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 3603,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 3603,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 3603,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 433,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "quality",
+      "repeat": 0,
+      "ttft_seconds": 7.957287037999777,
+      "wall_seconds": 12.099250051003764,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9051,
+        "prompt_ms": 7917.697,
+        "prompt_per_token_ms": 0.874786984863551,
+        "prompt_per_second": 1143.1354344577724,
+        "predicted_n": 331,
+        "predicted_ms": 4141.545,
+        "predicted_per_token_ms": 12.512220543806647,
+        "predicted_per_second": 79.92186490790273
+      },
+      "output": "{\n  \"svc-003\": {\n    \"replicas\": 5,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-3\",\n    \"deploy\": \"rev-9003\"\n  },\n  \"svc-021\": {\n    \"replicas\": 2,\n    \"timeout_ms\": 800,\n    \"retry_budget\": 1,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9021\"\n  },\n  \"svc-047\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9047\"\n  },\n  \"svc-075\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 750,\n    \"retry_budget\": 3,\n    \"owner\": \"team-10\",\n    \"deploy\": \"rev-9075\"\n  },\n  \"svc-089\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 350,\n    \"retry_budget\": 1,\n    \"owner\": \"team-11\",\n    \"deploy\": \"rev-9089\"\n  }\n}",
+      "prompt_tokens": 9051,
+      "prompt_sha256": "6bfdbbd6e8371f4377125be12ff788714218290ba1a813c641713f83d272a58a",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 73.0,
+          "max": 84.0
+        },
+        "gpu_memory_pct": {
+          "median": 10.0,
+          "max": 29.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14865.90625,
+          "max": 14930.8671875
+        },
+        "cpu_pct": {
+          "median": 99.61449427980176,
+          "max": 160.27705020819556
+        },
+        "gpu_temp": {
+          "median": 57.0,
+          "max": 63.0
+        },
+        "gpu_watts": {
+          "median": 113.88499999999999,
+          "max": 136.3
+        },
+        "sm_mhz": {
+          "median": 2880.0,
+          "max": 2880.0
+        },
+        "pcie_rx_kibs": {
+          "median": 14123290.5,
+          "max": 16036279
+        },
+        "pcie_tx_kibs": {
+          "median": 1623070.5,
+          "max": 1884326
+        },
+        "rss_hwm_mib": {
+          "median": 14990.51171875,
+          "max": 14990.51171875
+        },
+        "sys_available_mib": {
+          "median": 57051.833984375,
+          "max": 57059.75390625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 3551.7470000000003
+        },
+        "cpu_temp_tctl": {
+          "median": 70.75,
+          "max": 70.875
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 68.0,
+          "max": 75.0
+        },
+        "gpu_memory_pct": {
+          "median": 44.0,
+          "max": 48.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14995.359375,
+          "max": 14995.359375
+        },
+        "cpu_pct": {
+          "median": 611.3061344006433,
+          "max": 619.1070361298454
+        },
+        "gpu_temp": {
+          "median": 58.0,
+          "max": 59.0
+        },
+        "gpu_watts": {
+          "median": 147.07,
+          "max": 162.57
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1433056,
+          "max": 2894189
+        },
+        "pcie_tx_kibs": {
+          "median": 421044,
+          "max": 437158
+        },
+        "rss_hwm_mib": {
+          "median": 14998.890625,
+          "max": 14998.890625
+        },
+        "sys_available_mib": {
+          "median": 56936.14453125,
+          "max": 56946.98046875
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2880.1835,
+          "max": 3449.76
+        },
+        "cpu_temp_tctl": {
+          "median": 70.375,
+          "max": 71.125
+        }
+      },
+      "stop_type": "eos",
+      "quality_pass": true,
+      "memory_snapshot_kib": {
+        "Rss": 15360400,
+        "Pss": 15313812,
+        "Pss_Dirty": 1665816,
+        "Pss_Anon": 1374560,
+        "Pss_File": 13711884,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13612092,
+        "Private_Dirty": 1665816,
+        "Referenced": 15360400,
+        "Anonymous": 1374560,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 1099776,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 8014,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 1,
+          "last_cpu": 6,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 2,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 1,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 2,
+          "last_cpu": 17,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 1,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 4019,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 4018,
+          "last_cpu": 16,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 4019,
+          "last_cpu": 17,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 4018,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 4018,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 496,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        }
+      ]
+    },
+    {
+      "workload": "quality",
+      "repeat": 1,
+      "ttft_seconds": 7.945751973995357,
+      "wall_seconds": 11.929480111000885,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 9051,
+        "prompt_ms": 7942.584,
+        "prompt_per_token_ms": 0.8775366257872058,
+        "prompt_per_second": 1139.5535760150601,
+        "predicted_n": 331,
+        "predicted_ms": 3983.353,
+        "predicted_per_token_ms": 12.034299093655589,
+        "predicted_per_second": 83.09582404572228
+      },
+      "output": "{\n  \"svc-003\": {\n    \"replicas\": 5,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-3\",\n    \"deploy\": \"rev-9003\"\n  },\n  \"svc-021\": {\n    \"replicas\": 2,\n    \"timeout_ms\": 800,\n    \"retry_budget\": 1,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9021\"\n  },\n  \"svc-047\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 450,\n    \"retry_budget\": 3,\n    \"owner\": \"team-8\",\n    \"deploy\": \"rev-9047\"\n  },\n  \"svc-075\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 750,\n    \"retry_budget\": 3,\n    \"owner\": \"team-10\",\n    \"deploy\": \"rev-9075\"\n  },\n  \"svc-089\": {\n    \"replicas\": 7,\n    \"timeout_ms\": 350,\n    \"retry_budget\": 1,\n    \"owner\": \"team-11\",\n    \"deploy\": \"rev-9089\"\n  }\n}",
+      "prompt_tokens": 9051,
+      "prompt_sha256": "6bfdbbd6e8371f4377125be12ff788714218290ba1a813c641713f83d272a58a",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 72.0,
+          "max": 80.0
+        },
+        "gpu_memory_pct": {
+          "median": 9.0,
+          "max": 24.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14872.08984375,
+          "max": 14934.859375
+        },
+        "cpu_pct": {
+          "median": 99.61310656170858,
+          "max": 101.50147806549134
+        },
+        "gpu_temp": {
+          "median": 56.0,
+          "max": 63.0
+        },
+        "gpu_watts": {
+          "median": 112.665,
+          "max": 128.33
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 13780077.5,
+          "max": 16697363
+        },
+        "pcie_tx_kibs": {
+          "median": 1572802.5,
+          "max": 1924707
+        },
+        "rss_hwm_mib": {
+          "median": 14997.359375,
+          "max": 14997.359375
+        },
+        "sys_available_mib": {
+          "median": 57069.384765625,
+          "max": 57083.19140625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 3583.7515000000003
+        },
+        "cpu_temp_tctl": {
+          "median": 71.0,
+          "max": 71.25
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 66.0,
+          "max": 72.0
+        },
+        "gpu_memory_pct": {
+          "median": 44.0,
+          "max": 49.0
+        },
+        "vram_mib": {
+          "median": 15329.0,
+          "max": 15329.0
+        },
+        "rss_mib": {
+          "median": 14998.140625,
+          "max": 14998.328125
+        },
+        "cpu_pct": {
+          "median": 608.0489005692054,
+          "max": 610.847608132385
+        },
+        "gpu_temp": {
+          "median": 57.0,
+          "max": 58.0
+        },
+        "gpu_watts": {
+          "median": 156.68,
+          "max": 162.64
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 1315625,
+          "max": 1770751
+        },
+        "pcie_tx_kibs": {
+          "median": 426708,
+          "max": 472265
+        },
+        "rss_hwm_mib": {
+          "median": 15001.71875,
+          "max": 15001.7734375
+        },
+        "sys_available_mib": {
+          "median": 56942.44921875,
+          "max": 56961.75390625
+        },
+        "sys_swap_used_mib": {
+          "median": 1178.1640625,
+          "max": 1178.1640625
+        },
+        "cpu_active_range_mhz": {
+          "median": 2232.835,
+          "max": 3533.2524999999996
+        },
+        "cpu_temp_tctl": {
+          "median": 71.375,
+          "max": 71.75
+        }
+      },
+      "stop_type": "eos",
+      "quality_pass": true,
+      "memory_snapshot_kib": {
+        "Rss": 15361872,
+        "Pss": 15315284,
+        "Pss_Dirty": 1667288,
+        "Pss_Anon": 1376032,
+        "Pss_File": 13711884,
+        "Pss_Shmem": 227368,
+        "Shared_Clean": 82492,
+        "Shared_Dirty": 0,
+        "Private_Clean": 13612092,
+        "Private_Dirty": 1667288,
+        "Referenced": 15361872,
+        "Anonymous": 1376032,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 1099776,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      },
+      "thread_placement_snapshot": [
+        {
+          "tid": 1628781,
+          "cpu_ticks": 9201,
+          "last_cpu": 14,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628787,
+          "cpu_ticks": 0,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628788,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628789,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628793,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628794,
+          "cpu_ticks": 1,
+          "last_cpu": 6,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628795,
+          "cpu_ticks": 0,
+          "last_cpu": 23,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628796,
+          "cpu_ticks": 0,
+          "last_cpu": 1,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628797,
+          "cpu_ticks": 0,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628798,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628799,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628800,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628801,
+          "cpu_ticks": 0,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628802,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628803,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628804,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628805,
+          "cpu_ticks": 0,
+          "last_cpu": 2,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628806,
+          "cpu_ticks": 0,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628807,
+          "cpu_ticks": 1,
+          "last_cpu": 11,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628808,
+          "cpu_ticks": 2,
+          "last_cpu": 4,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628809,
+          "cpu_ticks": 2,
+          "last_cpu": 19,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628810,
+          "cpu_ticks": 2,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628811,
+          "cpu_ticks": 1,
+          "last_cpu": 3,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628812,
+          "cpu_ticks": 2,
+          "last_cpu": 17,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628813,
+          "cpu_ticks": 1,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628814,
+          "cpu_ticks": 1,
+          "last_cpu": 23,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628815,
+          "cpu_ticks": 0,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628816,
+          "cpu_ticks": 0,
+          "last_cpu": 10,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628817,
+          "cpu_ticks": 0,
+          "last_cpu": 7,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628818,
+          "cpu_ticks": 0,
+          "last_cpu": 20,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628819,
+          "cpu_ticks": 0,
+          "last_cpu": 9,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628835,
+          "cpu_ticks": 4420,
+          "last_cpu": 15,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628836,
+          "cpu_ticks": 4419,
+          "last_cpu": 16,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628837,
+          "cpu_ticks": 4419,
+          "last_cpu": 12,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628838,
+          "cpu_ticks": 4419,
+          "last_cpu": 5,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628839,
+          "cpu_ticks": 4418,
+          "last_cpu": 13,
+          "allowed": "0-23"
+        },
+        {
+          "tid": 1628846,
+          "cpu_ticks": 544,
+          "last_cpu": 18,
+          "allowed": "0-23"
+        }
+      ]
+    }
+  ],
+  "started_at": "2026-09-14T05:35:51Z",
+  "load_seconds": 1.833840268998756,
+  "api_smoke": {
+    "answer_pass": true,
+    "tool_call_pass": true,
+    "answer_response": {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "{\"answer\": 323}"
+          }
+        }
+      ],
+      "created": 1789364246,
+      "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "system_fingerprint": "b10530-bd1bf025f",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 9,
+        "prompt_tokens": 46,
+        "total_tokens": 55,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-ZEK117s4Tdn9mqExGQG9rGYvNwTcdO3k",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 46,
+        "prompt_ms": 299.249,
+        "prompt_per_token_ms": 6.505413043478262,
+        "prompt_per_second": 153.71814107983653,
+        "predicted_n": 9,
+        "predicted_ms": 120.994,
+        "predicted_per_token_ms": 13.443777777777777,
+        "predicted_per_second": 74.38385374481379
+      }
+    },
+    "tool_response": {
+      "choices": [
+        {
+          "finish_reason": "tool_calls",
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "type": "function",
+                "function": {
+                  "name": "lookup_service",
+                  "arguments": "{\"service\":\"svc-047\"}"
+                },
+                "id": "uhoX3LOxNgTTNXxy9oXik2qbRdPMuljM"
+              }
+            ]
+          }
+        }
+      ],
+      "created": 1789364247,
+      "model": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+      "system_fingerprint": "b10530-bd1bf025f",
+      "object": "chat.completion",
+      "usage": {
+        "completion_tokens": 31,
+        "prompt_tokens": 292,
+        "total_tokens": 323,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "id": "chatcmpl-DrissLAOvcX5ttEQRa0j4EX3cDQdKkex",
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 292,
+        "prompt_ms": 895.472,
+        "prompt_per_token_ms": 3.0666849315068494,
+        "prompt_per_second": 326.085014383476,
+        "predicted_n": 31,
+        "predicted_ms": 420.045,
+        "predicted_per_token_ms": 13.54983870967742,
+        "predicted_per_second": 73.80161649347093
+      }
+    }
+  },
+  "status": "passed",
+  "load_resources": {
+    "gpu_pct": {
+      "median": 14.5,
+      "max": 31.0
+    },
+    "gpu_memory_pct": {
+      "median": 5.5,
+      "max": 11.0
+    },
+    "vram_mib": {
+      "median": 8925.0,
+      "max": 15245.0
+    },
+    "rss_mib": {
+      "median": 536.1171875,
+      "max": 2494.92578125
+    },
+    "cpu_pct": {
+      "median": 99.93477400009124,
+      "max": 249.6096323784629
+    },
+    "gpu_temp": {
+      "median": 51.5,
+      "max": 53.0
+    },
+    "gpu_watts": {
+      "median": 34.735,
+      "max": 54.23
+    },
+    "sm_mhz": {
+      "median": 210.0,
+      "max": 2895.0
+    },
+    "pcie_rx_kibs": {
+      "median": 3885595.0,
+      "max": 12212060
+    },
+    "pcie_tx_kibs": {
+      "median": 463793.5,
+      "max": 1356738
+    },
+    "rss_hwm_mib": {
+      "median": 998.58203125,
+      "max": 2496.98828125
+    },
+    "sys_available_mib": {
+      "median": 58262.365234375,
+      "max": 58396.890625
+    },
+    "sys_swap_used_mib": {
+      "median": 1178.16796875,
+      "max": 1178.16796875
+    },
+    "cpu_active_range_mhz": {
+      "median": 2232.835,
+      "max": 2232.835
+    },
+    "cpu_temp_tctl": {
+      "median": 50.5,
+      "max": 50.875
+    }
+  },
+  "peak_vram_mib": 15329.0,
+  "peak_rss_mib": 15431.0234375,
+  "exit_code": 0,
+  "peak_rss_hwm_mib": 15495.6953125
+}

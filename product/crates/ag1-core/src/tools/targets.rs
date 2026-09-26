@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     Check,
+    Preview,
     Screenshot,
     Interact,
 }
@@ -39,6 +40,7 @@ impl Binding {
     }
     pub fn available_tools(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
+        if self.capabilities.contains(&Capability::Preview) { names.insert("preview".into()); }
         if self.capabilities.contains(&Capability::Check) {
             names.insert("check".into());
         }
@@ -88,6 +90,7 @@ impl Request {
         if call.origin() != Origin::BuiltIn
             || ![
                 "check",
+                "preview",
                 "screenshot_url",
                 "interact_then_screenshot",
                 "verify_ui",
@@ -100,7 +103,10 @@ impl Request {
         if args.to_string().len() > 1024 * 1024 {
             return Err(DomainError::LimitExceeded("target request".into()));
         }
-        if call.name() == "check" {
+        if call.name() == "preview" {
+            if !["status", "start", "stop"].contains(&args["action"].as_str().unwrap_or("")) { return Err(invalid("preview action")); }
+            if args["action"] == "stop" { text(&args["operation"], 2048, false)?; }
+        } else if call.name() == "check" {
             if let Some(files) = args.get("files") {
                 let files = files.as_array().ok_or_else(|| invalid("check files"))?;
                 if files.len() > 4096 {

@@ -1,0 +1,32 @@
+{
+  "status": "source-backed-investigation",
+  "release_acceptance": false,
+  "product_changed": false,
+  "finding": "Native Runtime::open obtains the exclusive lease and verifies the configuration capture with a fresh MaterialVerifier. NativeRuntimeHost::new then constructs a separate empty verifier. Its first ensure/spawn verifies selected-plan materials again. The existing MaterialVerifier already reuses a matching hash within its instance after checking canonical path and device/inode/size/mtime/ctime signatures.",
+  "interpretation": "This identifies a duplicate verification boundary and a possible admission-cost optimization. It is not a measured causal speedup and does not justify dropping identity checks.",
+  "candidate_design": "Review carrying only the in-memory verified material cache from capture verification into the host under the same held runtime lease. Keep all capture/input/plan comparisons and every existing per-admission identity recheck. Do not introduce serialized proof, cross-process cache trust, copied-marker authority or shared competing ownership.",
+  "required_checks": [
+    "Tampered bytes, same-size replacements, changed timestamps, changed expected hashes and symlink retargets still reject or rehash",
+    "Capture/configuration/plan mismatch still rejects independently of material cache",
+    "Fresh process and reacquired lease start from fresh identity verification",
+    "Measure separately shell readiness, capture admission, selected-model verification and actual model load on an uncontended window"
+  ],
+  "artifacts": [
+    {
+      "path": "product/crates/ag1-platform/src/client/local_runtime.rs",
+      "sha256": "e89bbc3ac7261d7bfd574f1c07c86287f17b151a0c2e3651c4bbaf49c68ef076"
+    },
+    {
+      "path": "product/crates/ag1-platform/src/cutover/configuration.rs",
+      "sha256": "fcff552d35a5b38e96792448ddaa429db3db3ea2fd0e9e325acf5141f2c39309"
+    },
+    {
+      "path": "product/crates/ag1-platform/src/llama/native.rs",
+      "sha256": "cb3f9cf566b520be16c434fd02841a6b1386f048bf0fc8697188717dcde216c3"
+    },
+    {
+      "path": "product/crates/ag1-platform/src/llama/custody.rs",
+      "sha256": "8ed37f4c53d9dafb2df474489d6dfd2cb16e32662b18442093dc4f86280b8c7b"
+    }
+  ]
+}

@@ -41,7 +41,7 @@ enum Change {
         )>,
     ),
     Model(Value),
-    Thinking(String),
+    Thinking(String, Option<Value>),
     Context(u64),
     Tools(Vec<Value>),
     Task(Option<ag1_core::task::TaskState>),
@@ -56,6 +56,8 @@ struct Model {
 #[serde(deny_unknown_fields)]
 struct Thinking {
     level: String,
+    #[serde(default)]
+    native_profile: Option<Value>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -116,7 +118,7 @@ impl SessionCommands {
             w::Command::Model { action, args } if action == "thinking" => {
                 let thinking: Thinking = parse(args)?;
                 next.thinking = thinking.level.clone();
-                Change::Thinking(thinking.level)
+                Change::Thinking(thinking.level, thinking.native_profile)
             }
             w::Command::Runtime { action, args } if action == "tools" => {
                 let selected: Tools = parse(args)?;
@@ -264,8 +266,8 @@ impl SessionCommands {
                     Change::Context(tokens) => {
                         Some(state.select_context(&id, &id, &timestamp, tokens))
                     }
-                    Change::Thinking(level) => {
-                        Some(state.select_thinking(&id, &id, &timestamp, level))
+                    Change::Thinking(level, profile) => {
+                        Some(state.select_native_thinking(&id, &id, &timestamp, level, profile))
                     }
                     Change::Tools(tools) => Some(state.select_tools(&id, &id, &timestamp, tools)),
                     Change::Task(Some(task)) => {

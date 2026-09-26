@@ -55,6 +55,20 @@ async fn command(host: &Arc<Host>, id: &str, command: w::Command) {
 
 #[tokio::test]
 async fn task_state_guidance_tracks_actual_tool_availability_across_reopen() {
+    prompt_roundtrip("Transport fixture", false).await;
+}
+
+#[tokio::test]
+async fn native_default_prompt_rebuilds_after_tool_changes_and_reopen() {
+    prompt_roundtrip("", false).await;
+}
+
+#[tokio::test]
+async fn replacing_captured_default_rebuilds_an_existing_chat_without_losing_history() {
+    prompt_roundtrip("Previously captured workspace prompt.", true).await;
+}
+
+async fn prompt_roundtrip(base_prompt: &str, migrate: bool) {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("workspace");
     let state = root.path().join("state");
@@ -113,7 +127,7 @@ async fn task_state_guidance_tracks_actual_tool_availability_across_reopen() {
             socket.flush().unwrap();
         }
     });
-    let config:Config=serde_json::from_value(json!({"models":[{"id":"Qwen-fixture","provider":"llamacpp","api":"openai-completions","baseUrl":format!("http://{address}/v1"),"compat":{"thinkingFormat":"qwen-chat-template"},"contextWindow":8192,"maxTokens":1024,"reasoning":true,"input":["text"]}],"selected":"Qwen-fixture","credential_env":null,"system_prompt":"Transport fixture","fixture":true,"policy_mode":"disabled"})).unwrap();
+    let config:Config=serde_json::from_value(json!({"models":[{"id":"Qwen-fixture","provider":"llamacpp","api":"openai-completions","baseUrl":format!("http://{address}/v1"),"compat":{"thinkingFormat":"qwen-chat-template"},"contextWindow":8192,"maxTokens":1024,"reasoning":true,"input":["text"]}],"selected":"Qwen-fixture","credential_env":null,"system_prompt":base_prompt,"prompt_append":"Host conversation boundary.","fixture":true,"policy_mode":"disabled"})).unwrap();
     let observed = Arc::new(Mutex::new(vec![]));
     let copy = observed.clone();
     let observer: ag1_platform::provider::http::RequestObserver = Arc::new(move |_, bytes| {
@@ -122,6 +136,14 @@ async fn task_state_guidance_tracks_actual_tool_availability_across_reopen() {
             .push(serde_json::from_slice::<Value>(bytes).unwrap());
         Ok(())
     });
+    std::fs::create_dir(workspace.join(".ag1")).unwrap();
+    std::fs::write(
+        workspace.join(".ag1/APPEND_SYSTEM.md"),
+        "Keep the user's appended instructions.",
+    )
+    .unwrap();
+    std::fs::create_dir(workspace.join("src")).unwrap();
+    std::fs::write(workspace.join("before-open.txt"), "before").unwrap();
     let mut host = Host::open_with_request_observer(
         &workspace,
         &state,
@@ -131,19 +153,27 @@ async fn task_state_guidance_tracks_actual_tool_availability_across_reopen() {
     )
     .await
     .unwrap();
+    std::fs::write(workspace.join("after-open.txt"), "after").unwrap();
     for (index, enabled) in [false, false, true, false].iter().enumerate() {
         if index == 1 {
             host.shutdown().await.unwrap();
             drop(host);
+            let mut reopened_config = config.clone();
+            if migrate {
+                reopened_config.system_prompt.clear();
+            }
             host = Host::open_with_request_observer(
                 &workspace,
                 &state,
-                config.clone(),
+                reopened_config,
                 &registry,
                 observer.clone(),
             )
             .await
             .unwrap();
+        }
+        if index == 1 {
+            std::fs::write(workspace.join("after-reopen.txt"), "later").unwrap();
         }
         command(
             &host,
@@ -169,7 +199,33 @@ async fn task_state_guidance_tracks_actual_tool_availability_across_reopen() {
     server.join().unwrap();
     let wire = wire.lock().unwrap();
     assert_eq!(*wire, *observed.lock().unwrap());
-    for (request, enabled) in wire.iter().zip([false, false, true, false]) {
+    for (index, (request, enabled)) in wire.iter().zip([false, false, true, false]).enumerate() {
+        let system = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "system" || message["role"] == "developer")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(system.contains("Top-level workspace entries (snapshot at session start):"));
+        assert!(system.contains("src/\n"));
+        assert!(system.contains("Keep the user's appended instructions."), "{system}");
+        assert!(system.contains("Host conversation boundary."));
+        if base_prompt.is_empty() || migrate && index > 0 {
+            assert!(!system.contains("Previously captured workspace prompt."));
+            assert!(system.contains("Host-supplied model identity:"));
+            assert!(system.contains("Qwen-fixture"));
+            let available = system.lines().find_map(|line| line.strip_prefix("Available tools: ")).unwrap();
+            assert_eq!(available, if enabled { "taskState" } else { "" });
+            assert!(!system.contains("Cruzible") && !system.contains("2026-09-07"));
+        }
+
+        assert!(system.contains("before-open.txt"));
+        // A reopen captures the current directory; tool changes within that
+        // incarnation retain its original observation.
+        assert_eq!(system.contains("after-open.txt"), index > 0);
+        assert!(!system.contains("after-reopen.txt"));
         let advertised = request["tools"]
             .as_array()
             .into_iter()

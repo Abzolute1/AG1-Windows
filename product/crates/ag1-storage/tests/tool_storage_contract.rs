@@ -79,7 +79,7 @@ fn selected_large_original_and_artifact_page_keep_complete_evidence_without_recu
 
 fn check_ticket(registry: &Registry, scope: &Scope, operation: &str) -> AuthorizedCall {
     let call = registry
-        .prepare(operation, "check-call", "check", &json!({}), true)
+        .prepare(operation, "check-call", "check", &json!({"verificationScope":"owned-check"}), true)
         .unwrap();
     let policy: Policy =
         serde_json::from_value(json!({"mode":"disabled","cwd":"/fixture"})).unwrap();
@@ -158,13 +158,8 @@ fn native_check_releases_only_verification_leases_atomically_with_completion_and
             )
             .unwrap();
         store
-            .lease(
-                "session",
-                "origin",
-                &evidence.id,
-                "through verification",
-                60000,
-                true,
+            .scoped_lease_record(
+                "session", "origin", &evidence.id, "through verification", 60000, true, Some("owned-check"),
             )
             .unwrap();
         store
@@ -177,6 +172,7 @@ fn native_check_releases_only_verification_leases_atomically_with_completion_and
                 false,
             )
             .unwrap();
+        clock.0.store(11, Ordering::SeqCst);
         let failed = executor::execute(&store, &mut artifacts(&store, "failed"), check_ticket(&registry, &scope, "failed"), execution(&registry, &scope, &clock), &mut ForgedPass, |ticket| {
             ticket.consume(&registry, execution(&registry, &scope, &clock).fence)?;
             Ok(AdapterOutcome { result: json!({"content":[{"type":"text","text":"failed"}],"isError":true,"details":{"passed":false}}), effect: Effect::None, artifact_page: false })
@@ -234,13 +230,8 @@ fn native_check_releases_only_verification_leases_atomically_with_completion_and
         assert!(leases.iter().any(|lease| lease.artifact == retained.id));
         // A later lease must survive recovery of the previous completion.
         store
-            .lease(
-                "session",
-                "origin",
-                &evidence.id,
-                "new verification",
-                60000,
-                true,
+            .scoped_lease_record(
+                "session", "origin", &evidence.id, "new verification", 60000, true, Some("owned-check"),
             )
             .unwrap();
         let replay = executor::execute(
@@ -1098,3 +1089,5 @@ fn post_hook_result_cannot_reuse_a_native_producer_grant_or_forge_one_in_details
             .contains("native complete output")
     );
 }
+
+mod mcp_execution;

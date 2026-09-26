@@ -14,7 +14,7 @@ use std::{
 };
 fn rejected(error: DomainError) -> AdapterOutcome {
     AdapterOutcome {
-        result: serde_json::json!({"content":[{"type":"text","text":format!("Todo tool failed: {error:?}")}],"isError":true,"details":{"executionEffect":"none"}}),
+        result: serde_json::json!({"content":[{"type":"text","text":format!("Todo tool failed: {error:?}. Query todo with no arguments to recover current IDs and statuses. Retain existing identities; do not combine clear with todos or new-plan. Change only the intended statuses, or explicitly archive/start prospective work.")}],"isError":true,"details":{"executionEffect":"none"}}),
         effect: Effect::None,
         artifact_page: false,
     }

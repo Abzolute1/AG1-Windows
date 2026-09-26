@@ -21,6 +21,7 @@ pub(super) fn adapters(
     epoch: u64,
     clock: Arc<dyn Clock>,
     tooling: Option<&Tooling>,
+    folders: Option<&crate::folder_access::Snapshot>,
 ) -> Result<NativeAdapters> {
     let scope = ag1_core::tools::registry::Scope {
         workspace: workspace.id().as_str().into(),
@@ -70,11 +71,14 @@ pub(super) fn adapters(
         ))),
         ..Default::default()
     };
+    if let Some(folders) = folders {
+        result.folder_files = folders.roots.iter().map(|root| Arc::new(crate::file_tools::FileService::new(root.clone()).with_reviews(store.clone()))).collect();
+    }
     if let Some(t) = tooling {
         let spools = state.join("tools");
         fs::create_dir_all(&spools).map_err(crate::io_error)?;
         let supervisor = Arc::new(crate::process::ProcessSupervisor::new(&t.process_host)?);
-        let git = || crate::git::GitService::new(&t.process_host, &t.git, &spools);
+        let git = || crate::git::GitService::new(&t.process_host, &t.git, &spools).map(|g|g.with_bubblewrap(&t.bubblewrap));
         result.git = Some(Arc::new(crate::git_tools::GitTools::new(
             workspace.clone(),
             git()?,
@@ -106,13 +110,16 @@ pub(super) fn adapters(
             &t.fd,
             &spools,
         )?));
+        if let Some(folders) = folders {
+            result.folder_search = folders.roots.iter().map(|root| crate::search_tools::SearchService::new(root.clone(), supervisor.clone(), &t.rg, &t.fd, &spools).map(Arc::new)).collect::<Result<Vec<_>>>()?;
+        }
         let shell = Arc::new(crate::shell_tools::ShellService::new(
             workspace.clone(),
             supervisor,
             &spools,
             crate::shell_tools::ShellConfig {
                 executable: "/bin/bash".into(),
-                env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+                env: t.targets.environment(workspace.root())?,
                 command_prefix: None,
                 command_template: None,
                 sandbox: crate::shell_tools::Sandbox::Workspace,
@@ -120,7 +127,7 @@ pub(super) fn adapters(
                 output_bytes: 8 * 1024 * 1024,
                 address_space: None,
             },
-        )?);
+        )?.with_folders(folders.cloned())?);
         result.jobs = Some(Arc::new(crate::job_tools::JobService::new(
             store.clone(),
             shell.clone(),

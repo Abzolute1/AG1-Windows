@@ -1,0 +1,83 @@
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1335,6 +1335,7 @@
+     const int64_t eos      = hp.ple_eos_token_id;
+ 
+     std::vector<int32_t> idx(n_heads * n_tokens);
++    const bool retain_history = flash_ple_experiment("AG1_FLASH_PLE_HISTORY");
+ 
+     // missing predecessors come from the per-sequence history, but only when it is
+     // contiguous with the incoming position; otherwise the window is EOS-padded
+@@ -1353,12 +1354,13 @@
+             h.next_pos = ubatch->pos[i];
+             h.toks.clear();
+         }
+-        if ((int64_t) h.toks.size() > n_gram - 1) {
++        if (!retain_history && (int64_t) h.toks.size() > n_gram - 1) {
+             h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+         }
+ 
+         std::vector<llama_token> padded(n_gram - 1, (llama_token) eos);
+-        std::copy(h.toks.begin(), h.toks.end(), padded.end() - (int64_t) h.toks.size());
++        const size_t n_copy = std::min<size_t>(h.toks.size(), padded.size());
++        std::copy(h.toks.end() - n_copy, h.toks.end(), padded.end() - n_copy);
+         snap[seq] = std::move(padded);
+     }
+ 
+@@ -1409,8 +1411,11 @@
+         }
+ 
+         auto & h = mctx->get_ple_hist(seq);
++        if (retain_history && h.toks.size() >= (1u << 20)) {
++            throw std::runtime_error("experimental PLE retained history exceeded validated bound");
++        }
+         h.toks.push_back(tok_of(i));
+-        if ((int64_t) h.toks.size() > n_gram - 1) {
++        if (!retain_history && (int64_t) h.toks.size() > n_gram - 1) {
+             h.toks.erase(h.toks.begin(), h.toks.end() - (n_gram - 1));
+         }
+         h.next_pos = pos + 1;
+--- a/src/llama-memory-hybrid-idx.cpp
++++ b/src/llama-memory-hybrid-idx.cpp
+@@ -10,6 +10,12 @@
+ #include <cmath>
+ #include <iterator>
+ #include <stdexcept>
++#include <cstdlib>
++
++static bool flash_retain_ple_history() {
++    const char * value = std::getenv("AG1_FLASH_PLE_HISTORY");
++    return value && value[0] == '1' && value[1] == '\0';
++}
+ 
+ //
+ // llama_memory_hybrid_idx
+@@ -285,6 +291,19 @@
+         return;
+     }
+ 
++    if (flash_retain_ple_history()) {
++        const llama_pos beg = ple_hist_beg(h);
++        if (p0 <= beg && p1 > beg && p1 < h.next_pos) {
++            // Prefix eviction: keep the surviving contiguous suffix and its positions.
++            h.toks.erase(h.toks.begin(), h.toks.begin() + (p1 - beg));
++            return;
++        }
++        if (p0 < h.next_pos && p1 >= h.next_pos) {
++            ple_hist_truncate(h, std::max(p0, beg));
++            return;
++        }
++    }
++
+     // a hole in the middle: seq_rm does not renumber what follows, so an overlapping
+     // window is no longer a run of consecutive positions
+     if (p1 > ple_hist_beg(h) && p0 < h.next_pos) {
+@@ -445,7 +464,7 @@
+ 
+         // the window is never longer than ple_ngram_size - 1, so a larger count is a corrupt
+         // blob and would size an allocation from the file
+-        if (n_toks > LLAMA_MAX_PLE_NGRAM - 1) {
++        if (n_toks > (flash_retain_ple_history() ? (1u << 20) : LLAMA_MAX_PLE_NGRAM - 1)) {
+             throw std::runtime_error("qwen4exp PLE history: implausible token count in state blob");
+         }
+ 

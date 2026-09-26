@@ -1,0 +1,53 @@
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1805,7 +1805,16 @@
+         }
+     }
+ 
+-    // reset current_chunk
++    const char * flat_env = getenv("AG1_FLASH_FLAT_CPU_MISSES");
++    const bool flat_misses = flat_env && flat_env[0] == '1' && flat_env[1] == '\0' &&
++        !params->use_ref &&
++        (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_S) &&
++        ids->type == GGML_TYPE_I32 && ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
++        n_ids > 0 && n_ids <= MOE_CACHE_MAX_TOPK && ne01 > 0 && ne01 <= INT32_MAX &&
++        ne03 == 1 && ne12 == 1 && ne13 == 1 && ne2 == 1 && ne3 == 1;
++
++    // reset current_chunk (unused by the flat schedule)
++    if (!flat_misses)
+     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
+         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
+         *current_chunk_ctr = nth;
+@@ -1813,6 +1822,32 @@
+ 
+     ggml_barrier(params->threadpool);
+ 
++    if (flat_misses) {
++        // Counts and mappings were published by thread zero before the barrier.
++        // GPU hits are absent; fused up/gate row masks are already applied.
++        int experts[MOE_CACHE_MAX_TOPK];
++        int rows[MOE_CACHE_MAX_TOPK];
++        int count = 0;
++        for (int expert = 0; expert < n_as; ++expert) {
++            for (int row = 0; row < matrix_row_counts[expert]; ++row) {
++                GGML_ASSERT(count < MOE_CACHE_MAX_TOPK);
++                experts[count] = expert; rows[count] = row; ++count;
++            }
++        }
++        const int64_t tiles = (ne01 + 15) / 16;
++        const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
++        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++        for (int64_t task = ith; task < count * tiles; task += nth) {
++            const int index = (int) (task / tiles);
++            const int expert = experts[index];
++            const int64_t first = (task % tiles) * 16;
++            ggml_compute_forward_mul_mat_id_one_chunk(
++                dst, src0, src1, ids, expert, first, MIN(first + 16, ne01),
++                rows[index], rows[index] + 1,
++                (const char *) src0->data + expert * nb02,
++                matrix_rows, row_size, src1_cont, wdata);
++        }
++    } else
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+ 

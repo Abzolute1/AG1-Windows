@@ -67,13 +67,11 @@ pub fn validate_lifecycle(current: &[Value], next: &[Value]) -> Result<(), Domai
         let new = next
             .iter()
             .find(|e| e["id"] == old["id"])
-            .ok_or_else(|| invalid("active plan item disappeared"))?;
+            .ok_or_else(|| invalid(&format!("Active todo {} disappeared. Query todo with no arguments to recover current IDs; retain all items, or explicitly archive and start a new plan.", old["id"])))?;
         if new["title"] != old["title"]
             || old["status"] == "completed" && new["status"] != "completed"
         {
-            return Err(invalid(
-                "stable todo identity and completed status required",
-            ));
+            return Err(invalid(&format!("Todo {} must retain its title and completed status. Query todo with no arguments and update only the intended statuses; use an explicit new-plan for new work.", old["id"])));
         }
     }
     if next

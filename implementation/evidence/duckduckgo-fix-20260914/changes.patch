@@ -1,0 +1,1152 @@
+--- before/product/Cargo.lock
++++ after/product/Cargo.lock
+@@ -29,6 +29,7 @@
+ dependencies = [
+  "base64 0.22.1",
+  "chrono",
++ "dom_query",
+  "icu_collator",
+  "icu_normalizer",
+  "regex",
+--- before/product/crates/ag1-core/Cargo.toml
++++ after/product/crates/ag1-core/Cargo.toml
+@@ -12,6 +12,7 @@
+ sha2.workspace = true
+ regex = "=1.13.1"
+ url = "=2.5.8"
++dom_query = "=0.27.0"
+ yaml-rust2 = { version = "=0.11.0", default-features = false }
+ icu_collator = { version = "=2.3.1", default-features = false, features = ["compiled_data"] }
+ icu_normalizer = { version = "=2.3.0", default-features = false, features = ["compiled_data"] }
+--- before/product/crates/ag1-core/src/tools/websearch.rs
++++ after/product/crates/ag1-core/src/tools/websearch.rs
+@@ -216,6 +216,15 @@
+         avoided_domains: None,
+         freshness: "any".into(),
+     };
++    // Explicit search syntax belongs to the caller. Rewriting it can discard
++    // domain restrictions, quoted phrases, exclusions, or exact punctuation.
++    if has(
++        r#"(?i)(?:\b(?:site|filetype|intitle|inurl):|"[^"]+"|(?:^|\s)-\S+)"#,
++        original,
++    ) {
++        plan.strategy = "explicit search syntax preserved".into();
++        return Ok(plan);
++    }
+     if let Some(error) = error_query(original) {
+         plan.effective_query = append(&error, &["fix"]);
+         plan.strategy =
+@@ -907,93 +916,126 @@
+     trim(&replace(&compact(&value), r"\s+([.,;:!?])", "$1")).into()
+ }
+ fn usable(url: &str) -> bool {
+-    Url::parse(url).is_ok_and(|u| {
+-        matches!(u.scheme(), "http" | "https")
+-            && !host_is(u.host_str().unwrap_or_default(), "duckduckgo.com")
+-    })
+-}
+-fn decode_uri(value: &str) -> Option<String> {
+-    let bytes = value.as_bytes();
+-    let mut output = Vec::with_capacity(bytes.len());
+-    let mut i = 0;
+-    while i < bytes.len() {
+-        if bytes[i] == b'%' {
+-            if i + 2 >= bytes.len() {
+-                return None;
+-            }
+-            let hi = (bytes[i + 1] as char).to_digit(16)?;
+-            let lo = (bytes[i + 2] as char).to_digit(16)?;
+-            output.push((hi * 16 + lo) as u8);
+-            i += 3
+-        } else {
+-            output.push(bytes[i]);
+-            i += 1
+-        }
+-    }
+-    String::from_utf8(output).ok()
++    url.len() <= 8192
++        && Url::parse(url).is_ok_and(|u| {
++            matches!(u.scheme(), "http" | "https")
++                && u.username().is_empty()
++                && u.password().is_none()
++                && !host_is(u.host_str().unwrap_or_default(), "duckduckgo.com")
++        })
+ }
+ fn normalize_result_url(value: &str) -> String {
+-    let absolute = if value.starts_with("//") {
+-        format!("https:{value}")
+-    } else {
+-        value.into()
+-    };
+-    let Ok(url) = Url::parse(&absolute) else {
++    let Ok(base) = Url::parse("https://duckduckgo.com/") else {
+         return value.into();
+     };
+-    if url.host_str() != Some("duckduckgo.com") || !url.path().starts_with("/l/") {
+-        return absolute;
+-    }
+-    if let Some((_, uddg)) = url.query_pairs().find(|(k, _)| k == "uddg")
+-        && !uddg.is_empty()
+-    {
+-        return decode_uri(&uddg).unwrap_or_else(|| value.into());
+-    }
+-    absolute
+-}
++    let Ok(url) = base.join(value) else {
++        return value.into();
++    };
++    if host_is(url.host_str().unwrap_or_default(), "duckduckgo.com")
++        && url.path().starts_with("/l/")
++    {
++        // query_pairs already percent-decodes once. A second decode corrupts
++        // percent-escaped paths and literal percent signs in destination URLs.
++        if let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
++            return target.into_owned();
++        }
++    }
++    url.to_string()
++}
++
++/// Classify transport-success pages before interpreting an empty parse as no hits.
++/// CAPTCHA pages are evidence of blocked access, never prompts to solve/bypass it.
++pub fn duckduckgo_page_status(html: &str) -> &'static str {
++    let doc = dom_query::Document::from(html);
++    if !doc
++        .select("form#challenge-form, .anomaly-modal, form[action*='anomaly.js']")
++        .is_empty()
++    {
++        "blocked"
++    } else if !doc.select("a.result__a, a.result-link").is_empty() {
++        "results"
++    } else if !doc.select(".no-results, .no-results__message").is_empty()
++        || compact(&doc.select("body").text())
++            .to_lowercase()
++            .starts_with("no results")
++        || doc.select("body").text().contains("No more results.")
++        || doc
++            .select("title")
++            .text()
++            .to_lowercase()
++            .contains("no results")
++    {
++        "empty"
++    } else {
++        "parse_error"
++    }
++}
++
+ pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, DomainError> {
+     if html.len() > 1_000_000 || max > 256 {
+         return Err(DomainError::LimitExceeded("web search HTML".into()));
+     }
+-    let anchors = rx(
+-        r#"(?i)<a[^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>"#,
+-    );
+-    let matches: Vec<_> = anchors.captures_iter(html).collect();
++    if max == 0 {
++        return Ok(vec![]);
++    }
++    let doc = dom_query::Document::from(html);
++    doc.select("script, style, template").remove();
+     let mut rows = vec![];
+-    for (index, matched) in matches.iter().enumerate() {
+-        let url = normalize_result_url(&matched[1]);
+-        let title = decode_html(&matched[2]);
+-        if title.is_empty() || !usable(&url) {
++    let mut seen = BTreeSet::new();
++    for anchor in doc.select("a.result__a, a.result-link").iter() {
++        let Some(href) = anchor.attr("href") else {
+             continue;
+-        }
+-        let end = matched.get(0).unwrap().end();
+-        let next = matches
+-            .get(index + 1)
+-            .map(|m| m.get(0).unwrap().start())
+-            .unwrap_or(html.len());
+-        let segment = &html[end..next];
++        };
++        let url = normalize_result_url(&href);
++        let title = compact(&anchor.text());
++        if title.is_empty() || !usable(&url) || !seen.insert(canonical(&url)) {
++            continue;
++        }
+         let mut snippet = String::new();
+-        for pattern in [
+-            r#"(?i)<a[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</a>"#,
+-            r#"(?i)<div[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</div>"#,
+-            r#"(?i)<span[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</span>"#,
+-        ] {
+-            if let Some(c) = rx(pattern).captures(segment) {
+-                snippet = decode_html(&c[1]);
++        // HTML results have a common .result ancestor. Lite puts the snippet
++        // in the next table row. Bound sibling scans to this result only.
++        for parent in anchor.ancestors(Some(6)).iter() {
++            if parent.is(".result, .web-result") {
++                snippet = compact(&parent.select(".result__snippet").text());
+                 break;
+             }
++            if parent.is("tr") {
++                let mut next = parent.next_sibling();
++                for _ in 0..3 {
++                    if next.is_empty() || !next.select("a.result-link").is_empty() {
++                        break;
++                    }
++                    snippet = compact(&next.select(".result-snippet").text());
++                    if !snippet.is_empty() {
++                        break;
++                    }
++                    next = next.next_sibling();
++                }
++                break;
++            }
++        }
++        if snippet.is_empty() {
++            let mut next = anchor.next_sibling();
++            for _ in 0..4 {
++                if next.is_empty() || next.is("a.result__a, a.result-link") {
++                    break;
++                }
++                if next.is(".result__snippet, .result-snippet") {
++                    snippet = compact(&next.text());
++                    break;
++                }
++                next = next.next_sibling();
++            }
+         }
+         rows.push(ResultRow {
+-            title,
++            title: title.chars().take(4096).collect(),
+             url,
+-            snippet,
++            snippet: snippet.chars().take(4096).collect(),
+         });
+         if rows.len() >= max {
+             break;
+         }
+     }
+-    let mut rows = dedupe_raw(rows);
+-    rows.truncate(max);
+     Ok(rows)
+ }
+ pub fn parse_brave(data: &Value, max: usize) -> Result<(Vec<ResultRow>, usize), DomainError> {
+@@ -1081,6 +1123,9 @@
+     };
+     fallback.truncate(max);
+     let used_fallback = !fallback.is_empty();
++    let blocked = response.attempts.iter().any(|a| a.status == "blocked");
++    let failed = response.results.is_empty()
++        && (blocked || !response.attempts.iter().any(|a| a.status == "ok"));
+     let raw = if used_fallback {
+         &fallback
+     } else {
+@@ -1098,7 +1143,7 @@
+     if let Some(domains) = plan.avoided_domains {
+         details["avoidedDomains"] = json!(domains);
+     }
+-    let text = research::search_transcript(
++    let mut text = research::search_transcript(
+         &plan.effective_query,
+         &ranked
+             .iter()
+@@ -1118,6 +1163,44 @@
+             follow_up_queries: plan.follow_up_queries,
+         },
+     );
++    if failed || used_fallback {
++        let reason = if blocked {
++            "DuckDuckGo blocked or rate-limited automated access (it may require human verification). Search results are unavailable. Do not repeat or rephrase searches while it is blocked."
++        } else if failed {
++            "Search providers failed; this is not evidence that no matching pages exist."
++        } else {
++            "No matching search results were returned."
++        };
++        text = format!(
++            "{}{}",
++            reason,
++            if used_fallback {
++                format!(
++                    "\nKnown documentation suggestions (not search results; not fetched or verified):\n{}",
++                    ranked
++                        .iter()
++                        .map(|r| format!("- {}: {}", r.result.title, r.result.url))
++                        .collect::<Vec<_>>()
++                        .join("\n")
++                )
++            } else {
++                "\nUse webFetch for known URLs, or try another available search provider.".into()
++            }
++        );
++        details["resultCount"] = json!(response.results.len());
++        details["sourceUrls"] = json!([]);
++        details["preferredSourceUrls"] = json!([]);
++        details["suggestions"] = json!(ranked);
++        details["results"] = json!([]);
++        details["status"] = json!(if failed {
++            if blocked { "blocked" } else { "error" }
++        } else {
++            "empty"
++        });
++        if failed {
++            details["error"] = json!(reason);
++        }
++    }
+     let hints = ranked
+         .iter()
+         .map(|r| {
+@@ -1138,7 +1221,11 @@
+         })
+         .collect();
+     Ok(SearchProjection {
+-        result: json!({"details":details,"content":[{"type":"text","text":text}]}),
++        result: if failed {
++            json!({"isError":true,"details":details,"content":[{"type":"text","text":text}]})
++        } else {
++            json!({"details":details,"content":[{"type":"text","text":text}]})
++        },
+         hints,
+     })
+ }
+--- before/product/crates/ag1-core/src/tools/web_presentation.rs
++++ after/product/crates/ag1-core/src/tools/web_presentation.rs
+@@ -64,6 +64,26 @@
+     super::schema::bounded(args, 64 * 1024, 16)?;
+     super::schema::bounded(result, 128 * 1024, 32)?;
+     let details = &result["details"];
++    if matches!(tool, "webSearch" | "webFetch")
++        && (result["isError"] == true || details["error"].is_string())
++    {
++        let reason = details["error"]
++            .as_str()
++            .unwrap_or("The web request failed.");
++        return Ok(Presentation {
++            heading: tool.to_ascii_uppercase(),
++            input: super::shell::sanitize(
++                string(args, if tool == "webSearch" { "query" } else { "url" }).as_bytes(),
++            )?,
++            summary: if details["status"] == "blocked" {
++                "Search blocked".into()
++            } else {
++                "Web request failed".into()
++            },
++            body: super::shell::sanitize(reason.as_bytes())?,
++        });
++    }
++
+     let (input, summary, body) = match tool {
+         "webSearch" => {
+             let input = string(args, "query").to_owned();
+--- before/product/crates/ag1-platform/src/web_tools/search.rs
++++ after/product/crates/ag1-platform/src/web_tools/search.rs
+@@ -13,7 +13,7 @@
+     fn default() -> Self {
+         Self {
+             html: "https://html.duckduckgo.com/html/".into(),
+-            lite: "https://duckduckgo.com/html/".into(),
++            lite: "https://lite.duckduckgo.com/lite/".into(),
+             brave: "https://api.search.brave.com/res/v1/web/search".into(),
+         }
+     }
+@@ -44,6 +44,8 @@
+     config: SearchConfig,
+     target: String,
+     cache: Mutex<VecDeque<SearchCache>>,
++    // Provider-wide rather than per query: rephrasing cannot fix a challenge.
++    blocked_until: Mutex<Option<Instant>>,
+ }
+ impl<R: WebResolver> SearchService<R> {
+     pub fn new(
+@@ -82,6 +84,7 @@
+             config,
+             target,
+             cache: Mutex::new(VecDeque::new()),
++            blocked_until: Mutex::new(None),
+         })
+     }
+     pub fn target_revision(&self) -> &str {
+@@ -277,6 +280,18 @@
+             }
+             if Instant::now() >= deadline {
+                 return Err(DomainError::TimedOut);
++            }
++            if name == "duckduckgo"
++                && self
++                    .blocked_until
++                    .lock()
++                    .map_err(|_| DomainError::Unavailable("search cooldown".into()))?
++                    .is_some_and(|until| Instant::now() < until)
++            {
++                attempts.push(Attempt { provider: name.clone(), url: "provider:duckduckgo".into(),
++                    status: "blocked".into(), result_count: 0,
++                    error: Some("DuckDuckGo blocked or rate-limited automated access. Search is paused for up to five minutes; changing the query will not resolve this.".into()) });
++                continue;
+             }
+             if matches!(name.as_str(), "serpapi" | "tavily" | "exa") {
+                 attempts.push(Attempt{provider:name.clone(),url:format!("provider:{name}:{query}"),status:"skipped".into(),result_count:0,error:Some(format!("{name} provider is not implemented yet; AG1_{}_API_KEY is optional and DuckDuckGo fallback remains available",name.to_uppercase()))});
+@@ -340,6 +355,28 @@
+                             None,
+                         )?;
+                         evidence.push(artifact.id);
++                        if name == "duckduckgo" {
++                            let text = String::from_utf8_lossy(&response.bytes);
++                            let status = websearch::duckduckgo_page_status(&text);
++                            if status == "blocked"
++                                || status == "parse_error"
++                                || response.status != 200
++                            {
++                                let blocked = status == "blocked";
++                                attempts.push(Attempt { provider: provider.into(), url,
++                                    status: if blocked { "blocked" } else { "parse_error" }.into(),
++                                    result_count: 0, error: Some(if blocked {
++                                        "DuckDuckGo requires human verification; no search results were received.".into()
++                                    } else { format!("Unrecognized DuckDuckGo response (HTTP {}). No usable search results were received.", response.status) }) });
++                                if blocked {
++                                    *self.blocked_until.lock().map_err(|_| {
++                                        DomainError::Unavailable("search cooldown".into())
++                                    })? = Some(Instant::now() + Duration::from_secs(300));
++                                    break;
++                                }
++                                continue;
++                            }
++                        }
+                         let parsed = if name == "brave" {
+                             serde_json::from_slice::<Value>(&response.bytes)
+                                 .map_err(|_| {
+@@ -359,6 +396,17 @@
+                         };
+                         match parsed {
+                             Ok((results, count)) => {
++                                if name == "duckduckgo"
++                                    && results.is_empty()
++                                    && websearch::duckduckgo_page_status(&String::from_utf8_lossy(
++                                        &response.bytes,
++                                    )) == "results"
++                                {
++                                    attempts.push(Attempt { provider: provider.into(), url,
++                                        status: "parse_error".into(), result_count: 0,
++                                        error: Some("DuckDuckGo result markup contained no usable result links.".into()) });
++                                    continue;
++                                }
+                                 attempts.push(Attempt {
+                                     provider: provider.into(),
+                                     url,
+@@ -398,7 +446,15 @@
+                         let code = message
+                             .strip_prefix("web HTTP status ")
+                             .and_then(|v| v.parse::<u16>().ok());
+-                        let status = if code.is_some() {
++                        let blocked = name == "duckduckgo" && matches!(code, Some(403 | 429));
++                        if blocked {
++                            *self.blocked_until.lock().map_err(|_| {
++                                DomainError::Unavailable("search cooldown".into())
++                            })? = Some(Instant::now() + Duration::from_secs(300));
++                        }
++                        let status = if blocked {
++                            "blocked"
++                        } else if code.is_some() {
+                             "http_error"
+                         } else {
+                             "error"
+@@ -423,6 +479,9 @@
+                             result_count: 0,
+                             error: Some(error),
+                         });
++                        if blocked {
++                            break;
++                        }
+                     }
+                 }
+             }
+--- before/product/crates/ag1-platform/src/client/website_icons.rs
++++ after/product/crates/ag1-platform/src/client/website_icons.rs
+@@ -7,7 +7,7 @@
+ 
+ pub(super) fn sources(entry: &Value) -> Vec<Value> {
+     let m=&entry["message"];
+-    if m["role"]!="toolResult" || m["isError"]==true {return vec![];}
++    if m["role"]!="toolResult" || m["isError"]==true || m["details"]["error"].is_string() || m["details"]["fallbackUsed"]==true {return vec![];}
+     let details=&m["details"];
+     let urls:Vec<_>=match m["toolName"].as_str() {
+         Some("webSearch")=>details["sourceUrls"].as_array().into_iter().flatten().filter_map(Value::as_str).take(4).collect(),
+@@ -88,6 +88,14 @@
+         e["message"]["isError"]=json!(true);assert!(sources(&e).is_empty());e["message"]["isError"]=json!(false);e["message"]["toolName"]=json!("bash");assert!(sources(&e).is_empty());
+     }
+     #[test]
++    fn old_fallback_suggestions_and_failed_fetches_do_not_become_source_badges() {
++        let mut e=json!({"message":{"role":"toolResult","toolName":"webSearch","isError":false,"details":{"fallbackUsed":true,"sourceUrls":["https://docs.python.org/3/"]}}});
++        assert!(sources(&e).is_empty());
++        e["message"]["toolName"]=json!("webFetch");
++        e["message"]["details"]=json!({"error":"404 Not Found","url":"https://example.org/missing"});
++        assert!(sources(&e).is_empty());
++    }
++    #[test]
+     fn icons_strip_page_paths_queries_and_reject_private_networks() {
+         assert_eq!(origin("http://example.com/private?q=secret#fragment").unwrap().as_str(),"https://example.com/");
+         for raw in ["file:///tmp/icon","https://user:secret@example.com/","https://example.com:8443/a"] {assert!(origin(raw).is_err());}
+--- before/product/crates/ag1-platform/tests/web_http_contract.rs
++++ after/product/crates/ag1-platform/tests/web_http_contract.rs
+@@ -817,11 +817,9 @@
+             let text = expected["content"][0]["text"].as_str().unwrap();
+             expected["content"][0]["text"] = serde_json::json!(text.replace(
+                 "This source summary is likely sufficient to answer or cite without refetching.",
+-                "This source extract is available as evidence for the active task."));
+-            assert_eq!(
+-                projected.result, expected,
+-                "decoded projection {index}"
+-            );
++                "This source extract is available as evidence for the active task."
++            ));
++            assert_eq!(projected.result, expected, "decoded projection {index}");
+         }
+         task.join().unwrap();
+     }
+@@ -1774,3 +1772,267 @@
+     }
+     assert_eq!(task.join().unwrap().len(), 1);
+ }
++
++#[tokio::test]
++async fn duckduckgo_challenge_stops_network_retries_and_preserves_raw_evidence() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::tools::research;
++    use ag1_platform::web_tools::{
++        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
++    };
++    use serde_json::json;
++    let fixture = ToolFixture::new();
++    let (port, task) = server(1, |_, _| {
++        let body = include_bytes!("../../ag1-core/tests/fixtures/duckduckgo-challenge.html");
++        let mut out=format!("HTTP/1.1 202 Accepted\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).into_bytes();
++        out.extend(body);
++        out
++    });
++    let origin = format!("http://127.0.0.1:{port}");
++    let web = Arc::new(
++        WebService::new(
++            WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap()),
++            fixture.scope.clone(),
++            "challenge-web",
++            Default::default(),
++        )
++        .unwrap(),
++    );
++    let search = SearchService::new(
++        web,
++        SearchConfig {
++            mode: "duckduckgo".into(),
++            brave: None,
++            endpoints: SearchEndpoints {
++                html: format!("{origin}/html"),
++                lite: format!("{origin}/lite"),
++                ..Default::default()
++            },
++        },
++        "challenge-search",
++    )
++    .unwrap();
++    for (index, query) in [
++        "Python documentation",
++        "A different query",
++        "Python documentation",
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let id = format!("challenge-{index}");
++        let ticket = fixture.ticket(
++            &id,
++            "webSearch",
++            json!({"query":query}),
++            search.target_revision(),
++            12,
++        );
++        let mut artifacts = fixture.artifacts(&id);
++        let (_source, mut cancel) = cancellation();
++        let result = search
++            .execute(
++                ticket,
++                WebExecution {
++                    registry: &fixture.registry,
++                    scope: &fixture.scope,
++                    policy_revision: 1,
++                    now: || 12,
++                    deadline: Instant::now() + Duration::from_secs(3),
++                    cancel: &mut cancel,
++                    profile: research::profile(50000., 4.),
++                },
++                2026,
++                &mut artifacts,
++            )
++            .await
++            .unwrap()
++            .result;
++        assert_eq!(result["isError"], true);
++        assert_eq!(result["details"]["status"], "blocked");
++        assert_eq!(result["details"]["resultCount"], 0);
++        assert_eq!(
++            result["details"]["searchAttempts"]
++                .as_array()
++                .unwrap()
++                .len(),
++            1
++        );
++        if index == 0 {
++            assert_eq!(
++                result["details"]["networkEvidence"]["artifactIds"]
++                    .as_array()
++                    .unwrap()
++                    .len(),
++                1
++            );
++        }
++        if index == 2 {
++            assert_eq!(result["details"]["cacheHit"], true);
++        }
++    }
++    assert_eq!(task.join().unwrap().len(), 1);
++}
++
++#[tokio::test]
++async fn duckduckgo_unknown_html_uses_actual_lite_markup_and_preserves_query() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::tools::research;
++    use ag1_platform::web_tools::{
++        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
++    };
++    use serde_json::json;
++    assert_eq!(
++        SearchEndpoints::default().lite,
++        "https://lite.duckduckgo.com/lite/"
++    );
++    let fixture = ToolFixture::new();
++    let (port, task) = server(2, |i, request| {
++        assert!(request.contains("q=site%3Aexample.org%20Retry"));
++        assert!(!request.contains("official"));
++        if i == 0 {
++            assert!(request.starts_with("GET /html?"));
++            return ok(b"<html><body>Unexpected service page</body></html>");
++        }
++        assert!(request.starts_with("GET /lite?"));
++        ok(br#"<table><tr><td><a href="https://example.org/retry" class="result-link">Retry documentation</a></td></tr><tr><td class="result-snippet">Retry parameters and allowed methods.</td></tr></table>"#)
++    });
++    let origin = format!("http://127.0.0.1:{port}");
++    let web = Arc::new(
++        WebService::new(
++            WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap()),
++            fixture.scope.clone(),
++            "lite-web",
++            Default::default(),
++        )
++        .unwrap(),
++    );
++    let search = SearchService::new(
++        web,
++        SearchConfig {
++            mode: "duckduckgo".into(),
++            brave: None,
++            endpoints: SearchEndpoints {
++                html: format!("{origin}/html"),
++                lite: format!("{origin}/lite"),
++                ..Default::default()
++            },
++        },
++        "lite-search",
++    )
++    .unwrap();
++    let ticket = fixture.ticket(
++        "lite",
++        "webSearch",
++        json!({"query":"site:example.org Retry"}),
++        search.target_revision(),
++        12,
++    );
++    let mut artifacts = fixture.artifacts("lite");
++    let (_source, mut cancel) = cancellation();
++    let result = search
++        .execute(
++            ticket,
++            WebExecution {
++                registry: &fixture.registry,
++                scope: &fixture.scope,
++                policy_revision: 1,
++                now: || 12,
++                deadline: Instant::now() + Duration::from_secs(3),
++                cancel: &mut cancel,
++                profile: research::profile(50000., 4.),
++            },
++            2026,
++            &mut artifacts,
++        )
++        .await
++        .unwrap()
++        .result;
++    assert_ne!(result["isError"], true);
++    assert_eq!(
++        result["details"]["searchAttempts"][0]["status"],
++        "parse_error"
++    );
++    assert_eq!(result["details"]["searchProvider"], "duckduckgo-lite");
++    assert_eq!(result["details"]["resultCount"], 1);
++    assert_eq!(
++        result["details"]["results"][0]["snippet"],
++        "Retry parameters and allowed methods."
++    );
++    assert_eq!(task.join().unwrap().len(), 2);
++}
++
++#[tokio::test]
++#[ignore = "Explicit bounded live DuckDuckGo probe; no model or desktop needed"]
++async fn duckduckgo_live_search_checkpoint() {
++    let _case = WEB_CASE.lock().await;
++    use ag1_core::tools::research;
++    use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
++    use serde_json::json;
++    let fixture = ToolFixture::new();
++    let web = Arc::new(
++        WebService::new(
++            WebHttp::new(WebPolicy::default()),
++            fixture.scope.clone(),
++            "live-web",
++            Default::default(),
++        )
++        .unwrap(),
++    );
++    let search = SearchService::new(web, SearchConfig::default(), "live-search").unwrap();
++    let mut results = vec![];
++    for (index, query) in [
++        "site:urllib3.readthedocs.io Retry allowed_methods",
++        "Rust ownership borrowing documentation",
++        "Norway public transport Oslo",
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let id = format!("live-{index}");
++        let ticket = fixture.ticket(
++            &id,
++            "webSearch",
++            json!({"query":query,"maxResults":4}),
++            search.target_revision(),
++            12,
++        );
++        let mut artifacts = fixture.artifacts(&id);
++        let (_source, mut cancel) = cancellation();
++        let result = search
++            .execute(
++                ticket,
++                WebExecution {
++                    registry: &fixture.registry,
++                    scope: &fixture.scope,
++                    policy_revision: 1,
++                    now: || 12,
++                    deadline: Instant::now() + Duration::from_secs(20),
++                    cancel: &mut cancel,
++                    profile: research::profile(90000., 0.),
++                },
++                2026,
++                &mut artifacts,
++            )
++            .await
++            .unwrap()
++            .result;
++        let blocked = result["details"]["status"] == "blocked";
++        results.push(result);
++        if blocked {
++            break;
++        }
++        tokio::time::sleep(Duration::from_secs(2)).await;
++    }
++    println!(
++        "LIVE_SEARCH_RESULTS={}",
++        serde_json::to_string(&results).unwrap()
++    );
++    assert!(!results.is_empty());
++    for r in results {
++        if r["details"]["status"] == "blocked" {
++            assert_eq!(r["isError"], true);
++            assert_eq!(r["details"]["resultCount"], 0);
++        }
++    }
++}
+--- before/product/apps/desktop/src/ToolActivity.tsx
++++ after/product/apps/desktop/src/ToolActivity.tsx
+@@ -74,7 +74,7 @@
+   const failed = results.some(m => m.tool?.failed), target = call ? toolTarget(call) : "";
+   const source = results.flatMap(m => m.blocks).find(b => b.kind === "unknown" && b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "mcp_result");
+   const capability = source?.kind === "unknown" && source.value && typeof source.value === "object" && !Array.isArray(source.value) ? source.value.capability : undefined;
+-  const label = typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : results[0]?.tool?.name || "Tool output";
++  const label = failed && call?.name === "webSearch" ? "Search unavailable" : typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : results[0]?.tool?.name || "Tool output";
+   const Icon = call?.name === "github" ? Github : ["read", "inspect", "write", "edit"].includes(call?.name ?? "") ? FileText : ["grep", "find", "webSearch"].includes(call?.name ?? "") ? Search : Terminal;
+   const sources = results.flatMap(webSources);
+   return <div className={`tool-entry ${failed ? "failed" : ""}`}>
+--- before/product/apps/desktop/src/ToolActivity.test.tsx
++++ after/product/apps/desktop/src/ToolActivity.test.tsx
+@@ -1,6 +1,6 @@
+ import { cleanup, render, screen } from "@testing-library/react";
+ import { afterEach, expect, test } from "vitest";
+-import { previewText, ToolOutput } from "./ToolActivity";
++import { ActivityGroup, previewText, ToolOutput } from "./ToolActivity";
+ afterEach(cleanup);
+ test("native preview hunks decode as literal diff with a bounded raw fallback", () => {
+   const text = JSON.stringify({ path: "λ.html", hunks: [{ fromLine: 1, toLine: 1, diff: '@@ -1 +1 @@\n-old\n+<script>alert("x")</script>' }] });
+@@ -13,3 +13,15 @@
+   expect(screen.getByRole("region", { name: "Tool output" }).textContent).toContain("+<script>");
+   expect(document.querySelector("script")).toBeNull();
+ });
++
++test("blocked web searches stop looking active and expose the failure", () => {
++  const messages = [
++    { id: "a", role: "assistant", blocks: [{ kind: "tool", name: "webSearch", call_id: "s", arguments: { query: "Rust documentation" } }] },
++    { id: "r", role: "toolResult", tool: { name: "webSearch", call_id: "s", failed: true }, blocks: [{ kind: "text", text: "DuckDuckGo requires human verification." }] },
++  ];
++  render(<ActivityGroup messages={messages as any} active={false} compact={false} run={async () => null} onExpand={() => {}} loading={() => false} />);
++  expect(screen.getByRole("button", { name: /Search unavailable.*Failed/ })).toBeTruthy();
++  expect(screen.queryByText("Searching the web")).toBeNull();
++  expect(screen.queryByText("Searched the web")).toBeNull();
++  expect(screen.getByText("1 failed")).toBeTruthy();
++});
+--- /dev/null
++++ after/product/crates/ag1-core/tests/web_search_recovery.rs
+@@ -0,0 +1,164 @@
++use ag1_core::tools::{
++    research, web_presentation,
++    websearch::{self as w, Attempt, ProviderResponse},
++};
++use serde_json::json;
++use std::collections::BTreeMap;
++
++#[test]
++fn captured_human_challenge_is_not_an_empty_search() {
++    let body = include_str!("fixtures/duckduckgo-challenge.html");
++    assert_eq!(w::duckduckgo_page_status(body), "blocked");
++    assert!(w::parse_duckduckgo(body, 4).unwrap().is_empty());
++    assert_eq!(
++        w::duckduckgo_page_status("<html><body>Service unavailable</body></html>"),
++        "parse_error"
++    );
++    assert_eq!(
++        w::duckduckgo_page_status("<div class='no-results'>No results found for a query</div>"),
++        "empty"
++    );
++}
++
++#[test]
++fn html_attributes_entities_snippets_and_redirects_survive_parsing() {
++    let html = r#"<div class="result"><h2><a href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fa%252Fb%3Fx%3D1%26y%3D2&amp;rut=ignored" data-other="x" class="other result__a">A &amp; B &#x1f980;</a></h2><div class="result__snippet">Use <b>Retry</b> &lt;limit&gt;.</div></div>"#;
++    assert_eq!(w::duckduckgo_page_status(html), "results");
++    let rows = w::parse_duckduckgo(html, 4).unwrap();
++    assert_eq!(rows.len(), 1);
++    assert_eq!(rows[0].title, "A & B 🦀");
++    assert_eq!(rows[0].url, "https://example.org/a%2Fb?x=1&y=2");
++    assert_eq!(rows[0].snippet, "Use Retry <limit>.");
++}
++
++#[test]
++fn real_lite_shape_keeps_snippets_with_their_results() {
++    let html = r#"<table>
++    <tr><td>1.</td><td><a rel="nofollow" href="https://example.org/first" class='result-link'>First</a></td></tr>
++    <tr><td></td><td class='result-snippet'>First <b>snippet</b>.</td></tr>
++    <tr><td></td><td class='link-text'>example.org</td></tr>
++    <tr><td>2.</td><td><a href="https://example.net/second" class='result-link'>Second</a></td></tr>
++    <tr><td></td><td class='result-snippet'>Second snippet.</td></tr></table>"#;
++    let rows = w::parse_duckduckgo(html, 4).unwrap();
++    assert_eq!(rows.len(), 2);
++    assert_eq!(rows[0].snippet, "First snippet.");
++    assert_eq!(rows[1].snippet, "Second snippet.");
++}
++
++#[test]
++fn invalid_links_and_duplicates_do_not_consume_result_budget() {
++    let html = r#"<a class=result__a href="javascript:alert(1)">Bad</a><a class=result__a href="https://u:p@example.org">Credentials</a><a class=result__a href="https://example.org/a">First</a><a class=result__a href="https://example.org/a">Duplicate</a><a class=result__a href="https://example.org/b">Second</a>"#;
++    let rows = w::parse_duckduckgo(html, 2).unwrap();
++    assert_eq!(rows.len(), 2);
++    assert_eq!(rows[1].title, "Second");
++    assert!(w::parse_duckduckgo(html, 0).unwrap().is_empty());
++}
++
++fn response(status: &str) -> ProviderResponse {
++    ProviderResponse {
++        results: vec![],
++        attempts: vec![Attempt {
++            provider: "duckduckgo-html".into(),
++            url: "https://html.duckduckgo.com/html/".into(),
++            status: status.into(),
++            result_count: 0,
++            error: None,
++        }],
++        provider: "duckduckgo-html".into(),
++        provider_mode: "auto".into(),
++        provider_order: vec!["duckduckgo".into()],
++        cache_hit: false,
++    }
++}
++#[test]
++fn blocked_search_is_an_error_and_static_suggestions_are_never_hits() {
++    let r = w::project(
++        "Python documentation",
++        2026,
++        4,
++        response("blocked"),
++        research::profile(50000., 4.),
++        &BTreeMap::new(),
++    )
++    .unwrap()
++    .result;
++    assert_eq!(r["isError"], true);
++    assert_eq!(r["details"]["status"], "blocked");
++    assert_eq!(r["details"]["resultCount"], 0);
++    assert_eq!(r["details"]["sourceUrls"], json!([]));
++    assert_eq!(r["details"]["results"], json!([]));
++    assert!(!r["details"]["suggestions"].as_array().unwrap().is_empty());
++    let text = r["content"][0]["text"].as_str().unwrap();
++    assert!(text.contains("not search results"));
++    assert!(!text.contains("No results found."));
++    let p = web_presentation::render(
++        "webSearch",
++        &json!({"query":"Python documentation"}),
++        &r,
++        false,
++    )
++    .unwrap();
++    assert_eq!(p.summary, "Search blocked");
++}
++#[test]
++fn genuine_empty_search_is_distinct_from_failed_search() {
++    let r = w::project(
++        "a garden",
++        2026,
++        4,
++        response("ok"),
++        research::profile(50000., 4.),
++        &BTreeMap::new(),
++    )
++    .unwrap()
++    .result;
++    assert_ne!(r["isError"], true);
++    assert_eq!(r["details"]["resultCount"], 0);
++    assert!(
++        r["content"][0]["text"]
++            .as_str()
++            .unwrap()
++            .contains("No results found.")
++    );
++    let r = w::project(
++        "a garden",
++        2026,
++        4,
++        response("parse_error"),
++        research::profile(50000., 4.),
++        &BTreeMap::new(),
++    )
++    .unwrap()
++    .result;
++    assert_eq!(r["isError"], true);
++}
++
++#[test]
++fn explicit_search_syntax_is_never_rewritten() {
++    for query in [
++        "site:docs.python.org urllib3 retry policy timeout",
++        "\"TypeError: exact text\" -site:example.com",
++        "site:github.com current release 2026",
++        "filetype:pdf research -advertisement",
++    ] {
++        assert_eq!(w::plan(query, 2026).unwrap().effective_query, query);
++    }
++}
++
++#[test]
++fn empty_primary_does_not_hide_a_blocked_fallback() {
++    let mut provider = response("ok");
++    provider.attempts.extend(response("blocked").attempts);
++    let result = w::project(
++        "a garden",
++        2026,
++        4,
++        provider,
++        research::profile(50000., 4.),
++        &BTreeMap::new(),
++    )
++    .unwrap()
++    .result;
++    assert_eq!(result["isError"], true);
++    assert_eq!(result["details"]["status"], "blocked");
++}
+--- /dev/null
++++ after/product/crates/ag1-core/tests/fixtures/duckduckgo-challenge.html
+@@ -0,0 +1,176 @@
++<!-- <!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd"> -->
++<!DOCTYPE html>
++<html lang="en">
++
++<head>
++    <link rel="canonical" href="https://duckduckgo.com/">
++    <meta http-equiv="content-type" content="text/html; charset=UTF-8">
++    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=3.0, user-scalable=1">
++    <meta name="referrer" content="origin">
++    <title>
++        DuckDuckGo
++    </title>
++    <link rel="preload" href="/font/ProximaNova-Reg-webfont.woff2" as="font" type="font/woff2" crossorigin="anonymous">
++    <link rel="preload" href="/font/ProximaNova-Sbold-webfont.woff2" as="font" type="font/woff2" crossorigin="anonymous">
++    <link title="DuckDuckGo (Lite)" type="application/opensearchdescription+xml" rel="search" href="//duckduckgo.com/opensearch_lite_v2.xml">
++    <link rel="icon" href="//duckduckgo.com/favicon.ico" type="image/x-icon"/>
++    <link id="icon60" rel="apple-touch-icon" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_60x60.png?v=2"/>
++    <link id="icon76" rel="apple-touch-icon" sizes="76x76" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_76x76.png?v=2"/>
++    <link id="icon120" rel="apple-touch-icon" sizes="120x120" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_120x120.png?v=2"/>
++    <link id="icon152" rel="apple-touch-icon" sizes="152x152" href="//duckduckgo.com/assets/icons/meta/DDG-iOS-icon_152x152.png?v=2"/>
++    <link rel="image_src" href="//duckduckgo.com/assets/icons/meta/DDG-icon_256x256.png">
++    <link rel="stylesheet" media="handheld, all" href="//duckduckgo.com/dist/l.304bf63bbd053ee46b28.css" type="text/css"/>
++    <link rel="stylesheet" media="handheld, all" href="//duckduckgo.com/dist/lc.844e8ff9baa78da64b59.css" type="text/css"/>
++</head>
++
++<body>
++    <a name="top"></a>
++    <center id="lite_wrapper">
++        <br>
++        <a class="header-url" href="/html/">
++            <span class="header">DuckDuckGo</span>
++        </a>
++        <br><br>
++
++        
++        <iframe name="ifr" width="0" height="0" border="0" class="hidden"></iframe>
++        <form id="img-form" action="//duckduckgo.com/anomaly.js?sv=html&cc=sre&ti=1789332811&gk=d4cd0dabcf4caa22ad92fab40844c786&p=7426f7b6a31ed4c775decb13bce5bff6-6c7dc479ed28087f7fd078315bd86879-8e9a317bc3e4d846d8b33328e3c3fd2a-b91b363d386a405fa778b12dc68b728d-9d045fa3cd2a44c206187f6c8bdf456c-150cc053fbe447864dd078c29444f78f-4f03c9125f97677d3fa603568fc1e2a8-c2248d9ecc9f9c74b56aea49f0e0a136-80fe1ed79753ab6296c01017536bff69&q=site:docs.python.org urllib3 retry policy timeout official docs&o=1QoDE4sJ6t0y%2BHJDstHZsrIkO7vQtZrO84C%2Fv4wxJd0NF1xh8fpCGeH9F3alNPj2%0A&r=eun" target="ifr" method="POST"></form>
++        <form id="challenge-form" action="//duckduckgo.com/anomaly.js?sv=html&cc=sre&st=1789332811&gk=d4cd0dabcf4caa22ad92fab40844c786&p=7426f7b6a31ed4c775decb13bce5bff6-6c7dc479ed28087f7fd078315bd86879-8e9a317bc3e4d846d8b33328e3c3fd2a-b91b363d386a405fa778b12dc68b728d-9d045fa3cd2a44c206187f6c8bdf456c-150cc053fbe447864dd078c29444f78f-4f03c9125f97677d3fa603568fc1e2a8-c2248d9ecc9f9c74b56aea49f0e0a136-80fe1ed79753ab6296c01017536bff69&q=site:docs.python.org urllib3 retry policy timeout official docs&o=1QoDE4sJ6t0y%2BHJDstHZsrIkO7vQtZrO84C%2Fv4wxJd0NF1xh8fpCGeH9F3alNPj2%0A&r=eun" method="POST">
++            <div class="anomaly-modal__mask">
++                <div class="anomaly-modal__modal  is-ie" data-testid="anomaly-modal">
++                    <div class="anomaly-modal__title">Unfortunately, bots use DuckDuckGo too.</div>
++                    <div class="anomaly-modal__description">Please complete the following challenge to confirm this search was made by a human.</div>
++                    <div class="anomaly-modal__instructions">Select all squares containing a duck:</div>
++                    <div class="anomaly-modal__puzzle-margins">
++                        <div class="anomaly-modal__puzzle">
++                            
++                                <div class="anomaly-modal__box" data-index="0">
++                                    
++                                    
++                                        <label class="" for="image-check_7426f7b6a31ed4c775decb13bce5bff6" data-testid="anomaly-modal-tile-0">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_7426f7b6a31ed4c775decb13bce5bff6" id="image-check_7426f7b6a31ed4c775decb13bce5bff6">
++                                            <img class="anomaly-modal__image" alt=" " id="image-7426f7b6a31ed4c775decb13bce5bff6" src="../assets/anomaly/images/challenge/7426f7b6a31ed4c775decb13bce5bff6.jpg" data-id="7426f7b6a31ed4c775decb13bce5bff6.jpg" data-testid="anomaly-modal-image-0"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="1">
++                                    
++                                    
++                                        <label class="" for="image-check_6c7dc479ed28087f7fd078315bd86879" data-testid="anomaly-modal-tile-1">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_6c7dc479ed28087f7fd078315bd86879" id="image-check_6c7dc479ed28087f7fd078315bd86879">
++                                            <img class="anomaly-modal__image" alt=" " id="image-6c7dc479ed28087f7fd078315bd86879" src="../assets/anomaly/images/challenge/6c7dc479ed28087f7fd078315bd86879.jpg" data-id="6c7dc479ed28087f7fd078315bd86879.jpg" data-testid="anomaly-modal-image-1"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="2">
++                                    
++                                    
++                                        <label class="" for="image-check_8e9a317bc3e4d846d8b33328e3c3fd2a" data-testid="anomaly-modal-tile-2">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_8e9a317bc3e4d846d8b33328e3c3fd2a" id="image-check_8e9a317bc3e4d846d8b33328e3c3fd2a">
++                                            <img class="anomaly-modal__image" alt=" " id="image-8e9a317bc3e4d846d8b33328e3c3fd2a" src="../assets/anomaly/images/challenge/8e9a317bc3e4d846d8b33328e3c3fd2a.jpg" data-id="8e9a317bc3e4d846d8b33328e3c3fd2a.jpg" data-testid="anomaly-modal-image-2"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="3">
++                                    
++                                    
++                                        <label class="" for="image-check_b91b363d386a405fa778b12dc68b728d" data-testid="anomaly-modal-tile-3">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_b91b363d386a405fa778b12dc68b728d" id="image-check_b91b363d386a405fa778b12dc68b728d">
++                                            <img class="anomaly-modal__image" alt=" " id="image-b91b363d386a405fa778b12dc68b728d" src="../assets/anomaly/images/challenge/b91b363d386a405fa778b12dc68b728d.jpg" data-id="b91b363d386a405fa778b12dc68b728d.jpg" data-testid="anomaly-modal-image-3"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="4">
++                                    
++                                    
++                                        <label class="" for="image-check_9d045fa3cd2a44c206187f6c8bdf456c" data-testid="anomaly-modal-tile-4">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_9d045fa3cd2a44c206187f6c8bdf456c" id="image-check_9d045fa3cd2a44c206187f6c8bdf456c">
++                                            <img class="anomaly-modal__image" alt=" " id="image-9d045fa3cd2a44c206187f6c8bdf456c" src="../assets/anomaly/images/challenge/9d045fa3cd2a44c206187f6c8bdf456c.jpg" data-id="9d045fa3cd2a44c206187f6c8bdf456c.jpg" data-testid="anomaly-modal-image-4"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="5">
++                                    
++                                    
++                                        <label class="" for="image-check_150cc053fbe447864dd078c29444f78f" data-testid="anomaly-modal-tile-5">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_150cc053fbe447864dd078c29444f78f" id="image-check_150cc053fbe447864dd078c29444f78f">
++                                            <img class="anomaly-modal__image" alt=" " id="image-150cc053fbe447864dd078c29444f78f" src="../assets/anomaly/images/challenge/150cc053fbe447864dd078c29444f78f.jpg" data-id="150cc053fbe447864dd078c29444f78f.jpg" data-testid="anomaly-modal-image-5"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="6">
++                                    
++                                    
++                                        <label class="" for="image-check_4f03c9125f97677d3fa603568fc1e2a8" data-testid="anomaly-modal-tile-6">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_4f03c9125f97677d3fa603568fc1e2a8" id="image-check_4f03c9125f97677d3fa603568fc1e2a8">
++                                            <img class="anomaly-modal__image" alt=" " id="image-4f03c9125f97677d3fa603568fc1e2a8" src="../assets/anomaly/images/challenge/4f03c9125f97677d3fa603568fc1e2a8.jpg" data-id="4f03c9125f97677d3fa603568fc1e2a8.jpg" data-testid="anomaly-modal-image-6"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="7">
++                                    
++                                    
++                                        <label class="" for="image-check_c2248d9ecc9f9c74b56aea49f0e0a136" data-testid="anomaly-modal-tile-7">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_c2248d9ecc9f9c74b56aea49f0e0a136" id="image-check_c2248d9ecc9f9c74b56aea49f0e0a136">
++                                            <img class="anomaly-modal__image" alt=" " id="image-c2248d9ecc9f9c74b56aea49f0e0a136" src="../assets/anomaly/images/challenge/c2248d9ecc9f9c74b56aea49f0e0a136.jpg" data-id="c2248d9ecc9f9c74b56aea49f0e0a136.jpg" data-testid="anomaly-modal-image-7"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                                <div class="anomaly-modal__box" data-index="8">
++                                    
++                                    
++                                        <label class="" for="image-check_80fe1ed79753ab6296c01017536bff69" data-testid="anomaly-modal-tile-8">
++                                            <input type="checkbox" class="anomaly-modal__check" name="image-check_80fe1ed79753ab6296c01017536bff69" id="image-check_80fe1ed79753ab6296c01017536bff69">
++                                            <img class="anomaly-modal__image" alt=" " id="image-80fe1ed79753ab6296c01017536bff69" src="../assets/anomaly/images/challenge/80fe1ed79753ab6296c01017536bff69.jpg" data-id="80fe1ed79753ab6296c01017536bff69.jpg" data-testid="anomaly-modal-image-8"></img>
++                                        </label>
++                                    
++                                </div>
++                            
++                        </div>
++                    </div>
++                    <div class="anomaly-modal__controls">
++                        <button name="challenge-submit" class="btn btn--primary anomaly-modal__submit js-anomaly-modal-submit" form="challenge-form" value="d4cd0dabcf4caa22ad92fab40844c786" >Submit</button>
++                        <p></p>
++                        <input class="feedback-toggle" type="checkbox" id="feedback" unchecked />
++                        <label for="feedback" class="feedback-text">Images not loading?</label>
++                        <div class="feedback-content">
++                            <label class="feedback-instructions">Please email the following code to:</label>
++                            <p class="feedback-instructions">error-lite+95af@duckduckgo.com</p>
++                            <p><label class="feedback-instructions">Code: 95af</label></p>
++                        </div>
++                    </div>
++            </div>
++        </form>
++        
++
++        
++
++        
++
++        
++
++
++        <br>
++        <p class='html-only'>
++            <!--    This is the Lite version. Get the full-JS version <a href="https://duckduckgo.com/">here</a>. //-->
++        </p>
++    </center>
++    
++        <img src="//duckduckgo.com/t/tqadb?7349184&amp;s=lite&amp;e=0&amp;gk=d4cd0dabcf4caa22ad92fab40844c786&amp;o=1QoDE4sJ6t0y%2BHJDstHZsrIkO7vQtZrO84C%2Fv4wxJd0NF1xh8fpCGeH9F3alNPj2%0A&amp;i=-1&amp;sc=1&amp;cc=sre&amp;r=eun&amp;p=7426f7b6a31ed4c775decb13bce5bff6-6c7dc479ed28087f7fd078315bd86879-8e9a317bc3e4d846d8b33328e3c3fd2a-b91b363d386a405fa778b12dc68b728d-9d045fa3cd2a44c206187f6c8bdf456c-150cc053fbe447864dd078c29444f78f-4f03c9125f97677d3fa603568fc1e2a8-c2248d9ecc9f9c74b56aea49f0e0a136-80fe1ed79753ab6296c01017536bff69&amp;c=dadb&amp;iadb=0"/>
++    
++    
++    
++    
++    
++
++</body>
++
++</html>

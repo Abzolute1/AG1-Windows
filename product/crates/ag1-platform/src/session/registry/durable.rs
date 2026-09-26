@@ -8,6 +8,7 @@ use std::sync::{
 };
 
 pub(super) struct Durability {
+    pub(super) conversation: bool,
     state: Mutex<DurableState>,
 }
 pub(super) struct DurableState {
@@ -81,6 +82,22 @@ impl RuntimeRegistry {
         previous: Option<StoredSelection>,
         command: String,
     ) -> Result<Self, DomainError> {
+        Self::durable_inner(initial, previous, command, false)
+    }
+    /// A desktop conversation retains its own durable owner while other chats run.
+    pub fn durable_conversation(
+        initial: PreparedRuntime,
+        previous: Option<StoredSelection>,
+        command: String,
+    ) -> Result<Self, DomainError> {
+        Self::durable_inner(initial, previous, command, true)
+    }
+    fn durable_inner(
+        initial: PreparedRuntime,
+        previous: Option<StoredSelection>,
+        command: String,
+        conversation: bool,
+    ) -> Result<Self, DomainError> {
         let frozen = initial.runtime.freeze()?;
         if !frozen.idle()?
             || !initial.runtime.settled()?
@@ -119,6 +136,7 @@ impl RuntimeRegistry {
             selected: Mutex::new(next),
             replacing: tokio::sync::Mutex::new(()),
             durable: Some(Durability {
+                conversation,
                 state: Mutex::new(DurableState {
                     revision,
                     pending: Some(Arc::new(pending)),
@@ -187,14 +205,24 @@ impl RuntimeRegistry {
             .map_err(|_| DomainError::Conflict)?;
         let writing = Writing(pending.clone());
         let store = pending.next.services.runtime.store.clone();
+        let conversation = durable.conversation;
         let ack = pending
             .next
             .services
             .runtime
             .pool
             .submit(move || {
-                let ack = store.commit_runtime_selection(&writing.0.change)?;
-                let current = store.runtime_selection(&ack.selection.workspace)?;
+                let ack = if conversation {
+                    store.commit_conversation_selection(&writing.0.change)?
+                } else {
+                    store.commit_runtime_selection(&writing.0.change)?
+                };
+                let current = if conversation {
+                    store
+                        .conversation_selection(&ack.selection.workspace, &ack.selection.session)?
+                } else {
+                    store.runtime_selection(&ack.selection.workspace)?
+                };
                 if current.as_ref().is_none_or(|record| {
                     record.sha256 != ack.sha256 || record.selection != ack.selection
                 }) {

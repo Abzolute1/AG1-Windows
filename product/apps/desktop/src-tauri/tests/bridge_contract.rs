@@ -1,6 +1,6 @@
 use ag1_desktop::{Desktop, file_operation};
 use ag1_protocol::{BridgeFrame, Command, CommandEnvelope, PromptInput, Sequence};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::{
     fs,
     path::PathBuf,
@@ -39,6 +39,78 @@ fn desktop_private_state_has_one_writer() {
     assert!(Desktop::new(root(), dir.path().to_path_buf(), true).is_err());
     drop(a);
     assert!(Desktop::new(root(), dir.path().to_path_buf(), true).is_ok());
+}
+#[test]
+fn normal_desktop_opens_and_reopens_existing_project_with_saved_native_config() {
+    assert!(std::env::var_os("AG1_NATIVE_CONFIG").is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("project");
+    let state = dir.path().join("desktop");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&state).unwrap();
+    fs::write(
+        workspace.join("README.md"),
+        b"Keep existing project files.\n",
+    )
+    .unwrap();
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    fs::write(
+        state.join("native-host.json"),
+        serde_json::to_vec(&json!({
+            "models":[{"provider":"fixture","id":"saved-model","api":"openai-completions",
+                "baseUrl":format!("http://{}/v1",endpoint.local_addr().unwrap()),
+                "contextWindow":32768,"maxTokens":4096,"input":["text"],"reasoning":false}],
+            "selected":"saved-model","system_prompt":"Saved native configuration","fixture":true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for _ in 0..2 {
+        let desktop = Desktop::new(root(), state.clone(), false).unwrap();
+        assert!(desktop.native.selects(&workspace).unwrap());
+        let view = runtime
+            .block_on(desktop.native.open(&workspace, &state))
+            .unwrap();
+        assert_eq!(view["snapshot"]["status"], "idle");
+        let registry = ag1_platform::cutover::Registry::for_user().unwrap();
+        let record = registry.inspect(&workspace).unwrap().unwrap();
+        assert_eq!(record.owner, ag1_platform::cutover::Owner::Native);
+        assert!(!record.isolated);
+        assert!(record.transfer.is_none());
+        runtime.block_on(desktop.native.shutdown()).unwrap();
+    }
+    assert_eq!(
+        fs::read(workspace.join("README.md")).unwrap(),
+        b"Keep existing project files.\n"
+    );
+    assert!(
+        !state.join("workspaces").exists(),
+        "Legacy worker was never started"
+    );
+}
+
+#[test]
+fn normal_desktop_without_config_reports_setup_before_registering_workspace() {
+    assert!(std::env::var_os("AG1_NATIVE_CONFIG").is_none());
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("project");
+    fs::create_dir(&workspace).unwrap();
+    let state = dir.path().join("desktop");
+    let desktop = Desktop::new(root(), state.clone(), false).unwrap();
+    assert!(desktop.native.selects(&workspace).unwrap());
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let error = runtime
+        .block_on(desktop.native.open(&workspace, &state))
+        .unwrap_err();
+    assert!(error.contains("native-host.json"), "{error}");
+    assert!(
+        ag1_platform::cutover::Registry::for_user()
+            .unwrap()
+            .inspect(&workspace)
+            .unwrap()
+            .is_none()
+    );
 }
 #[test]
 fn real_worker_is_supervised_and_scoped() {
@@ -115,4 +187,44 @@ fn real_worker_is_supervised_and_scoped() {
     assert!(worker.view()["snapshot"]["message_count"].as_u64().unwrap() >= 4);
     worker.stop();
     assert!(worker.view()["error"].as_str().unwrap().contains("stopped"));
+}
+
+#[test]
+fn theme_plugins_and_trash_survive_discovery_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop = Desktop::new(root(), dir.path().to_path_buf(), false).unwrap();
+    let mut themes: Value =
+        serde_json::from_str(include_str!("../../src/builtin-themes.json")).unwrap();
+    themes[0]["id"] = json!("personal-graphite");
+    let exported = desktop.export_theme(themes[0].clone()).unwrap();
+    assert!(std::path::Path::new(&exported).exists());
+    assert_ne!(desktop.export_theme(themes[0].clone()).unwrap(), exported);
+    desktop.import_theme(themes[0].clone()).unwrap();
+    assert!(desktop.import_theme(themes[0].clone()).is_err());
+    desktop.set_theme("personal-graphite").unwrap();
+    assert!(desktop.set_theme("missing-plugin").is_err());
+    desktop.save_chat(json!({"session":"chat","workspace":"/fixture","title":"Renamed","renamed":true,"deleted":true})).unwrap();
+    desktop.save_chat(json!({"session":"chat","workspace":"/fixture","title":"Discovered old title","discovered":true,"deleted":false})).unwrap();
+    let catalog = desktop.catalog().unwrap();
+    assert_eq!(catalog["chats"][0]["deleted"], true);
+    assert_eq!(catalog["chats"][0]["title"], "Renamed");
+    drop(desktop);
+    let desktop = Desktop::new(root(), dir.path().to_path_buf(), false).unwrap();
+    assert_eq!(desktop.catalog().unwrap()["theme"], "personal-graphite");
+    assert_eq!(desktop.catalog().unwrap()["chats"][0]["deleted"], true);
+    desktop.remove_theme("personal-graphite").unwrap();
+    assert_eq!(desktop.catalog().unwrap()["theme"], "dark");
+}
+
+#[test]
+fn empty_discovered_sessions_are_not_saved_as_chats() {
+    let dir = tempfile::tempdir().unwrap();
+    let desktop = Desktop::new(root(), dir.path().to_path_buf(), false).unwrap();
+    for id in ["draft1", "draft2", "draft3"] {
+        desktop.save_chat(json!({"session":id,"workspace":"/fixture","title":"New chat","empty":true,"discovered":true})).unwrap();
+    }
+    assert!(desktop.catalog().unwrap()["chats"].as_array().is_none_or(|c| c.is_empty()));
+    // A real conversation titled New chat must not be mistaken for a draft.
+    desktop.save_chat(json!({"session":"real","workspace":"/fixture","title":"New chat","empty":false,"discovered":true})).unwrap();
+    assert_eq!(desktop.catalog().unwrap()["chats"].as_array().unwrap().len(),1);
 }

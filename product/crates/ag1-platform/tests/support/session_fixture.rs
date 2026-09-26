@@ -267,6 +267,25 @@ fn fixture_configured(
     imported_memory: Option<&[u8]>,
     workers: usize,
 ) -> Fixture {
+    fixture_configured_tools(
+        origin,
+        mode,
+        messages,
+        faults,
+        imported_memory,
+        workers,
+        &["read", "write", "append"],
+    )
+}
+fn fixture_configured_tools(
+    origin: &str,
+    mode: &str,
+    messages: Vec<Value>,
+    faults: Option<Arc<dyn ag1_storage::FaultInjector>>,
+    imported_memory: Option<&[u8]>,
+    workers: usize,
+    active_tools: &[&str],
+) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("workspace");
     std::fs::create_dir(&root).unwrap();
@@ -319,7 +338,7 @@ fn fixture_configured(
         .register_origin("session", "session", &[9; 32])
         .unwrap();
     let mut registry = Registry::builtins().unwrap();
-    let names = ["read", "write", "append"].map(str::to_owned);
+    let names: Vec<_> = active_tools.iter().map(|name| (*name).to_owned()).collect();
     registry
         .activate(&names, &names.iter().cloned().collect())
         .unwrap();

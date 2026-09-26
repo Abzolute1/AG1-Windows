@@ -1,0 +1,17 @@
+# MCP Discover row grouping — 2026-09-13
+
+> Historical evidence, archived 2026-09-13. Status, commands, permissions and paths below describe their original checkpoint. For current work start with [implementation status](../../../README.md). Original bytes and old paths are preserved in the [relocation manifest](../manifest.json) and recovery archive.
+
+Complete and installed systemwide. Both the user menu launcher and system launcher now use the same verified production build. Restart AG1 to use the updated layout.
+
+The directory now keeps a 62/38 master-detail split on wide windows, including a useful, restrained detail placeholder before selection. Rows remain horizontal with separators and modest hover states. Each has a 40 px icon, a 16 px name, a 14 px description, and a single wrapping 13 px metadata line: publisher · version · Local/Remote · credentials when declared. The distant table columns are removed. Add belongs to the directory row, rather than the full application width. Vertical padding is 16 px, with a 108 px minimum row height.
+
+The selected-server pane retains description, publisher, exact registry ID, version, transport, authentication, capabilities/permissions, trust/status, endpoint/package details and the existing reviewed setup actions. On wide screens it remains available while the directory scrolls. Narrow windows use the normal detail subview and Back to directory. Existing icons, local filtering, registry pagination/cache behavior, private entry, native review and security logic are unchanged.
+
+Only `MCPDiscover.tsx` and the scoped Discover CSS changed. The existing 18 Discover/manager tests pass. Actual React components were inspected at 640, 1,000, 1,440 and 2,560 px in light/dark themes. The wide split measures 62/38 and the views have no horizontal overflow. The 2,560 px check hides the sidebar to match the user's full-window example. Tests use owned responses and public publisher-avatar fixtures, not live account operations.
+
+Evidence: `.local/mcp-rows-ui/source.json`, `tests.log`, `visual.json`, and screenshots. Before-edit source is in `.local/mcp-rows-ui/before`. Production uses a fresh isolated profile and preserves earlier accepted binaries/releases. Build staging is on `/var/tmp/ag1-mcp-rows-20260913` because the home volume has little free space. The unchanged packaging procedure exports exact regular archive/manifest/SBOM files into `.local/mcp-rows-ui/package-artifacts` for normal source/hash/payload validation.
+
+Production typecheck/build, normal archive validation and packaged native navigation passed. Native directory and selected-details screenshots were inspected; the smoke made no model requests and left no owned child processes. Evidence: `.local/mcp-rows-ui/production-inspection.json`, `production-smoke/result.json`, `package-validation.json`, and `installation.json`.
+
+Installed release: `/opt/ag1/releases/f6d50802e3704d03bfb6c1f998566959`. Desktop SHA-256: `d94d3c7934d0a9c0db61a862b3337364fb37cca007e4fdc92a5b79beeca4a6e4`. Archive SHA-256: `248fc9b353f60ef0eb444018a2953b0f82862e7b0d7926a2b8288dc05f30a055`. The installation receipt is `/opt/ag1/receipts/f6d50802e3704d03bfb6c1f998566959.json`. The prior system release and prior per-user release are retained. To avoid duplicating the payload on the nearly full home volume, the user launcher delegates to `/usr/local/bin/ag1-desktop`; its previous bytes are saved in `.local/mcp-rows-ui/before/user-launcher`.

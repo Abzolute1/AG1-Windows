@@ -662,12 +662,20 @@ impl Runtime {
                 args.extend(["--ro-bind".into(), path.into(), path.into()]);
             }
         }
-        for path in &self.toolchains.mounts {
+        let trust = super::environment::system_trust_bundles()?;
+        for path in &trust {
+            args.extend(["--ro-bind".into(), path.display().to_string(), path.display().to_string()]);
+        }
+        let rustup = self.toolchains.rustup_home();
+        let executable_roots = self.toolchains.cargo.iter().chain(self.toolchains.rustc.iter())
+            .filter_map(|p| p.parent());
+        for path in self.toolchains.mounts.iter().map(PathBuf::as_path)
+            .chain(rustup.as_deref()).chain(executable_roots) {
             if !path.is_absolute()
                 || !path.is_dir()
                 || path == Path::new("/")
                 || path == Path::new("/home")
-                || path == Path::new("/home/alex")
+                || std::env::var_os("HOME").is_some_and(|home| path == Path::new(&home))
             {
                 return Err(DomainError::PermissionDenied);
             }
@@ -702,33 +710,15 @@ impl Runtime {
             command.executable.display().to_string(),
         ]);
         args.extend(command.argv.clone());
-        let path = self
-            .toolchains
-            .node
-            .iter()
-            .chain(self.toolchains.cargo.iter())
-            .filter_map(|p| p.parent())
-            .map(|p| p.display().to_string())
-            .chain(["/usr/bin".into(), "/bin".into()])
-            .collect::<Vec<_>>()
-            .join(":");
         let mut env = BTreeMap::from([
             ("HOME".into(), "/home/project".into()),
-            ("PATH".into(), path),
             ("LC_ALL".into(), "C.UTF-8".into()),
-            (
-                "CARGO_HOME".into(),
-                self.workspace
-                    .root()
-                    .join("target/ag1-cargo")
-                    .display()
-                    .to_string(),
-            ),
-            (
-                "CARGO_TARGET_DIR".into(),
-                self.workspace.root().join("target").display().to_string(),
-            ),
         ]);
+        env.extend(self.toolchains.environment(self.workspace.root())?);
+        if let Some(bundle) = trust.first() {
+            env.insert("SSL_CERT_FILE".into(), bundle.display().to_string());
+            env.insert("CARGO_HTTP_CAINFO".into(), bundle.display().to_string());
+        }
         if let Some(display) = &self.display {
             env.extend([
                 ("DISPLAY".into(), format!(":{}", display.number)),
@@ -737,9 +727,6 @@ impl Runtime {
                 ("WEBKIT_DISABLE_DMABUF_RENDERER".into(), "1".into()),
                 ("LIBGL_ALWAYS_SOFTWARE".into(), "1".into()),
             ]);
-        }
-        if let Some(rustc) = &self.toolchains.rustc {
-            env.insert("RUSTC".into(), rustc.display().to_string());
         }
         pinned.verify_identity()?;
         self.supervisor.spawn_project_with_cwd(
@@ -1432,3 +1419,7 @@ fn text_diagnostic(line: &str, source: &str) -> Option<Diagnostic> {
             .map(|v| v.as_str().into()),
     })
 }
+
+#[path = "model_preview.rs"]
+mod model_preview;
+pub use model_preview::PreviewPlan;

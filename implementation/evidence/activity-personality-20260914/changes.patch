@@ -1,0 +1,439 @@
+--- a/product/apps/desktop/src/NativeConversation.tsx
++++ b/product/apps/desktop/src/NativeConversation.tsx
+@@ -1,5 +1,6 @@
+ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+ import { ArrowDown, Copy, ChevronRight, LoaderCircle } from "lucide-react";
++import { ActivityStatus, describeActivity } from "./ActivityStatus";
+ import { LiveBlocks } from "./LiveBlocks";
+ import { ChatBlocks } from "./ChatBlocks";
+ import { ActivityGroup } from "./ToolActivity";
+@@ -59,7 +60,7 @@
+     {/* Retained-output footer temporarily hidden at user request. */}
+     {error && <p role="alert">{error}</p>}
+     {active && live && !live.committed && <div className="assistant-message live-answer" key={live.id}><LiveBlocks live={live} run={run} {...thoughts(rest.filter(m => m.role === "assistant").length)} /></div>}
+-    {active && workStatus && !(live && !live.committed && live.blocks.some(b => b.kind === "thinking" || b.kind === "text" && b.text.trim())) && <div className="work-phase" role="status">{workStatus}</div>}
++    {active && workStatus && <ActivityStatus activity={describeActivity(workStatus, messages, live)} seed={turn.id} />}
+   </article>;
+ }
+ const MemoTurn = memo(TurnView);
+--- a/product/apps/desktop/src/NativeConversation.test.tsx
++++ b/product/apps/desktop/src/NativeConversation.test.tsx
+@@ -159,7 +159,7 @@
+   expect(screen.queryByText("0 tools")).toBeNull();
+   for (const status of ["Preparing request", "Waiting for model", "Thinking", "Stopping response…"]) {
+     view.rerender(<TurnView {...props} active workStatus={status} />);
+-    expect(screen.getByRole("status").textContent).toBe(status);
++    expect(screen.getByRole("status").getAttribute("aria-label")).toBe(status);
+   }
+   view.rerender(<TurnView {...props} active={false} workStatus="Thinking" />);
+   expect(screen.queryByRole("status")).toBeNull();
+@@ -174,7 +174,7 @@
+   expect(row.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+   expect(view.container.querySelector('.response-work.is-working')).toBeTruthy();
+   fireEvent.click(screen.getByRole("button", { name: /Working.*1 tool/ }));
+-  expect(screen.getByRole("status").textContent).toBe("Thinking");
++  expect(screen.getByRole("status", { name: "Thinking" }).querySelector(".ag1-activity-word")).not.toBeNull();
+ });
+ test("a new thinking generation appears below old work and loses its live label when text arrives", () => {
+   const run = vi.fn(async () => null);
+@@ -184,7 +184,7 @@
+   const view = render(<TurnView {...props} live={live} />);
+   const current = screen.getByRole("button", { name: "Thinking" });
+   expect(screen.getByRole("button", { name: /Read notes.md/ }).compareDocumentPosition(current) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+-  expect(screen.queryByRole("status")).toBeNull();
++  expect(screen.getByRole("status", { name: "Thinking" }).querySelector(".ag1-activity-mark")).not.toBeNull();
+   fireEvent.click(current);
+   view.rerender(<TurnView {...props} live={{ ...live, blocks: [...live.blocks, { kind: "text", text: "Answer is arriving" }] }} />);
+   expect(screen.queryByRole("button", { name: "Thinking" })).toBeNull();
+--- /dev/null
++++ b/product/apps/desktop/src/workingVerbs.ts
+@@ -0,0 +1,87 @@
++/** Presentation-only vocabulary. Keep words short; never imply success, approval,
++ * deployment or a particular Git operation. Pools follow observed activity,
++ * never guesses from the user's prompt. Add/remove phrases here independently
++ * of the animation and native protocol. */
++export const WORKING_VERBS = {
++  thinking: [
++    "Noodling", "Mulling", "Cogitating", "Scheming", "Reckoning", "Deliberating",
++    "Untangling", "Connecting dots", "Brainstorming", "Hypothesising", "Modelling",
++    "Puzzling", "Ruminating", "Contemplating", "Musing", "Pondering", "Reflecting",
++    "Turning the gears", "Chewing it over", "Letting it marinate", "Plotting a course",
++    "Following a hunch", "Chasing a thought", "Joining the dots", "Wrestling with it",
++    "Thinking it through", "Teasing it apart", "Looking for an angle", "Making connections",
++    "Mulling it over", "Working backwards", "Turning it over", "Reasoning", "Percolating",
++  ],
++  reading: [
++    "Perusing", "Skimming", "Rummaging", "Peering inside", "Sifting through", "Unpacking",
++    "Spelunking", "Deciphering", "Absorbing", "Taking it in", "Leafing through",
++    "Combing through", "Reading between lines", "Exploring", "Surveying", "Taking stock",
++    "Getting acquainted", "Looking under the hood", "Poking around", "Scouting",
++    "Following the trail", "Dusting off", "Turning pages", "Lifting the lid",
++    "Having a look", "Eyeing the details", "Browsing", "Studying", "Inspecting",
++    "Getting the lay of things", "Unrolling the map", "Following the thread",
++  ],
++  searching: [
++    "Hunting", "Trawling", "Prospecting", "Sniffing around", "Tracking down", "Digging",
++    "Fossicking", "Combing through", "Casting a net", "Looking around", "Chasing leads",
++    "Following clues", "Seeking", "Scouring", "Sleuthing", "Nosing around",
++    "Rooting around", "Checking the corners", "Panning for gold", "Sifting the haystack",
++    "Looking for needles", "Going down the rabbit hole", "Turning over stones",
++    "Widening the net", "Fishing for clues", "Tracing leads", "On the lookout",
++    "Hunting for breadcrumbs", "Searching", "Scoping things out",
++  ],
++  writing: [
++    "Composing", "Drafting", "Weaving", "Shaping words", "Putting pen to paper",
++    "Scrawling", "Scribbling", "Etching", "Authoring", "Sketching", "Spinning a thread",
++    "Laying it out", "Putting it together", "Finding the words", "Hammering it out",
++    "Filling the page", "Getting it down", "Writing it up", "Stringing it together",
++    "Laying down lines", "Making a mark", "Painting with words", "Knitting it together",
++    "Assembling the pieces", "Bringing it together", "Crafting", "Writing", "Inking",
++  ],
++  editing: [
++    "Tinkering", "Stitching", "Mending", "Patching", "Tweaking", "Reshaping", "Sculpting",
++    "Wrangling", "Sanding", "Buffing", "Finessing", "Reworking", "Splicing", "Pruning",
++    "Tidying", "Reshuffling", "Nudging into shape", "Rejigging", "Fine-tuning",
++    "Turning the screws", "Tightening things up", "Moving the pieces", "Trimming",
++    "Smoothing the edges", "Giving it a polish", "Adjusting", "Tuning up", "Refining",
++    "Straightening out", "Making alterations", "Doing some tailoring", "Kneading",
++  ],
++  building: [
++    "Baking", "Forging", "Smelting", "Conjuring", "Assembling", "Fusing", "Tempering",
++    "Distilling", "Casting", "Cooking it up", "Firing the kiln", "Warming the forge",
++    "Turning up the heat", "Working the anvil", "Mixing the ingredients", "Building",
++    "Bringing it to life", "Putting pieces together", "Making something", "In the workshop",
++    "Cooking with gas", "Stacking the bricks", "Raising the frame", "Working the recipe",
++  ],
++  testing: [
++    "Probing", "Poking", "Checking", "Exercising", "Bug-hunting", "Kicking the tyres",
++    "Giving it a whirl", "Taking it for a spin", "Trying it out", "Shaking it down",
++    "Checking the seams", "Looking for cracks", "Rattling the cage", "Tugging the threads",
++    "Testing the waters", "Checking the wiring", "Poking the edges", "Challenging",
++    "Checking the fit", "Turning it over", "Walking the checks", "Doing the rounds",
++    "Putting it to work", "Checking the corners", "Trying the handles", "Testing",
++  ],
++  executing: [
++    "Cranking", "Pulling levers", "Sending it", "Kicking off", "Making moves",
++    "Working the gears", "Letting it rip", "Getting it rolling", "Setting it in motion",
++    "Turning the crank", "Running the machinery", "Doing the legwork", "Making it happen",
++    "Working away", "Rolling along", "Getting on with it", "Taking action",
++    "Putting things in motion", "Keeping it moving", "Working the controls",
++    "Running the play", "Giving it a go", "Getting stuck in", "Operating",
++  ],
++  general: [
++    "Cooking", "Doing the thing", "Vibing", "Figuring it out", "Making headway",
++    "Working on it", "Chipping away", "Getting into it", "Finding a way", "Keeping at it",
++    "Getting things together", "Moving things along", "Getting organised", "Gearing up",
++    "Rolling up the sleeves", "Putting things in order", "Getting situated", "Setting the stage",
++    "Lining things up", "Warming the braincells", "Gathering the threads", "Taking shape",
++    "Working some magic", "Making preparations",
++  ],
++} as const;
++export type WorkingVerbKind = keyof typeof WORKING_VERBS;
++export function pickWorkingVerb(kind: WorkingVerbKind, seed: string): string {
++  let hash = 2166136261;
++  for (let i = 0; i < seed.length; i++) hash = Math.imul(hash ^ seed.charCodeAt(i), 16777619) >>> 0;
++  const words = WORKING_VERBS[kind];
++  return words[hash % words.length];
++}
+--- /dev/null
++++ b/product/apps/desktop/src/ActivityMark.tsx
+@@ -0,0 +1,9 @@
++import "./activityMotion.css";
++
++/** AG1's activity mark. Change the stroke, rotations and viewBox here; motion,
++ * size and theme live in activityMotion.css. No timers or native dependencies. */
++export function ActivityMark({ paused = false }: { paused?: boolean }) {
++  return <svg className="ag1-activity-mark" data-paused={paused || undefined} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
++    {[0, 120, 240].map(angle => <g key={angle} transform={`rotate(${angle} 12 12)`}><path d="M 9 5 L 15 5" /></g>)}
++  </svg>;
++}
+--- /dev/null
++++ b/product/apps/desktop/src/activityMotion.css
+@@ -0,0 +1,51 @@
++/* Motion tuning surface: adjust these fallbacks or override the variables on
++   an ActivityStatus ancestor. The SVG shape itself is in ActivityMark.tsx.
++   Both animations use one cycle; no JS frame loop or polling is involved. */
++.ag1-activity-status {
++  display: flex;
++  align-items: center;
++  gap: var(--ag1-activity-gap, 9px);
++  min-height: 24px;
++  color: var(--muted-foreground);
++}
++.ag1-activity-mark {
++  width: var(--ag1-activity-size, 20px);
++  height: var(--ag1-activity-size, 20px);
++  flex: 0 0 var(--ag1-activity-size, 20px);
++  overflow: visible;
++  color: var(--foreground);
++}
++.ag1-activity-mark path {
++  fill: none;
++  stroke: currentColor;
++  stroke-width: var(--ag1-activity-stroke, 2.2px);
++  stroke-linecap: round;
++  opacity: .35;
++  animation: ag1-stroke-breathe var(--ag1-activity-cycle, 2400ms) ease-in-out infinite;
++}
++.ag1-activity-mark g:nth-child(2) path { animation-delay: calc(var(--ag1-activity-cycle, 2400ms) / -3); }
++.ag1-activity-mark g:nth-child(3) path { animation-delay: calc(var(--ag1-activity-cycle, 2400ms) * -2 / 3); }
++@keyframes ag1-stroke-breathe {
++  0%, 65%, 100% { opacity: .35; transform: translateY(0); }
++  25% { opacity: 1; transform: translateY(var(--ag1-activity-travel, -.7px)); }
++}
++.ag1-activity-word { color: var(--muted-foreground); }
++@supports ((background-clip: text) or (-webkit-background-clip: text)) {
++  .ag1-activity-word {
++    background-image: linear-gradient(105deg, var(--muted-foreground) 35%, var(--foreground) 50%, var(--muted-foreground) 65%);
++    background-size: 250% 100%;
++    background-clip: text;
++    -webkit-background-clip: text;
++    -webkit-text-fill-color: transparent;
++    animation: ag1-word-shimmer var(--ag1-activity-cycle, 2400ms) linear infinite;
++  }
++}
++@keyframes ag1-word-shimmer {
++  0%, 12% { background-position: 150% 0; }
++  88%, 100% { background-position: -50% 0; }
++}
++.ag1-activity-mark[data-paused] path { animation: none; opacity: .7; }
++@media (prefers-reduced-motion: reduce), (forced-colors: active) {
++  .ag1-activity-mark path { animation: none; transform: none; opacity: .8; }
++  .ag1-activity-word { animation: none; background: none; -webkit-text-fill-color: currentColor; }
++}
+--- /dev/null
++++ b/product/apps/desktop/src/ActivityStatus.tsx
+@@ -0,0 +1,62 @@
++import type { ClientMessage, MessageBlock } from "./generated/protocol";
++import { ActivityMark } from "./ActivityMark";
++import { pickWorkingVerb, type WorkingVerbKind } from "./workingVerbs";
++
++type Call = Extract<MessageBlock, { kind: "tool" }>;
++export type ActivityDescription = { kind?: WorkingVerbKind; label: string; key: string; paused?: boolean };
++function commandKind(command: unknown): WorkingVerbKind {
++  if (typeof command !== "string") return "executing";
++  // Deliberately conservative: a mention in an echo, a filename or user prose
++  // must not make AG1 claim that it is running tests or building software.
++  const text = command.trim().replace(/^(?:[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/, "");
++  if (/^(?:(?:cargo|go)\s+test\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|check)(?:\s|:|$)|(?:pytest|vitest|jest|ctest)(?:\s|$)|python(?:3)?\s+(?:-m\s+(?:pytest|unittest)\b|(?:[^\s/]+\/)*(?:verify|test(?:_[\w-]+)?)\.py(?:\s|$)))/.test(text)) return "testing";
++  if (/^(?:(?:cargo|go)\s+build\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build(?:\s|:|$)|cmake\s+--build\b|(?:make|ninja)(?:\s|$))/.test(text)) return "building";
++  return "executing";
++}
++function toolKind(call: Call): WorkingVerbKind {
++  const args = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments) ? call.arguments : {};
++  switch (call.name) {
++    case "webSearch": case "grep": case "find": return "searching";
++    case "inspect": return args.query || args.glob ? "searching" : "reading";
++    case "read": case "ls": case "glob": case "webFetch": case "repo": return "reading";
++    case "write": case "append": return "writing";
++    case "edit": case "editApply": case "apply_patch": case "str_replace_editor": return "editing";
++    case "editPreview": return "reading";
++    case "check": return "testing";
++    case "bash": case "exec": case "runCommand": return commandKind(args.command ?? args.cmd);
++    default: return "executing";
++  }
++}
++const labels: Record<WorkingVerbKind, string> = {
++  thinking: "Thinking", reading: "Reading", searching: "Searching", writing: "Writing",
++  editing: "Editing", building: "Building", testing: "Running tests", executing: "Running tools", general: "Working",
++};
++/** Inputs are native display state and actual unresolved tool calls. Never
++ * classify from the user's prompt or carry a completed tool into the next wait. */
++export function describeActivity(status: string, messages: ClientMessage[], live?: { id: string; committed: boolean; blocks: MessageBlock[] }): ActivityDescription {
++  const generation = live?.id ?? messages.filter(m => m.role === "assistant").at(-1)?.id ?? "starting";
++  if (status === "Thinking" || status === "Generating") {
++    const output = live && !live.committed ? live.blocks.filter(b => b.kind === "text" || b.kind === "thinking").at(-1) : undefined;
++    const kind = output?.kind === "text" && output.text.trim() ? "writing" : status === "Thinking" ? "thinking" : "writing";
++    return { kind, label: kind === "writing" ? "Generating response" : "Thinking", key: generation };
++  }
++  if (status === "Preparing request" || status === "Generating operation" || status === "Processing prompt") {
++    return { kind: status === "Generating operation" ? "writing" : "general", label: status, key: generation };
++  }
++  if (status === "Running tools") {
++    const complete = new Set(messages.filter(m => m.role === "toolResult").map(m => m.tool?.call_id));
++    const call = messages.filter(m => m.role === "assistant").flatMap(m => m.blocks.filter((b): b is Call => b.kind === "tool")).find(c => !complete.has(c.call_id));
++    const kind = call ? toolKind(call) : "executing";
++    return { kind, label: labels[kind], key: call?.call_id ?? generation };
++  }
++  // Loading, queueing, first-output waits, stopping, approvals and errors stay
++  // literal. In particular, 'waiting' is not evidence of prefill progress.
++  return { label: status, key: status, paused: /waiting for you|approval|failed|error|queued/i.test(status) };
++}
++export function ActivityStatus({ activity, seed }: { activity: ActivityDescription; seed: string }) {
++  const text = activity.kind ? `${pickWorkingVerb(activity.kind, `${seed}|${activity.key}|${activity.kind}`)}…` : activity.label;
++  return <div className="work-phase ag1-activity-status" role="status" aria-label={activity.label} aria-live="polite" aria-atomic="true" data-activity={activity.kind ?? "literal"} title={activity.label}>
++    <ActivityMark paused={activity.paused} />
++    <span className={activity.kind ? "ag1-activity-word" : undefined}>{text}</span>
++  </div>;
++}
+--- /dev/null
++++ b/product/apps/desktop/src/ActivityStatus.test.tsx
+@@ -0,0 +1,63 @@
++import { afterEach, expect, test } from "vitest";
++import { cleanup, render, screen } from "@testing-library/react";
++import { ActivityStatus, describeActivity } from "./ActivityStatus";
++import { WORKING_VERBS, pickWorkingVerb } from "./workingVerbs";
++import type { ClientMessage } from "./generated/protocol";
++afterEach(cleanup);
++const call = (name: string, args: Record<string, string> = {}): ClientMessage => ({ id: "a", role: "assistant", blocks: [{ kind: "tool", call_id: "c", name, arguments: args }] });
++
++test("varied vocabulary remains stable for the same operation and independent of frames", () => {
++  expect(Object.values(WORKING_VERBS).flat().length).toBeGreaterThan(240);
++  for (const kind of Object.keys(WORKING_VERBS) as Array<keyof typeof WORKING_VERBS>) {
++    expect(new Set(WORKING_VERBS[kind]).size).toBe(WORKING_VERBS[kind].length);
++    const samples = Array.from({ length: 100 }, (_, i) => pickWorkingVerb(kind, `turn-${i}`));
++    expect(new Set(samples).size).toBeGreaterThan(10);
++    expect(pickWorkingVerb(kind, "same")).toBe(pickWorkingVerb(kind, "same"));
++  }
++  const activity = { kind: "thinking" as const, label: "Thinking", key: "generation-1" };
++  const view = render(<ActivityStatus activity={activity} seed="turn-1" />);
++  const status = screen.getByRole("status", { name: "Thinking" }), text = status.textContent;
++  for (let i = 0; i < 5; i++) view.rerender(<ActivityStatus activity={{ ...activity }} seed="turn-1" />);
++  expect(status.textContent).toBe(text);
++  expect(status.querySelectorAll(".ag1-activity-mark path")).toHaveLength(3);
++  expect(status.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
++});
++
++test("literal operational states never become a whimsical claim", () => {
++  for (const label of ["Waiting for model", "Queued · waiting for model", "Loading Qwen model", "Verifying Qwen files", "Waiting for you", "Stopping response…", "Connection failed"]) {
++    const activity = describeActivity(label, [call("edit")]);
++    const view = render(<ActivityStatus activity={activity} seed="turn" />);
++    expect(screen.getByRole("status", { name: label }).textContent).toBe(label);
++    expect(view.container.querySelector(".ag1-activity-word")).toBeNull();
++    if (/Queued|Waiting for you|failed/.test(label)) expect(view.container.querySelector("[data-paused]")).not.toBeNull();
++    view.unmount();
++  }
++});
++
++test("only unresolved tool activity supplies a tool verb, never completed searches or prompt guesses", () => {
++  expect(describeActivity("Running tools", [call("webSearch")]).kind).toBe("searching");
++  expect(describeActivity("Running tools", [call("webFetch")]).kind).toBe("reading");
++  expect(describeActivity("Running tools", [call("inspect", { query: "foo" })]).kind).toBe("searching");
++  expect(describeActivity("Running tools", [call("edit")]).kind).toBe("editing");
++  expect(describeActivity("Generating operation", [call("edit")]).kind).toBe("writing");
++  const done: ClientMessage = { id: "r", role: "toolResult", tool: { name: "webSearch", call_id: "c", failed: false }, blocks: [] };
++  expect(describeActivity("Running tools", [call("webSearch"), done]).kind).toBe("executing");
++  expect(describeActivity("Waiting for model", [call("webSearch"), done]).kind).toBeUndefined();
++  expect(describeActivity("Thinking", [call("webSearch"), done]).kind).toBe("thinking");
++});
++
++test("build and test labels use actual command positions, with conservative fallback", () => {
++  for (const command of ["cargo test --lib", "npm run test", "python verify.py", "pytest -q", "CARGO_BUILD_JOBS=6 cargo test --lib"]) expect(describeActivity("Running tools", [call("bash", { command })]).kind).toBe("testing");
++  for (const command of ["cargo build --release", "npm run build", "cmake --build build"]) expect(describeActivity("Running tools", [call("bash", { command })]).kind).toBe("building");
++  for (const command of ["echo cargo test", "cat test.py", "git status", "python application.py", "echo 'npm run build'", "cd a && something-unclassified"]) expect(describeActivity("Running tools", [call("bash", { command })]).kind).toBe("executing");
++});
++
++test("streamed text updates preserve the chosen verb and stopping takes precedence", () => {
++  const live = { id: "g", committed: false, blocks: [{ kind: "thinking" as const, text: "A" }] };
++  const first = describeActivity("Thinking", [], live);
++  expect(describeActivity("Thinking", [], { ...live, blocks: [{ kind: "thinking", text: "More thought tokens" }] })).toEqual(first);
++  const text = { ...live, blocks: [{ kind: "text" as const, text: "Answer text" }] };
++  expect(describeActivity("Thinking", [], text).kind).toBe("writing");
++  expect(describeActivity("Stopping response…", [], text).label).toBe("Stopping response…");
++  expect(describeActivity("Stopping response…", [], text).kind).toBeUndefined();
++});
+--- /dev/null
++++ b/product/apps/desktop/activity-preview.html
+@@ -0,0 +1,5 @@
++<!doctype html>
++<html lang="en" class="dark">
++  <head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>AG1 activity preview</title></head>
++  <body><div id="root"></div><script type="module" src="/src/ActivityStatus.preview.tsx"></script></body>
++</html>
+--- /dev/null
++++ b/product/apps/desktop/src/ActivityStatus.preview.tsx
+@@ -0,0 +1,39 @@
++/** Development-only entry: /activity-preview.html on the Vite dev server.
++ * Not imported by the application or included in the production entry. */
++import { useState, type CSSProperties } from "react";
++import { createRoot } from "react-dom/client";
++import { ActivityStatus } from "./ActivityStatus";
++import { TurnView } from "./NativeConversation";
++import { WORKING_VERBS, type WorkingVerbKind } from "./workingVerbs";
++import type { ClientMessage } from "./generated/protocol";
++import "./dyad.css";
++import "./app.css";
++import "./redesign.css";
++import "./activityPreview.css";
++
++const kinds = Object.keys(WORKING_VERBS) as WorkingVerbKind[];
++const run = async () => null;
++const messages: ClientMessage[] = [
++  { id: "preview-user", role: "user", blocks: [{ kind: "text", text: "Find the answer, then put the changes through their paces." }] },
++  { id: "preview-assistant", role: "assistant", blocks: [{ kind: "text", text: "I’ve checked the sources. I’m working through the next step." }, { kind: "tool", name: "read", call_id: "read", arguments: { path: "notes.md" } }] },
++  { id: "preview-result", role: "toolResult", tool: { name: "read", call_id: "read", failed: false }, blocks: [{ kind: "text", text: "Example notes." }] },
++];
++function Preview() {
++  const [seed, setSeed] = useState(1), [cycle, setCycle] = useState(2400), [dark, setDark] = useState(true), [paused, setPaused] = useState(false), [status, setStatus] = useState("Thinking");
++  return <main className="activity-preview" data-paused={paused || undefined} style={{ "--ag1-activity-cycle": `${cycle}ms` } as CSSProperties}>
++    <header><h1>AG1 activity studio</h1><p>Simulated activity. No models, tools or native connection.</p></header>
++    <div className="activity-preview-controls">
++      <button onClick={() => setSeed(s => s + 1)}>Next verbs</button>
++      <button onClick={() => { setDark(!dark); document.documentElement.classList.toggle("dark", !dark); document.documentElement.dataset.theme = !dark ? "dark" : "light"; }}>{dark ? "Light theme" : "Dark theme"}</button>
++      <button aria-pressed={paused} onClick={() => setPaused(!paused)}>{paused ? "Resume motion" : "Pause motion"}</button>
++      <label>Cycle <input type="range" min="1400" max="4400" step="100" value={cycle} onChange={e => setCycle(Number(e.target.value))} />{(cycle / 1000).toFixed(1)}s</label>
++    </div>
++    <div className="activity-preview-grid">{kinds.map(kind => <section key={kind}><small>{kind} · {WORKING_VERBS[kind].length} phrases</small><ActivityStatus activity={{ kind, label: kind, key: "preview" }} seed={String(seed)} /></section>)}</div>
++    <section className="activity-preview-conversation">
++      <label>Conversation phase <select value={status} onChange={e => setStatus(e.target.value)}>{["Thinking", "Generating", "Preparing request", "Waiting for model", "Queued · waiting for model", "Loading Qwen model", "Waiting for you", "Stopping response…"].map(s => <option key={s}>{s}</option>)}</select></label>
++      <TurnView turn={{ id: `preview-${seed}`, messages }} active run={run} workTime="12s" workStatus={status} live={status === "Thinking" || status === "Generating" ? { id: "preview-live", committed: false, blocks: status === "Thinking" ? [{ kind: "thinking", text: "This is a simulated thought for checking the layout." }] : [{ kind: "text", text: "A response is arriving. The animated mark stays beneath the newest content." }] } : undefined} />
++    </section>
++    <footer>Edit ActivityMark.tsx for the shape, activityMotion.css for motion, and workingVerbs.ts for words. The application entry does not include this studio.</footer>
++  </main>;
++}
++createRoot(document.getElementById("root")!).render(<Preview />);
+--- /dev/null
++++ b/product/apps/desktop/src/activityPreview.css
+@@ -0,0 +1,16 @@
++.activity-preview { max-width: 980px; margin: 32px auto; padding: 0 24px 40px; color: var(--foreground); }
++.activity-preview h1 { margin: 0; font-size: 23px; font-weight: 550; }
++.activity-preview header p, .activity-preview footer { color: var(--muted-foreground); font-size: 13px; }
++.activity-preview-controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 24px 0; }
++.activity-preview-controls button, .activity-preview select { padding: 7px 11px; border: 1px solid var(--border); border-radius: 8px; background: var(--card); color: var(--foreground); font: inherit; font-size: 13px; }
++.activity-preview label { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted-foreground); }
++.activity-preview input[type=range] { width: 110px; accent-color: var(--muted-foreground); }
++.activity-preview-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 12px; }
++.activity-preview-grid section { padding: 16px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
++.activity-preview-grid small { display: block; margin-bottom: 10px; color: var(--muted-foreground); font-size: 11px; }
++.activity-preview .ag1-activity-status { font-size: 15px; }
++.activity-preview-conversation { margin: 24px 0; padding-top: 18px; border-top: 1px solid var(--border); }
++.activity-preview-conversation > label { margin-bottom: 24px; }
++.activity-preview[data-paused] .ag1-activity-word, .activity-preview[data-paused] .ag1-activity-mark path { animation-play-state: paused; }
++@media(max-width:650px) { .activity-preview { margin-top: 20px; padding-inline: 16px; } .activity-preview-grid { grid-template-columns: repeat(2,minmax(0,1fr)); } }
++@media(max-width:390px) { .activity-preview-grid { grid-template-columns: 1fr; } }
+--- /dev/null
++++ b/product/apps/desktop/ACTIVITY-DESIGN.md
+@@ -0,0 +1,33 @@
++# Iterating on AG1's activity indicator
++
++Run the desktop Vite development server with the repository's Node 24 toolchain, then open `/activity-preview.html` (default `http://127.0.0.1:1420/activity-preview.html`). The studio uses simulated activity and the real UI components; it needs no native bridge, model or GPU. It is a separate development entry and is not included in the production app entry.
++
++The studio has dark/light themes, a motion-cycle slider, Pause/Resume, Next verbs and a conversation-phase selector. Its conversation example exercises the actual `TurnView`, including the live status below streamed output. Use browser reduced-motion emulation to inspect the fully static version.
++
++## Small, independent editing surfaces
++
++- `src/ActivityMark.tsx`: SVG geometry only. The initial mark has three short rounded strokes at 0°, 120° and 240° around an open center. Change the path, angles or viewBox here.
++- `src/activityMotion.css`: animation, theme colors, sizing and accessibility fallbacks. Shared cycle coordinates the travelling highlight with the word shimmer. No frame timer, state update or native call drives the motion.
++- `src/workingVerbs.ts`: 254 phrase entries grouped by actual activity. Add or remove phrases without touching components or the native protocol. Selection is deterministic from turn/operation/category identity, not elapsed time or streamed tokens.
++- `src/ActivityStatus.tsx`: native display-state mapping, conservative tool classification and accessible literal status. Keep this independent from visual experiments.
++- `src/ActivityStatus.preview.tsx`, `src/activityPreview.css`, `activity-preview.html`: development studio only.
++
++CSS variables can be overridden on the status or any ancestor:
++
++| Variable | Initial value | Purpose |
++|---|---|---|
++| `--ag1-activity-cycle` | `2400ms` | Shared stroke/shimmer cycle |
++| `--ag1-activity-size` | `20px` | Fixed mark footprint |
++| `--ag1-activity-stroke` | `2.2px` | Line thickness |
++| `--ag1-activity-travel` | `-.7px` | Radial stroke movement |
++| `--ag1-activity-gap` | `9px` | Mark-to-label spacing |
++
++Colors use the existing `--muted-foreground` and `--foreground` theme values. There is no green/success accent. Reduced motion and forced colors disable both animations and leave readable text plus a static mark. Paused/approval/error states do not pulse.
++
++## Preserve truthful status
++
++Whimsical phrases belong to real thinking, output generation, request preparation or unresolved tool execution. Do not infer an action from the user's prompt, a completed historical tool call or text inside `echo`. Shell classification is intentionally conservative; unfamiliar commands get a generic executing phrase.
++
++Keep loading, verification, queueing, awaiting-first-output, stopping, approvals and errors literal. `Waiting for model` alone does not prove prompt processing and must not be labelled as measured reading progress. The shimmer conveys activity, never completion percentage, successful checks or elapsed-time progress. The top response timer and completed tool labels retain their existing wording.
++
++Run `npm test -- --run src/ActivityStatus.test.tsx src/NativeConversation.test.tsx` plus the TypeScript/Vite build after behavior changes. For animation-only changes, inspect dark/light themes, a narrow viewport, reduced motion and frozen animation frames; ensure the mark footprint and text baseline do not move. Final implementation evidence is linked from `implementation/README.md` at repository root.

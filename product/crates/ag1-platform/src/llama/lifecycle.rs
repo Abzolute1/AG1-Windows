@@ -20,11 +20,18 @@ pub struct ModelIdentity {
 }
 impl ModelIdentity {
     pub fn matches(&self, plan: &LaunchPlan) -> bool {
-        let model = self.path.as_deref() == Some(&plan.model_path)
-            || self.alias.as_deref() == Some(&plan.model_id)
-            || self.model.as_ref().is_some_and(|m| {
-                m == &plan.model_id || m.ends_with(&format!("/{}", plan.model_id))
-            });
+        // A matching alias must never override a contradictory weight path.
+        // Some llama.cpp versions omit model_path; only then use the identity
+        // exposed by that version's props response.
+        let model = if let Some(path) = &self.path {
+            path == &plan.model_path
+        } else if let Some(alias) = &self.alias {
+            alias == &plan.model_id
+        } else {
+            self.model
+                .as_ref()
+                .is_some_and(|m| m == &plan.model_id || m == &plan.model_path)
+        };
         model
             && self.context_window.is_some_and(|loaded| {
                 loaded >= plan.requested_context && loaded - plan.requested_context < 1024
@@ -44,6 +51,10 @@ pub enum Observation {
 pub trait RuntimeHost {
     type Handle;
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError>;
+    fn verify_progress(&mut self, materials: &[Material], _progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+        self.verify_materials(materials)
+    }
+    fn loading_phase(&mut self, _handle: &Self::Handle) -> Option<&'static str> { None }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError>;
     fn spawn(&mut self, plan: &LaunchPlan) -> Result<Self::Handle, DomainError>;
     /// Verifies both process lifetime and executable identity; false means exited.
@@ -78,6 +89,15 @@ impl<H: RuntimeHost> RuntimeController<H> {
     }
     pub fn owns_process(&self) -> bool {
         self.owned.is_some()
+    }
+    pub fn loading_phase(&mut self) -> Option<&'static str> {
+        self.host.loading_phase(self.owned.as_ref()?)
+    }
+    pub fn owned_alive(&mut self) -> Result<bool, DomainError> {
+        match self.owned.as_ref() {
+            Some(handle) => self.host.owned_alive(handle),
+            None => Ok(false),
+        }
     }
     pub fn host(&self) -> &H {
         &self.host
@@ -152,7 +172,7 @@ impl<H: RuntimeHost> RuntimeController<H> {
         if seal != plan.plan_sha256 {
             return Err(DomainError::Conflict);
         }
-        self.host.verify_materials(&plan.materials)?;
+        self.host.verify_materials(&plan.runtime_materials()?)?;
         if self.host.observe(plan)? != Observation::Vacant {
             return Err(DomainError::Conflict);
         }
@@ -246,7 +266,9 @@ impl<H: RuntimeHost> RuntimeHandoff<H> {
             {
                 return Err(DomainError::Conflict);
             }
-            self.controller.host.verify_materials(&plan.materials)?;
+            self.controller
+                .host
+                .verify_materials(&plan.runtime_materials()?)?;
             self.controller.poll_ready(plan)?;
             Ok(())
         })();

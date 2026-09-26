@@ -1,0 +1,25 @@
+import { useEffect, useRef, useState } from "react";
+import { api, errorMessage } from "./bridge";
+import { GitHubAction } from "./GitHubAction";
+import { Source } from "./GitHubWorkbench";
+import { Markdown } from "./Markdown";
+function Form({ repo, item, scope }: { repo: string; item?: any; scope: string }) {
+  const [tag, setTag] = useState(item?.tag_name ?? ""), [target, setTarget] = useState(item?.target_commitish ?? ""), [name, setName] = useState(item?.name ?? ""), [body, setBody] = useState(item?.body ?? ""), [draft, setDraft] = useState(item ? !!item.draft : true), [prerelease, setPrerelease] = useState(!!item?.prerelease);
+  return <GitHubAction title={item ? "Edit release" : "Create release"} scope={scope} reviewLabel="Review release change" request={() => {
+    if (!tag.trim()) throw new Error("Enter the release tag.");
+    return { operation: item ? "releases.update" : "releases.create", repo, parameters: item ? { release_id: item.id } : {}, body: { tag_name: tag, name, body, draft, prerelease, ...(!item && target.trim() ? { target_commitish: target } : {}) } };
+  }}><label>Release tag<input required maxLength={255} value={tag} onChange={e => setTag(e.target.value)} /></label>{!item && <label>Target branch or commit<input maxLength={255} value={target} onChange={e => setTarget(e.target.value)} placeholder="Repository default branch if omitted" /></label>}<label>Release name<input maxLength={256} value={name} onChange={e => setName(e.target.value)} /></label><label>Release notes<textarea rows={6} maxLength={60000} value={body} onChange={e => setBody(e.target.value)} /></label><label className="checkbox-label"><input type="checkbox" checked={draft} onChange={e => setDraft(e.target.checked)} />Keep as draft</label><label className="checkbox-label"><input type="checkbox" checked={prerelease} onChange={e => setPrerelease(e.target.checked)} />Mark as prerelease</label><p>{draft ? "The release remains a draft." : "This publishes the release and may notify watchers or trigger automation."} Updating fields may replace concurrent edits. Immutable release rules and repository permissions still apply.</p></GitHubAction>;
+}
+export function GitHubRelease({ repo, id, scope }: { repo: string; id?: number; scope: string }) {
+  const [item, setItem] = useState<any>(null), [error, setError] = useState(""), [busy, setBusy] = useState(false), [version, setVersion] = useState(0); const epoch = useRef(0);
+  async function read() {
+    if (!id) return;
+    const ticket = ++epoch.current; setBusy(true); setError(""); setItem(null);
+    try { const response = await api.github("api_read", { operation: "releases.get", repo, parameters: { release_id: id } }); if (ticket !== epoch.current) return; if (!response.ok) throw new Error(response.error?.message ?? "Release detail failed."); const data = response.value?.data; if (!data || data.id !== id || typeof data.tag_name !== "string") throw new Error("Invalid release detail target."); setItem(data); setVersion(v => v + 1); }
+    catch (e) { if (ticket === epoch.current) setError(errorMessage(e)); }
+    finally { if (ticket === epoch.current) setBusy(false); }
+  }
+  useEffect(() => { setItem(null); setError(""); void read(); return () => { ++epoch.current; }; }, [repo, id, scope]);
+  if (!id) return <Form key={`${repo}:${scope}`} repo={repo} scope={`${repo}:${scope}:new-release`} />;
+  return <section className="github-release" aria-label="Release details"><button className="outline-button" disabled={busy} onClick={() => void read()}>Refresh release detail</button>{busy && <p role="status">Loading current release…</p>}{error && <p role="alert">{error}</p>}{item && <><h4>{String(item.name ?? item.tag_name)}</h4><p>{item.draft ? "Draft" : "Published"} · {item.prerelease ? "Prerelease" : "Stable release"} · {String(item.tag_name)}{item.immutable ? " · Immutable" : ""}</p><Markdown text={String(item.body ?? "").slice(0, 65536)} />{String(item.body ?? "").length > 65536 && <p>Showing the first 65,536 characters. Complete notes are available in the paged detail below.</p>}<details><summary>Edit this release</summary><Form key={`${repo}:${id}:${version}`} repo={repo} item={item} scope={`${scope}:${repo}:${id}:${version}`} /></details><details><summary>Complete release detail</summary><Source value={item} label="Release detail response" /></details></>}</section>;
+}

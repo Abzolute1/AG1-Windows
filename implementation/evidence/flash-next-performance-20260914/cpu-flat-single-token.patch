@@ -1,0 +1,77 @@
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1557,6 +1557,42 @@
+     return ptr;
+ }
+ 
++static void ggml_compute_forward_mul_mat_id_single_token(
++        const struct ggml_compute_params * params,
++              struct ggml_tensor * dst) {
++    const struct ggml_tensor * src0 = dst->src[0];
++    const struct ggml_tensor * src1 = dst->src[1];
++    const struct ggml_tensor * ids  = dst->src[2];
++
++    const enum ggml_type dot_type = type_traits_cpu[src0->type].vec_dot_type;
++    ggml_vec_dot_t const vec_dot = type_traits_cpu[src0->type].vec_dot;
++    const size_t row_size = ggml_row_size(dot_type, src1->ne[0]);
++    const bool contiguous_input = ggml_is_contiguous(src1) || src1->type != dot_type;
++    const char * wdata = src1->type == dot_type ? src1->data : params->wdata;
++
++    const int64_t blocks_per_slot = (src0->ne[1] + 15) / 16;
++    const int64_t total_blocks = ids->ne[0] * blocks_per_slot;
++    const int64_t first = total_blocks * params->ith / params->nth;
++    const int64_t last  = total_blocks * (params->ith + 1) / params->nth;
++    float tmp[16];
++
++    for (int64_t block = first; block < last; ++block) {
++        const int64_t slot = block / blocks_per_slot;
++        const int64_t row = (block % blocks_per_slot) * 16;
++        const int64_t end = MIN(row + 16, src0->ne[1]);
++        const int32_t expert = *(const int32_t *) ((const char *) ids->data + slot * ids->nb[0]);
++        GGML_ASSERT(expert >= 0 && expert < src0->ne[2]);
++        const int64_t input_slot = slot % src1->ne[1];
++        const char * weights = (const char *) src0->data + expert * src0->nb[2];
++        const char * activation = wdata + input_slot * (contiguous_input ? row_size : src1->nb[1]);
++        float * output = (float *) ((char *) dst->data + slot * dst->nb[1]);
++        for (int64_t r = row; r < end; ++r) {
++            vec_dot(src0->ne[0], &tmp[r - row], 0, weights + r * src0->nb[1], 0, activation, 0, 1);
++        }
++        memcpy(output + row, tmp, (end - row) * sizeof(float));
++    }
++}
++
+ static void ggml_compute_forward_mul_mat_id(
+         const struct ggml_compute_params * params,
+               struct ggml_tensor * dst) {
+@@ -1653,6 +1689,31 @@
+             }
+         }
+ #endif
++    }
++
++    // A single decode token needs no expert grouping or per-expert work queues.
++    bool single_token = !params->use_ref &&
++        (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_S) &&
++        (src1->type == GGML_TYPE_F32 || src1->type == vec_dot_type) &&
++        ids->type == GGML_TYPE_I32 && n_ids > 0 && n_ids <= 64 &&
++        ne00 > 0 && ne00 <= INT32_MAX && ne01 > 0 && ne01 <= INT32_MAX && ne03 == 1 &&
++        ne10 == ne00 && ne11 > 0 && ne12 == 1 && ne13 == 1 &&
++        ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
++        ne0 == ne01 && ne1 == n_ids && ne2 == 1 && ne3 == 1;
++    if (single_token && iqp) {
++        // Repeated experts may select the stock multi-row IQ panel kernel.
++        for (int i = 0; i < n_ids && single_token; ++i) {
++            const int32_t a = *(const int32_t *) ((const char *) ids->data + i * ids->nb[0]);
++            for (int j = 0; j < i; ++j) {
++                const int32_t b = *(const int32_t *) ((const char *) ids->data + j * ids->nb[0]);
++                if (a == b) { single_token = false; break; }
++            }
++        }
++    }
++    if (single_token) {
++        ggml_barrier(params->threadpool);
++        ggml_compute_forward_mul_mat_id_single_token(params, dst);
++        return;
+     }
+ 
+     if (ith == 0) {

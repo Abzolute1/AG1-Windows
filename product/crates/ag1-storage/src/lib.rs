@@ -1,5 +1,6 @@
 //! Shadow-only persistence. No model, process-control, renderer or live TS authority.
 mod artifacts;
+mod blob_codec;
 pub mod context;
 mod import;
 mod journal;
@@ -23,7 +24,11 @@ pub use artifact_search::{ArtifactSearchMatch, ArtifactSearchResult, ArtifactSea
 mod session_lifecycle;
 pub use session_lifecycle::{SessionBootstrap, SessionSeed};
 mod runtime_recovery;
+mod file_changes;
 mod runtime_selection;
 pub use runtime_recovery::InterruptedCommand;
 pub use runtime_selection::{RuntimeSelection, SelectionAck, SelectionChange, StoredSelection};
 mod client;
+
+pub mod mcp;
+pub mod mcp_private;

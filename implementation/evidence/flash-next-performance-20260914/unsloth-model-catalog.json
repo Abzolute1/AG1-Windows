@@ -1,0 +1,654 @@
+{
+  "_id": "6a8edc2c225d22c0ee0fdab6",
+  "id": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "private": false,
+  "pipeline_tag": "image-text-to-text",
+  "tags": [
+    "gguf",
+    "unsloth",
+    "image-text-to-text",
+    "base_model:Qwen/Qwen3.8-Flash-Next",
+    "base_model:quantized:Qwen/Qwen3.8-Flash-Next",
+    "license:other",
+    "endpoints_compatible",
+    "region:us",
+    "conversational"
+  ],
+  "downloads": 1256828,
+  "likes": 928,
+  "modelId": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "author": "unsloth",
+  "sha": "38bb39ee97821de2c9009abb7e93950eec396e66",
+  "lastModified": "2026-09-02T14:02:41.000Z",
+  "gated": false,
+  "disabled": false,
+  "widgetData": [
+    {
+      "text": "Hi, what can you help me with?"
+    },
+    {
+      "text": "What is 84 * 3 / 2?"
+    },
+    {
+      "text": "Tell me an interesting fact about the universe!"
+    },
+    {
+      "text": "Explain quantum computing in simple terms."
+    }
+  ],
+  "model-index": null,
+  "config": {},
+  "cardData": {
+    "license": "other",
+    "license_name": "qwen-community-1.0",
+    "license_link": "LICENSE",
+    "pipeline_tag": "image-text-to-text",
+    "base_model": [
+      "Qwen/Qwen3.8-Flash-Next"
+    ],
+    "tags": [
+      "unsloth"
+    ]
+  },
+  "gguf": {
+    "total": 176943899520,
+    "architecture": "qwen4exp",
+    "context_length": 262144,
+    "chat_template": "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- set sysns = namespace(count=0, text='') %}\n{%- for message in messages %}\n    {%- if sysns.count == loop.index0 and (message.role == 'system' or message.role == 'developer') %}\n        {%- set sys_content = render_content(message.content, false, true)|trim %}\n        {%- if sys_content %}\n            {%- set sysns.text = sysns.text + ('\\n' if sysns.text else '') + sys_content %}\n        {%- endif %}\n        {%- set sysns.count = sysns.count + 1 %}\n    {%- endif %}\n{%- endfor %}\n{%- set num_sys = sysns.count %}\n{%- set merged_system = sysns.text %}\n{%- set reasoning_instructions = '' %}\n{%- if enable_thinking is undefined or enable_thinking is true %}\n    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n    {%- if resolved_reasoning_effort == 'high' %}\n        {%- set resolved_reasoning_effort = 'xhigh' %}\n    {%- endif %}\n    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\n    {%- endif %}\n    {%- if resolved_reasoning_effort == 'xhigh' %}\n        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}\n    {%- elif resolved_reasoning_effort == 'low' %}\n        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}\n    {%- endif %}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if reasoning_instructions %}\n        {{- reasoning_instructions + '\\n\\n' }}\n    {%- endif %}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if merged_system %}\n        {{- '\\n\\n' + merged_system }}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if merged_system %}\n        {{- '<|im_start|>system\\n' + (reasoning_instructions + '\\n\\n' if reasoning_instructions else '')  + merged_system + '<|im_end|>\\n' }}\n    {%- elif reasoning_instructions %}\n        {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- for message in messages %}\n    {%- if loop.index0 >= num_sys %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" or message.role == \"developer\" %}\n        {{- raise_exception('System message must be at the beginning.') }}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if tool_call.name is not defined or tool_call.name is none %}\n                    {{- raise_exception('Tool call is missing a function name.') }}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is mapping %}\n                    {%- for args_name, args_value in tool_call.arguments|items %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | string if args_value is string else args_value | tojson | safe %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- elif tool_call.arguments is string %}\n                    {%- if tool_call.arguments|trim %}\n                        {{- raise_exception('Tool call arguments for function \"' + (tool_call.name | string) + '\" were passed as a JSON string. Parse them into an object before calling apply_chat_template.') }}\n                    {%- endif %}\n                {%- elif tool_call.arguments is defined and tool_call.arguments is not none %}\n                    {{- raise_exception('Tool call arguments for function \"' + (tool_call.name | string) + '\" must be an object/mapping or a JSON string.') }}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is false %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- else %}\n        {{- '<think>\\n' }}\n    {%- endif %}\n{%- endif %}\n{#- Unsloth fixes - developer role, merged system messages, tool calling #}",
+    "bos_token": "<|endoftext|>",
+    "eos_token": "<|im_end|>",
+    "totalFileSize": 354029930496
+  },
+  "siblings": [
+    {
+      "rfilename": ".gitattributes",
+      "blobId": "9219d7f50381232afb6832be98305384ec4d4286",
+      "size": 6607
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf",
+      "blobId": "345da2356735ee83db97f5b63897b34c54033c8e",
+      "size": 10946368,
+      "lfs": {
+        "sha256": "348986b2568af284eb16a0be0ccd17aa4cf0bc823de4a1c9da8e5a24365e3fd9",
+        "size": 10946368,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00002-of-00008.gguf",
+      "blobId": "e0d384d6e2b1f6b2a854f1eb9dbf03246d979edf",
+      "size": 10447201664,
+      "lfs": {
+        "sha256": "905f21f256847501da84872c526791539a660328b85b701049d859a1c3dfa1cd",
+        "size": 10447201664,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf",
+      "blobId": "7d1e0abdb36a12c450dccc5a11314cc8c823bc77",
+      "size": 102400491712,
+      "lfs": {
+        "sha256": "fd6926a9142df95273cb92623b151f09d260f85b7c02e9469a1b610b552c6d0e",
+        "size": 102400491712,
+        "pointerSize": 137
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00004-of-00008.gguf",
+      "blobId": "3e18f346dd120de16891f6c6063dcae359c42b7a",
+      "size": 48394236672,
+      "lfs": {
+        "sha256": "e4ca944e85c400a5fecb6fd7b0ae0358b67e9bb39ded38a9a8596f8850e7e6dc",
+        "size": 48394236672,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00005-of-00008.gguf",
+      "blobId": "6ac50a4557f56145ddec1bbebd0e25d0199b2c15",
+      "size": 48367899040,
+      "lfs": {
+        "sha256": "c110361d1bbe8064e15c58c456cc35f0fe3d1b1329869e51b067909f83b95e6e",
+        "size": 48367899040,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00006-of-00008.gguf",
+      "blobId": "e8e500c0e0c6c60fe2159be92befe11e61c6324f",
+      "size": 48615233984,
+      "lfs": {
+        "sha256": "cbce912e81f2d983e0a302ceb48554a45ecade9b083f4827d53fc8191af3aeb6",
+        "size": 48615233984,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00007-of-00008.gguf",
+      "blobId": "031027a073e5097ad96394fbbf278bf6185c8e2f",
+      "size": 48367899040,
+      "lfs": {
+        "sha256": "23fbbbef0920c451c2fa4d9cf96d3dd167ed38c1cead608457464812d8930bc8",
+        "size": 48367899040,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "BF16/Qwen3.8-Flash-Next-BF16-00008-of-00008.gguf",
+      "blobId": "7160e5a413e560df0600c3313cf5d1904baea339",
+      "size": 47426022016,
+      "lfs": {
+        "sha256": "b6e4e5c646f8f708bd471e922004aa752acbcdac1d3abb27c9d42037630916f7",
+        "size": 47426022016,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "MTP/README.md",
+      "blobId": "bb3c92938ed04dc01d38f81efde78a6a4f26c932",
+      "size": 5906
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf",
+      "blobId": "8e563418acbe31c57a110ad529d4780d3a3c9d3d",
+      "size": 7770760320,
+      "lfs": {
+        "sha256": "8ac04a65440ade36c4001c432f5dba256028e047bbaa71ff6161f91fe149a99c",
+        "size": 7770760320,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf",
+      "blobId": "f450f49aff3a8d1846fe41ae841968087902aa2d",
+      "size": 2786204800,
+      "lfs": {
+        "sha256": "b646ef60eaae2a9ed849e75f15f399629ca22633555e99e809959e95f22a1575",
+        "size": 2786204800,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+      "blobId": "b59fdc3805e20a450567e0d1462085ed76de9b45",
+      "size": 4137429120,
+      "lfs": {
+        "sha256": "cd87e5d1a4dadaeed63e35929f3b2f28d13e081b4cd32e00f2835095ec09351e",
+        "size": 4137429120,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf",
+      "blobId": "2e489f16c0cc5c68df70d710685dc1ca8debd2b8",
+      "size": 5227963456,
+      "lfs": {
+        "sha256": "32473fa74e8ed0f0026219b09b43d303f52f328c0f8b0caf4b24bf8834cc596b",
+        "size": 5227963456,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf",
+      "blobId": "6e53be32ad46a93bd73469dba7ffced3625a8ef9",
+      "size": 1907151936,
+      "lfs": {
+        "sha256": "f521868a9e143718bef513772f6e04d9642551e362cf2439636d2abdbd149dfc",
+        "size": 1907151936,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+      "blobId": "2b1a353f638d4f8725657701ba136838d0d0b58a",
+      "size": 2786568256,
+      "lfs": {
+        "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6",
+        "size": 2786568256,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+      "blobId": "d8329531db51307f4c6ffa02fbd70388d058143b",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "2dabcbb53ca537a7947bc7d20414fd464eeaf4d66d43021b5b2556cc87544ad2",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf",
+      "blobId": "0b80d9b701214473d8a7f1572f9336b7431aa9d5",
+      "size": 682434912,
+      "lfs": {
+        "sha256": "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e",
+        "size": 682434912,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf",
+      "blobId": "3f2d4655e5c91c823e64b776df1bfeb4a82e81dd",
+      "size": 54400261312,
+      "lfs": {
+        "sha256": "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20",
+        "size": 54400261312,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf",
+      "blobId": "6a842502416071acf7e4f5a665493e8521b061ff",
+      "size": 49446841216,
+      "lfs": {
+        "sha256": "bfa634025fabbd2658bf7694bc80b90e571699c768723f844c934c7ef06c691a",
+        "size": 49446841216,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf",
+      "blobId": "10290dac2d099c0a6c768eb2212eecd175086ebb",
+      "size": 49668930400,
+      "lfs": {
+        "sha256": "232a8f14cc0fa4262e7efe8593774b136fe40909e39c7a020342ddaa27259a97",
+        "size": 49668930400,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "Q8_0/Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf",
+      "blobId": "be6b55dacfd4f62df68fd88880177cc90de27f2d",
+      "size": 34015618784,
+      "lfs": {
+        "sha256": "538a93bca918064983409a41187ad4c68640f9aced6f29564da8f551bf86d7a5",
+        "size": 34015618784,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "README.md",
+      "blobId": "ba04ae3e7c4d04f42f945c0e648a918b900a05cf",
+      "size": 59183
+    },
+    {
+      "rfilename": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+      "blobId": "56fffd90e00e234d38899e09b44cadfc5e61ec71",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+      "blobId": "bf1f52a86922b550c6f8ebf2f17a6e8fda85c100",
+      "size": 49988981792,
+      "lfs": {
+        "sha256": "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586",
+        "size": 49988981792,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+      "blobId": "52390fcbeb3216a75f3e14610c3bdd646e701de0",
+      "size": 24538827360,
+      "lfs": {
+        "sha256": "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203",
+        "size": 24538827360,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf",
+      "blobId": "adae61f03bf3e417bf422160756a06454805e7cd",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "88a1420825a9304063e882ada29d438263617f51ac8923d438d927496693bafd",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf",
+      "blobId": "9bc6bb7d4f2b345fc7b65c4498c204b6d15c92e9",
+      "size": 49990818368,
+      "lfs": {
+        "sha256": "3a62e35bbf9add4733bd1438ebd3a67649d5edd6cb0e72bb78e33c913992b2b6",
+        "size": 49990818368,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf",
+      "blobId": "81cf297048632e4e45705300b9f06ef079d2ab0a",
+      "size": 22544696352,
+      "lfs": {
+        "sha256": "0e25ceaeb89b8a80aa973c6c0c7448943682f7408c2855b2ebd016b7643a861a",
+        "size": 22544696352,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00003.gguf",
+      "blobId": "1f27472c001a405be6c70e04d01b163c38458231",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "268f81fdedf3149a538f252308927a4d5d1f6e062c178568a51e3b519744f8a8",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00003.gguf",
+      "blobId": "00e79213780c2e2c234e8e3f5519647b0d57fcda",
+      "size": 49567921344,
+      "lfs": {
+        "sha256": "cfe600b236b88c7fad1613a5ca5e83b9f2beb63cbd44c32b2be50a44747c695f",
+        "size": 49567921344,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00003.gguf",
+      "blobId": "ae82eb9bb8f72d46dfc0951e4e1f7ec79c456e72",
+      "size": 32382955968,
+      "lfs": {
+        "sha256": "f1912ba34c79427d2295a58dcb2b732b5931af5bef7a373c60557a57d9ee7250",
+        "size": 32382955968,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+      "blobId": "4940621af566be6752c174f9db274acc745e0c1b",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "5ce89370720f8bf90890f439361282104c1aa1482d4013bb9a50923e758e71a4",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf",
+      "blobId": "d652b16b0285308799d4d84011b18d77120a34ab",
+      "size": 49835229856,
+      "lfs": {
+        "sha256": "577a38a2392b40ca2193cea502e1d92f60b8cd370675d308e0ec21885d9daaa7",
+        "size": 49835229856,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf",
+      "blobId": "54fac79b00fe74bd2c8c285982db0aeee1efcd64",
+      "size": 43836407744,
+      "lfs": {
+        "sha256": "d4634e6d84f0ebb0940be15c90d3790bf6464e3dea3a1cddc567dc0e83ad8833",
+        "size": 43836407744,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+      "blobId": "895cade3fc28961cfd47d0521a191d2372af0ea6",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
+      "blobId": "5c1d444643b0d38d431c387eb0da5c2a73d0a21e",
+      "size": 49979779296,
+      "lfs": {
+        "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6",
+        "size": 49979779296,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
+      "blobId": "ee4fa761d6f410df00e8b6d0232fa02036d4676c",
+      "size": 28878402944,
+      "lfs": {
+        "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9",
+        "size": 28878402944,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf",
+      "blobId": "c167973a368f59f1aa7520fe8cc1f19661d8974a",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "f2ef4328929d8b8c8930e2856eef52128dd4ce3425302f04bc3c657431cc4c49",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf",
+      "blobId": "1905be0f9242c1e5a11228803fc058ec381d8233",
+      "size": 49983253824,
+      "lfs": {
+        "sha256": "7d230e7c9421d868b89eebaf23033af0ea1a4e046956df00fb156814fb62346e",
+        "size": 49983253824,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00003.gguf",
+      "blobId": "7ed2bc9a4fd5698fb73127240e3292734cf4c9fd",
+      "size": 39992153376,
+      "lfs": {
+        "sha256": "21d4f90f9cd7b7c3a1582667c20cb22f7b03de895b88a23bb20aaeaa44f2c199",
+        "size": 39992153376,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "blobId": "001977c3783820fbfdc63fd9ba52ed0f3626062f",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf",
+      "blobId": "0dd3921aadf70d33e46271ad8744221d32b2f9c0",
+      "size": 49859583136,
+      "lfs": {
+        "sha256": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9",
+        "size": 49859583136,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf",
+      "blobId": "992dec031e26339fe4d856d86aa1c4a5c849a454",
+      "size": 49376141504,
+      "lfs": {
+        "sha256": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3",
+        "size": 49376141504,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf",
+      "blobId": "f3e014c1d11275be90fa148a4b12ef304b4f41fb",
+      "size": 12087983520,
+      "lfs": {
+        "sha256": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a",
+        "size": 12087983520,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf",
+      "blobId": "f421f4ff72f0edd1168dae037506d3998eae12eb",
+      "size": 10946618,
+      "lfs": {
+        "sha256": "610922cdb1afe1094e95d7a3e86b12ee33317ebbf7320ac9344e21b6ae4bb69f",
+        "size": 10946618,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00002-of-00006.gguf",
+      "blobId": "0b80d9b701214473d8a7f1572f9336b7431aa9d5",
+      "size": 682434912,
+      "lfs": {
+        "sha256": "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e",
+        "size": 682434912,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00003-of-00006.gguf",
+      "blobId": "3f2d4655e5c91c823e64b776df1bfeb4a82e81dd",
+      "size": 54400261312,
+      "lfs": {
+        "sha256": "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20",
+        "size": 54400261312,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00004-of-00006.gguf",
+      "blobId": "58ae56b6cc004539942108dba3ead8fafe5f84fe",
+      "size": 49990245824,
+      "lfs": {
+        "sha256": "9ee6bbe462e6830864382d629101490625b1c95afa15492b7ad550c7bed2dd13",
+        "size": 49990245824,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00005-of-00006.gguf",
+      "blobId": "663f609685c326753dd39e35684f1011f8746fa9",
+      "size": 49882416192,
+      "lfs": {
+        "sha256": "0b2437f661f584030cb5aeb8fb1bb70f6422518a6746bfcc0304167c7b6b8beb",
+        "size": 49882416192,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00006-of-00006.gguf",
+      "blobId": "da755a4405aa23fce29fa899c1c748ef8a18ddb3",
+      "size": 3320101792,
+      "lfs": {
+        "sha256": "55dd96c5ad0863b06b6393151b9ad0ac727b8d58a62e02a296ca5d5ddbfee4a3",
+        "size": 3320101792,
+        "pointerSize": 135
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf",
+      "blobId": "84136533ce35185dcb9ee3e2d216e45147f3739b",
+      "size": 10946624,
+      "lfs": {
+        "sha256": "8bdc6bad55b6699f46f60708829932ff4018d7ac9bd309c388534fa31753bdb7",
+        "size": 10946624,
+        "pointerSize": 133
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf",
+      "blobId": "0b80d9b701214473d8a7f1572f9336b7431aa9d5",
+      "size": 682434912,
+      "lfs": {
+        "sha256": "494ca4ed3dbf97bc28da88af3890b8877b9032f909812d00c0526a9ca5e91d2e",
+        "size": 682434912,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf",
+      "blobId": "3f2d4655e5c91c823e64b776df1bfeb4a82e81dd",
+      "size": 54400261312,
+      "lfs": {
+        "sha256": "34efd79a80a1ce540a517a5d56171924b66ce1c38b04c904f17ad6d8ef17cf20",
+        "size": 54400261312,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf",
+      "blobId": "24f51b906282c84147c1030397e14b77a14e6dcf",
+      "size": 49814108512,
+      "lfs": {
+        "sha256": "0ea4b599880a5a52fcd9c188ba1443f646c69c96571904ddbd6a79246a01a997",
+        "size": 49814108512,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf",
+      "blobId": "6755fc4ed9d2324652a536d10ac56d5c4ef3dd52",
+      "size": 49419317344,
+      "lfs": {
+        "sha256": "9948e81ae8368144b135a7403d8c0f2cf9a6c2f9f692313865855b2832e696c9",
+        "size": 49419317344,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf",
+      "blobId": "c487f4bd27fee7d72306fb6903faa129014de4d4",
+      "size": 14838313984,
+      "lfs": {
+        "sha256": "e4ae255234f42b18012f6d6eec5bf615b57479b7e0a0233c47436a321ffeec3f",
+        "size": 14838313984,
+        "pointerSize": 136
+      }
+    },
+    {
+      "rfilename": "imatrix_unsloth.gguf_file",
+      "blobId": "cc1319a0aee0b72dfd59d7e5613c66118b2d31c7",
+      "size": 580038720,
+      "lfs": {
+        "sha256": "a5863123db1ca458727e738955bef7bfc199520aa2bee3a30142a1aff9254154",
+        "size": 580038720,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "mmproj-BF16.gguf",
+      "blobId": "b072531a44656cf614efa0c861329244825e500c",
+      "size": 907542944,
+      "lfs": {
+        "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+        "size": 907542944,
+        "pointerSize": 134
+      }
+    },
+    {
+      "rfilename": "mmproj-F16.gguf",
+      "blobId": "fec1653643b8d3b44724449b9fc4da2a81a84eab",
+      "size": 904004000,
+      "lfs": {
+        "sha256": "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980",
+        "size": 904004000,
+        "pointerSize": 134
+      }
+    }
+  ],
+  "spaces": [
+    "apathy-exe/Qwen3.8-Flash-Next"
+  ],
+  "createdAt": "2026-08-26T12:29:32.000Z",
+  "usedStorage": 1389468786938
+}

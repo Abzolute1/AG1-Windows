@@ -1,0 +1,16 @@
+--- /home/alex/Projects/flash-next-perf-20260914/original-source/llama.cpp-b10715-mix-86bd2d3/ggml/src/ggml-cpu/ggml-cpu.c	2026-08-31 18:22:53.000000000 +0200
++++ /home/alex/Projects/flash-next-perf-20260914/source-original-ple-parallel/ggml/src/ggml-cpu/ggml-cpu.c	2026-09-14 14:34:09.403216802 +0200
+@@ -2354,6 +2354,13 @@
+                 n_tasks = n_threads;
+             } break;
+         case GGML_OP_GET_ROWS:
++            {
++                // Large lazy embeddings benefit from concurrent independent page reads.
++                const struct ggml_tensor * table = node->src[0];
++                const int64_t rows = ggml_nelements(node->src[1]);
++                n_tasks = ggml_is_quantized(table->type) && ggml_nbytes(table) > (size_t) 4*1024*1024*1024 && rows >= 1024
++                        ? MIN(n_threads, (int) (rows/256)) : 1;
++            } break;
+         case GGML_OP_SET_ROWS:
+             {
+                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads

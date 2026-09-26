@@ -112,8 +112,26 @@ pub type RequestObserver =
 /// Host custody preparation, called with an already held generation permit.
 /// It may load the pinned model but must not issue a generation itself.
 pub trait GenerationRuntime: Send + Sync {
+    /// Explicit host request: prepare resident weights without generating a message.
+    /// The caller must hold the shared local endpoint scheduler permit.
+    fn load_model<'a>(&'a self, _model: &'a str) -> ag1_core::PortFuture<'a, ()> {
+        Box::pin(async { Err(DomainError::Unavailable("Manual model loading is unavailable".into())) })
+    }
+    /// Advisory UI phase, independent of the blocking model-loading lock.
+    fn progress(&self) -> Option<serde_json::Value> {
+        None
+    }
     fn prepare<'a>(&'a self, request: &'a HttpRequest) -> ag1_core::PortFuture<'a, ()>;
     fn shutdown(&self) -> ag1_core::PortFuture<'_, ()>;
+    /// Success must prove this request's owned runtime has stopped. A remote
+    /// transport disconnect alone is not sufficient settlement evidence.
+    fn cancel_generation<'a>(&'a self, _url: &'a str) -> ag1_core::PortFuture<'a, ()> {
+        Box::pin(async {
+            Err(DomainError::Unavailable(
+                "No owned cancellation proof".into(),
+            ))
+        })
+    }
 }
 pub fn endpoint_origin(value: &str) -> Result<String, DomainError> {
     let url = Url::parse(value).map_err(|_| DomainError::InvalidInput("provider URL".into()))?;
@@ -128,6 +146,13 @@ pub fn endpoint_origin(value: &str) -> Result<String, DomainError> {
     Ok(url.origin().ascii_serialization())
 }
 impl ProviderHttp {
+    pub(super) async fn cancel_generation(&self, url: &str) -> Result<(), DomainError> {
+        self.runtime
+            .as_ref()
+            .ok_or_else(|| DomainError::Unavailable("No owned runtime".into()))?
+            .cancel_generation(url)
+            .await
+    }
     pub fn new(origins: &[String], connect_timeout: Duration) -> Result<Self, DomainError> {
         if origins.is_empty()
             || origins.len() > 256

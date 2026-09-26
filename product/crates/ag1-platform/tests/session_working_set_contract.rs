@@ -70,6 +70,10 @@ async fn admitted_working_history_survives_tool_appends_without_reexternalizing_
     }
     let stats = resolver.stats.lock().unwrap();
     assert!(stats[0]["externalizedToolResults"].as_u64().unwrap() >= 30);
+    for current in &stats[1..] {
+        assert_eq!(current["unchangedHistoryPrefixMessages"], current["admittedHistoryMessages"]);
+        assert_eq!(current["requestPrefixComparison"]["configurationUnchanged"], true);
+    }
     // A newly unprotected tail can need reduction. Already reduced older
     // history must not be externalized and evicted again on every tool round.
     assert!(
@@ -258,7 +262,7 @@ async fn branch_navigation_does_not_reuse_abandoned_working_history() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_and_memory_changes_recompile_with_current_configuration() {
+async fn model_changes_recompile_while_memory_changes_update_only_request_tail() {
     use ag1_core::memory::MemoryService;
     for change in ["model", "memory"] {
         let (origin, server) = server(vec![stop(), stop()]);
@@ -301,19 +305,90 @@ async fn model_and_memory_changes_recompile_with_current_configuration() {
             .unwrap();
         assert_eq!(
             resolver.stats.lock().unwrap()[1]["workingSetReused"],
-            false,
+            change == "memory",
             "{change}"
         );
         let requests = server.join().unwrap();
+        let stats = resolver.stats.lock().unwrap();
+        assert_eq!(stats[1]["requestPrefixComparison"]["configurationUnchanged"], change == "memory");
         if change == "model" {
             assert_eq!(requests[1]["model"], "replacement");
         } else {
+            assert_eq!(stats[1]["unchangedHistoryPrefixMessages"], stats[1]["admittedHistoryMessages"]);
+            let first = resolver.inputs.lock().unwrap()[0].as_array().unwrap().clone();
+            let next = resolver.inputs.lock().unwrap()[1].as_array().unwrap().clone();
+            let common = first.iter().zip(&next).take_while(|(before, after)| before == after).count();
+            assert_eq!(stats[1]["requestPrefixComparison"]["unchangedMessagePrefix"], common);
+            assert_eq!(requests[0]["messages"][0], requests[1]["messages"][0], "Memory mutation must preserve the system prefix");
+            assert!(!requests[1]["messages"][0].to_string().contains("Preserve the newly selected fixture behavior"));
             assert!(
                 requests[1]
                     .to_string()
                     .contains("Preserve the newly selected fixture behavior")
             );
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_native_rounds_batch_reductions_and_retain_final_request_diagnostics() {
+    let mut responses = (0..20).map(|id| calls(vec![(
+        &format!("read-{id}"), "read", json!({"path":format!("evidence-{id}.txt")})
+    )])).collect::<Vec<_>>();
+    responses.push(stop());
+    let (origin, server) = server(responses);
+    let f = fixture_configured_tools(&origin, "disabled", vec![], None, None, 3, &["read"]);
+    for id in 0..20 {
+        std::fs::write(f.root.join(format!("evidence-{id}.txt")), format!("CURRENT_CONTRACT: exact evidence {id}\n{}", "x".repeat(8000))).unwrap();
+    }
+    let resolver = ContextObserver { inner: Resolver::new(false), stats: Mutex::new(vec![]), inputs: Mutex::new(vec![]) };
+    let mut turn = input();
+    turn.max_generations = Some(21);
+    let result = f.host.run(turn, &resolver, f.files.clone(), &ignore).await.unwrap();
+    assert_eq!(result.generations, 21);
+    assert!(f.host.settled().unwrap());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 21);
+    let stats = resolver.stats.lock().unwrap();
+    let inputs = resolver.inputs.lock().unwrap();
+    let mut reductions = 0;
+    let mut stable = 0;
+    for i in 1..stats.len() {
+        let stat = &stats[i];
+        assert_eq!(stat["workingSetReused"], true);
+        let before = inputs[i-1].as_array().unwrap();
+        let after = inputs[i].as_array().unwrap();
+        let common = before.iter().zip(after).take_while(|(a,b)| a == b).count();
+        assert_eq!(stat["requestPrefixComparison"]["unchangedMessagePrefix"], common);
+        assert_eq!(stat["requestPrefixComparison"]["configurationUnchanged"], true);
+        assert_eq!(stat["requestPrefixComparison"]["firstDifferentMessage"], common);
+        assert!(ag1_core::context::retry::complete_pairs(after));
+        if stat["externalizedToolResults"].as_u64().unwrap() > 0 {
+            reductions += 1;
+            assert!(stat["tokensAfter"].as_u64().unwrap() <= stat["compactionTargetTokens"].as_u64().unwrap(), "{stat}");
+        } else {
+            stable += 1;
+            assert_eq!(stat["unchangedHistoryPrefixMessages"], stat["admittedHistoryMessages"]);
+        }
+    }
+    assert!(reductions >= 2, "fixture must cross pressure repeatedly");
+    assert!(stable > reductions, "reductions should create multi-round headroom");
+    eprintln!("controlled native context: {} requests; {reductions} reduction rounds; {stable} unchanged-history continuation rounds", stats.len());
+    let retained = f.store.artifact_catalog("session", None, 128, Some("runtime-request-compiled")).unwrap();
+    assert_eq!(retained.len(), inputs.len());
+    let context = ag1_storage::context::ContextStore::new(&f.store, SessionId::new("session").unwrap(), "session", "inspect", NOW, ag1_core::context::features::Features::default()).unwrap();
+    for record in retained {
+        let text = context.bounded_text(&record.position.id, 1_000_000).unwrap();
+        let request: Value = serde_json::from_str(&text).unwrap();
+        let index = inputs.iter().position(|input| input == &request["messages"]).unwrap();
+        assert_eq!(request["stats"], stats[index], "retained diagnostics must match the actual final compiler projection");
+        assert_eq!(request["thinking"], "off");
+    }
+    let records = f.host.client_records().unwrap();
+    for id in 0..20 {
+        let results = records.iter().filter(|record| record["message"]["role"] == "toolResult" && record["message"]["toolCallId"] == format!("read-{id}")).collect::<Vec<_>>();
+        assert_eq!(results.len(), 1);
+        assert!(results[0]["message"]["content"].to_string().contains(&"x".repeat(8000)), "durable original must not shrink");
     }
 }
 

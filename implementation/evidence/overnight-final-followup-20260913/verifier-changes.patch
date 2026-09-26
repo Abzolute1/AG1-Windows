@@ -1,0 +1,106 @@
+--- before/product/crates/ag1-platform/src/session/completion_evidence.rs
++++ after/product/crates/ag1-platform/src/session/completion_evidence.rs
+@@ -19,6 +19,7 @@
+     canonical: Option<String>,
+     pub mutation_seen: bool,
+     checks: BTreeMap<String, Status>,
++    unrecognized_shell: bool,
+ }
+ impl Evidence {
+     pub fn new(canonical: Option<String>) -> Shared {
+@@ -26,6 +27,7 @@
+             canonical,
+             mutation_seen: false,
+             checks: BTreeMap::new(),
++            unrecognized_shell: false,
+         }))
+     }
+     pub fn verified(&self) -> bool {
+@@ -54,7 +56,10 @@
+         } else {
+             "verification_required"
+         };
+-        format!("<native-verification-status>\nstatus: {status}\nOnly acknowledged checks since the latest observed mutation count. A passing check need not be repeated solely because an older inspection index is stale; repeat when new changes, failures, uncovered cases or external changes warrant it. Passing proves only the executed checks, not semantic correctness or full coverage.\n</native-verification-status>")
++        let mismatch = if self.mutation_seen && self.unrecognized_shell && self.canonical.is_some() {
++            "The last shell command was not recognized as the recorded verifier. A successful wrapped command does not establish that receipt. Submit the contract's command string unchanged to bash; do not add cd, shell composition or redirection. Bash already starts in the workspace.\n"
++        } else { "" };
++        format!("<native-verification-status>\nstatus: {status}\n{mismatch}Only acknowledged checks since the latest observed mutation count. A passing check need not be repeated solely because an older inspection index is stale; repeat when new changes, failures, uncovered cases or external changes warrant it. Passing proves only the executed checks, not semantic correctness or full coverage.\n</native-verification-status>")
+     }
+     fn recognizes(&self, command: &str) -> bool {
+         self.canonical
+@@ -106,6 +111,7 @@
+     if mutation {
+         evidence.mutation_seen = true;
+         evidence.checks.clear();
++        evidence.unrecognized_shell = false;
+         return Ok(());
+     }
+     let args = artifacts.read_json(&outcome.record.arguments)?;
+@@ -113,6 +119,7 @@
+         && let Some(command) = args["command"].as_str()
+         && evidence.recognizes(command)
+     {
++        evidence.unrecognized_shell = false;
+         if !evidence.checks.contains_key(command) && evidence.checks.len() >= 256 {
+             return Err(DomainError::LimitExceeded(
+                 "native completion checks".into(),
+@@ -129,8 +136,13 @@
+         if evidence.mutation_seen {
+             evidence.checks.insert(command.into(), verification.status);
+         }
+-    } else if outcome.record.effect == Effect::Unknown {
+-        evidence.checks.clear();
++    } else {
++        if outcome.record.tool == "bash" {
++            evidence.unrecognized_shell = true;
++        }
++        if outcome.record.effect == Effect::Unknown {
++            evidence.checks.clear();
++        }
+     }
+     Ok(())
+ }
+--- before/product/crates/ag1-core/src/context/projections.rs
++++ after/product/crates/ag1-core/src/context/projections.rs
+@@ -302,7 +302,7 @@
+     pub finished_jobs: Option<&'a str>,
+ }
+ pub fn turn(input: TurnAddenda<'_>) -> Option<String> {
+-    let contract=input.verification_command.filter(|s|!s.is_empty()).map(|command|format!("<runtime-verification-contract>\n{{\"kind\":\"repository_verifier\",\"version\":1,\"command\":{},\"required_after_mutation\":true}}\nUse this canonical repository verifier after the final mutation. Alternative or focused tests may supplement it, but do not replace it.\n</runtime-verification-contract>",serde_json::to_string(command).unwrap()));
++    let contract=input.verification_command.filter(|s|!s.is_empty()).map(|command|format!("<runtime-verification-contract>\n{{\"kind\":\"repository_verifier\",\"version\":1,\"command\":{},\"required_after_mutation\":true}}\nUse this canonical repository verifier after the final mutation. Submit its command string unchanged to bash, which already starts in the workspace; do not add cd, shell composition or redirection. Alternative or focused tests may supplement it, but do not replace it.\n</runtime-verification-contract>",serde_json::to_string(command).unwrap()));
+     let parts: Vec<_> = [
+         input.runtime_pending,
+         contract.as_deref(),
+--- before/product/crates/ag1-platform/tests/session_verification/mod.rs
++++ after/product/crates/ag1-platform/tests/session_verification/mod.rs
+@@ -294,3 +294,30 @@
+     assert!(!json!(branch).to_string().contains("<runtime-verification-contract>"));
+     assert!(!json!(branch).to_string().contains("<native-verification-status>"));
+ }
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn wrapped_verifier_feedback_explains_missing_receipt_then_expires_after_exact_check() {
++    let (origin, server) = server(vec![
++        calls(vec![("write", "write", json!({"path":"note.txt","content":"fixed"}))]),
++        calls(vec![("wrapped", "bash", json!({"command":"cd . && node verifier.mjs"}))]),
++        calls(vec![("exact", "bash", json!({"command":"node verifier.mjs"}))]),
++        stop(),
++    ]);
++    let f = fixture(&origin, "disabled");
++    std::fs::write(f.root.join("verifier.mjs"), "console.log('original verifier output: passed');").unwrap();
++    let runner = native_adapters_configured(&f, &["write", "bash"], None, None).await;
++    let mut input = input();
++    input.message["content"] = json!("Fix the note and verify it.");
++    let result = print::run(&f.host, input, &Resolver::new(false), runner, &ignore,
++        print::Options { recommended_verifier: Some("node verifier.mjs".into()), ..Default::default() }).await.unwrap();
++    assert_eq!(result.exit_code, 0);
++    let requests = server.join().unwrap();
++    assert_eq!(requests.len(), 4);
++    let tail = |i: usize| ag1_core::context::hygiene::content(requests[i]["messages"].as_array().unwrap().last().unwrap(), "\n");
++    assert!(tail(0).contains("Submit its command string unchanged to bash"));
++    assert!(tail(2).contains("original verifier output: passed"));
++    assert!(tail(2).contains("status: verification_required"));
++    assert!(tail(2).contains("The last shell command was not recognized as the recorded verifier"));
++    assert!(tail(3).contains("status: passed_after_latest_observed_mutation"));
++    assert!(!tail(3).contains("The last shell command was not recognized"));
++}

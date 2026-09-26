@@ -1,0 +1,183 @@
+--- a/product/crates/ag1-platform/tests/session_contract.rs
++++ b/product/crates/ag1-platform/tests/session_contract.rs
+@@ -277,7 +277,8 @@
+         .await
+         .unwrap();
+     assert_eq!(result.journal_revision, 3);
+-    assert_eq!(seen.load(Ordering::SeqCst), 3);
++    // Request-phase notifications also exercise the Recovery listener path.
++    assert_eq!(seen.load(Ordering::SeqCst), 7);
+     assert!(fixture.host.settled().unwrap());
+     server.join().unwrap();
+     assert_eq!(fixture.scheduler.status(&origin).unwrap().quarantined, 0);
+@@ -613,6 +614,9 @@
+             .any(|entry| entry["message"]["stopReason"] == "error")
+     );
+     let events = events.lock().unwrap();
++    // Phase telemetry surrounds retry recovery; it is not a retry transition.
++    assert!(events.iter().any(|event| event["type"] == "request_phase"));
++    let events: Vec<_> = events.iter().filter(|event| event["type"] != "request_phase").collect();
+     assert_eq!(
+         events
+             .iter()
+@@ -4132,18 +4136,26 @@
+     fixture: &Fixture,
+     git: &std::path::Path,
+ ) -> Arc<ag1_platform::session::files::NativeToolRunner> {
++    native_repo_runner_with_bubblewrap(fixture, git, None).await
++}
++async fn native_repo_runner_with_bubblewrap(
++    fixture: &Fixture,
++    git: &std::path::Path,
++    bubblewrap: Option<&std::path::Path>,
++) -> Arc<ag1_platform::session::files::NativeToolRunner> {
+     use ag1_platform::{git::GitService, repo_tools::RepoTools, session::adapters::NativeAdapters};
+     let spools = fixture._directory.path().join("repo-spools");
+     std::fs::create_dir(&spools).unwrap();
++    let mut git_service = GitService::new(
++        env!("CARGO_BIN_EXE_ag1-process-host").as_ref(), git, &spools,
++    ).unwrap();
++    if let Some(path) = bubblewrap {
++        git_service = git_service.with_bubblewrap(path);
++    }
+     let adapters = NativeAdapters {
+         repo: Some(Arc::new(RepoTools::new(
+             fixture.workspace.clone(),
+-            GitService::new(
+-                env!("CARGO_BIN_EXE_ag1-process-host").as_ref(),
+-                git,
+-                &spools,
+-            )
+-            .unwrap(),
++            git_service,
+             fixture.store.clone(),
+         ))),
+         ..Default::default()
+@@ -4417,27 +4429,39 @@
+         json!({"view":"all"}),
+     )])]);
+     let fixture = fixture(&origin, "disabled");
+-    let executable = fixture._directory.path().join("owned-slow-git");
++    owned_repo_git(&fixture.root, &["init", "-b", "main"]);
++    let executable = fixture._directory.path().join("owned-slow-git-container");
+     std::fs::write(
+         &executable,
+-        "#!/bin/sh\nprintf '%s' \"$$\" > git-started\nsleep 30\n",
++        // Git must remain the configured system executable. Delay its owned
++        // container launcher, and signal through stderr (the retained spool).
++        "#!/bin/sh\nprintf '%s\\n' \"$$\" >&2\nexec sleep 30\n",
+     )
+     .unwrap();
+     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+-    let runner = native_repo_runner(&fixture, &executable).await;
++    let runner = native_repo_runner_with_bubblewrap(
++        &fixture, "/usr/bin/git".as_ref(), Some(&executable),
++    ).await;
+     let host = fixture.host.clone();
+     let running = tokio::spawn(async move {
+         host.run(input(), &Resolver::new(false), runner, &ignore)
+             .await
+     });
+-    tokio::time::timeout(Duration::from_secs(5), async {
+-        while !fixture.root.join("git-started").exists() {
++    let pid = tokio::time::timeout(Duration::from_secs(5), async {
++        loop {
++            for entry in std::fs::read_dir(fixture._directory.path().join("repo-spools")).unwrap() {
++                let path = entry.unwrap().path().join("stderr.log");
++                if let Ok(text) = std::fs::read_to_string(path)
++                    && let Ok(pid) = text.trim().parse::<u32>()
++                {
++                    return pid;
++                }
++            }
+             tokio::time::sleep(Duration::from_millis(5)).await;
+         }
+     })
+     .await
+     .unwrap();
+-    let pid = std::fs::read_to_string(fixture.root.join("git-started")).unwrap();
+     fixture.host.cancel().unwrap();
+     let result = tokio::time::timeout(Duration::from_secs(3), running)
+         .await
+--- a/product/crates/ag1-platform/tests/session_extensions/tools.rs
++++ b/product/crates/ag1-platform/tests/session_extensions/tools.rs
+@@ -14,7 +14,10 @@
+             "export default api=>{api.on('tool_result',()=>({content:[{type:'text',text:'extension claims command not found'}],isError:true,details:{exitCode:127}}));};"
+         };
+         let extension = extensions(&f,code);
+-        let mut runner = native_adapters(&f,&["bash"],Some("printf 'configured prefix\\n'; ".into())).await;
++        // Keep repeated complete output deterministic: separate stdout/stderr readers
++        // may merge the same two writes in different orders.
++        let prefix = if native_fails { "printf 'configured prefix\\n' >&2; " } else { "printf 'configured prefix\\n'; " };
++        let mut runner = native_adapters(&f,&["bash"],Some(prefix.into())).await;
+         Arc::get_mut(&mut runner).unwrap().adapters.extensions = Some(extension.clone());
+         let result = f.host.run(input(),&Resolver::new(false),runner,&ignore).await.unwrap();
+         assert_eq!(result.generations,if native_fails {3} else {4});
+--- a/product/crates/ag1-platform/tests/session_controlled/mod.rs
++++ b/product/crates/ag1-platform/tests/session_controlled/mod.rs
+@@ -181,7 +181,7 @@
+                 "append",
+                 json!({"path":"value.txt","content":"changed"}),
+             ),
+-            ("apply", "editApply", json!({"path":"value.txt"})),
++            ("apply", "editApply", json!({"path":"value.txt","edits":[{"oldText":"original","newText":"changed"}]})),
+             (
+                 "write",
+                 "write",
+--- a/product/crates/ag1-core/tests/runtime_contract.rs
++++ b/product/crates/ag1-core/tests/runtime_contract.rs
+@@ -817,7 +817,7 @@
+ }
+ 
+ #[test]
+-fn todo_tool_actions_match_sdk_preflight_presentation_and_journal_transitions() {
++fn todo_tool_preserves_sdk_transitions_and_exposes_current_query_ids() {
+     use serde_json::{Value, json};
+     let oracle: Value = serde_json::from_str(include_str!(
+         "../../../../fixtures/runtime/todo-tool-oracle.json"
+@@ -841,13 +841,25 @@
+             continue;
+         }
+         let plan = result.unwrap();
+-        assert_eq!(plan.result, row["output"], "{} output", row["id"]);
++        if matches!(row["id"].as_str(), Some("query" | "query-phase")) {
++            // Native queries intentionally expose reusable IDs; the frozen SDK
++            // oracle returned only a generic acknowledgement and null todos.
++            let items = row.get("state").map(|state| state["items"].clone()).unwrap_or_else(|| json!([]));
++            assert_eq!(plan.result["details"], json!({
++                "todos": items, "planId": row["state"]["planId"], "phase": row["state"]["phase"],
++            }));
++            assert_eq!(plan.result["content"], json!([{"type":"text","text":format!(
++                "Current todo list (reuse these IDs when updating): {items}"
++            )}]));
++        } else {
++            assert_eq!(plan.result, row["output"], "{} output", row["id"]);
++        }
+         assert_eq!(json!(plan.records), row["records"], "{} records", row["id"]);
+     }
+ }
+ 
+ #[test]
+-fn runtime_observation_matches_sdk_feedback_and_related_task_reopening() {
++fn runtime_observation_preserves_sdk_reopening_and_labels_unverified_claims() {
+     use serde_json::{Value, json};
+     let oracle: Value = serde_json::from_str(include_str!(
+         "../../../../fixtures/runtime/observation-tool-oracle.json"
+@@ -876,7 +888,16 @@
+             continue;
+         }
+         let plan = result.unwrap();
+-        assert_eq!(plan.result, row["output"], "{} result", row["id"]);
++        // Preserve the frozen source oracle while checking the intentional
++        // native distinction between recording a claim and verifying it.
++        let mut expected = row["output"].clone();
++        expected["details"]["verification"] = json!("recorded_claim");
++        expected["details"]["sourceReference"] = json!("session-entry:observation-entry");
++        expected["content"][0]["text"] = json!(format!(
++            "{}. Recording this claim does not independently verify its result; cite a matching check receipt for verification.",
++            row["output"]["content"][0]["text"].as_str().unwrap(),
++        ));
++        assert_eq!(plan.result, expected, "{} result", row["id"]);
+         assert_eq!(json!(plan.records), row["records"], "{} records", row["id"]);
+     }
+ }

@@ -67,7 +67,6 @@ async fn native_missing_shell_recovery_preserves_raw_results_and_warns_once_on_n
         missing("three"),
         stop(),
         stop(),
-        stop(),
     ]);
     let fixture = fixture(&origin, "disabled");
     let runner = native_adapters(&fixture, &["bash"], None).await;
@@ -128,11 +127,11 @@ async fn native_missing_shell_recovery_preserves_raw_results_and_warns_once_on_n
     );
     let requests = server.join().unwrap();
     assert!(
-        requests[4]["messages"]
+        requests[3]["messages"]
             .to_string()
             .contains("<tool_failure_warning>")
     );
-    assert_eq!(requests[4]["messages"][0], requests[0]["messages"][0]);
+    assert_eq!(requests[3]["messages"][0], requests[0]["messages"][0]);
     assert!(fixture.host.settled().unwrap());
     assert!(fixture.host.persistence_healthy().unwrap());
 }
@@ -163,7 +162,6 @@ async fn missing_warning_receipt_blocks_next_request_without_publishing_warning_
             missing("one"),
             missing("two"),
             missing("three"),
-            stop(),
         ]);
         let fixture = fixture_seeded_with_fault(
             &origin,
@@ -204,6 +202,6 @@ async fn missing_warning_receipt_blocks_next_request_without_publishing_warning_
             warnings(&fixture).len(),
             usize::from(point == ag1_storage::Boundary::BeforeAck)
         );
-        assert_eq!(server.join().unwrap().len(), 4);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 }

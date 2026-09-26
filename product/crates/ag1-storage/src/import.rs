@@ -537,6 +537,7 @@ impl Store {
                 return Err(StorageError::Corrupt("Lease scope/version".into()));
             }
             for lease in leases {
+                ag1_core::tools::verification::scope(lease).map_err(|_| StorageError::Corrupt("Lease verification scope".into()))?;
                 let stamp = |key: &str| -> StorageResult<u64> {
                     let s = lease[key]
                         .as_str()
@@ -752,7 +753,8 @@ impl Store {
             };
             let hashes = Self::referenced_blobs(&db)?;
             for hash in hashes {
-                write(&format!("blobs/{hash}"), &self.blob_bytes(&hash)?)?;
+                let (name, bytes) = self.export_blob(&hash)?;
+                write(&format!("blobs/{name}"), &bytes)?;
             }
             let mut q = db.prepare("SELECT path,digest FROM archives ORDER BY path")?;
             for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
@@ -919,7 +921,8 @@ impl Store {
         let sqlite = fs::read(temp.path().join("storage.sqlite"))?;
         File::open(temp.path().join("storage.sqlite"))?.sync_all()?;
         files.push(json!({"path":"storage.sqlite","sha256":digest(&sqlite),"bytes":sqlite.len()}));
-        let manifest = json!({"version":1,"kind":"ag1-shadow-lossless-export","schema":1,"compatible_resume":safe,"bridge_compatible_resume":structural,"runtime_authority":"historical-only","files":files});
+        let schema: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let manifest = json!({"version":1,"kind":"ag1-shadow-lossless-export","schema":schema,"compatible_resume":safe,"bridge_compatible_resume":structural,"runtime_authority":"historical-only","files":files});
         let mut f = File::create(temp.path().join("export.json"))?;
         f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
         f.sync_all()?;
@@ -938,7 +941,7 @@ impl Store {
         let manifest: Value = serde_json::from_slice(&raw)?;
         if manifest["version"] != 1
             || manifest["kind"] != "ag1-shadow-lossless-export"
-            || manifest["schema"] != 1
+            || !matches!(manifest["schema"].as_u64(), Some(1 | 2))
         {
             return Err(StorageError::Unsupported("Export format".into()));
         }
@@ -985,7 +988,10 @@ impl Store {
         // Validate the restored database and every referenced blob before publishing the destination.
         {
             let restored = Store::open(temp.path())?;
-            restored.reconcile()?;
+            let health = restored.reconcile()?;
+            if Some(health.schema as u64) != manifest["schema"].as_u64() {
+                return Err(StorageError::Corrupt("Export schema mismatch".into()));
+            }
         }
         sync_tree(temp.path())?;
         crate::persistence::publish_directory(temp.path(), destination)?;

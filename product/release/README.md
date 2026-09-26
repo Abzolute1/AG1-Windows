@@ -28,12 +28,26 @@ It requires Linux/POSIX. Other platform installers remain pending.
 
 The launcher stores desktop preferences in `$XDG_STATE_HOME/ag1/desktop` (or
 `$HOME/.local/state/ag1/desktop`), separately from installation files. Durable
-workspace authority still uses the OS account registry. For an already migrated
-workspace it resolves the accepted native destination and configuration. Opening a
-legacy workspace requires its separately retained TS reference companion; the
-default candidate does not include that entire AgentSession or Node. Keep the
-checkout and P13 archives available. Missing legacy dependencies are not permission
-to migrate or reopen stale original journals.
+workspace authority still uses the OS account registry. Normal desktop startup
+loads `native-host.json` from that desktop state directory; `AG1_NATIVE_CONFIG`
+can explicitly select another configuration. Keep this user-specific file private
+and outside the installation. It uses the native CLI's host configuration format,
+including the model catalog and pinned local runtime capture. Missing configuration
+produces a setup error before workspace registration.
+
+Local runtime configuration defaults to strict GPU exclusivity for preserved
+measurement workflows. Set `runtime.exclusive_gpu` to `false` for desktop use
+alongside other GPU applications. This leaves the workspace/runtime leases,
+endpoint ownership checks, pinned materials, and owned-process supervision intact;
+it only disables the requirement that every other GPU compute client be absent.
+
+Opening an unregistered project creates fresh native agent state while preserving
+existing project files. It does not import legacy conversation history. Existing
+ownership is never replaced by this registration. Already migrated workspaces use
+their accepted destination and pinned configuration even when a desktop default
+is present. Explicitly rolled-back TypeScript workspaces still require the retained
+reference companion. Keep the checkout and P13 archives available; missing legacy
+dependencies never authorize migration or reopening stale original journals.
 
 `external-runtimes.json` records the existing three tuned Linux model executables,
 profile and plan hashes. Libraries, weights, projectors and credentials remain
@@ -51,6 +65,8 @@ embedding, judge-only vision and dynamic extension-provider rebinding.
 build and other-platform license entries, plus the compiler's Rust standard-library
 notices and third-party exceptions. `binary-dependencies.json` records actual
 Linux loader closure; these system libraries are external, not redistributed.
+GitHub private secret entry also requires the recorded system libsodium library
+for sealed-box encryption (notice and provenance in `licenses/system-libsodium`).
 This is not a portable Linux ABI certification or an exact static symbol-level SBOM.
 
 All L01–L08 preservation requirements remain in force: per-model binary/library

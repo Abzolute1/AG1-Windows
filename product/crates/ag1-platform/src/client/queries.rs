@@ -1,11 +1,38 @@
 use super::*;
 use crate::workspace::preserve_text;
+use ag1_core::storage::StoragePort;
 use sha2::{Digest, Sha256};
 impl Host {
     pub(super) fn query(&self, command: &w::Command) -> Result<Option<Value>> {
         let selected = self.registry.selected()?;
         let session = selected.services.runtime();
         Ok(Some(match command {
+            #[cfg(target_os = "linux")]
+            w::Command::Runtime {action,args} if action=="mcp_manager"=>{
+                let current=self.commands.snapshot()?.scope;
+                let scope=ag1_core::tools::registry::Scope {workspace:current.workspace.as_str().into(),session:current.session.as_str().into(),epoch:session.context_epoch()?,revision:session.journal_revision()?};
+                selected.services.tools().client_mcp().ok_or_else(||DomainError::Unavailable("MCP manager is unavailable for this chat; choose an available working folder or reopen the desktop".into()))?.dispatch(&scope,args)?
+            },
+            w::Command::Runtime {action,args} if action=="website_icon"=>{
+                let scope=self.commands.snapshot()?.scope;
+                let records=session.client_records()?;
+                let entry=records.iter().find(|r| r["id"]==args["entry"]).ok_or(DomainError::NotFound)?;
+                let url=args["url"].as_str().ok_or(DomainError::PermissionDenied)?;
+                let source=website_icons::sources(entry).into_iter().any(|s| s["url"]==url);
+                if !source {return Err(DomainError::PermissionDenied);}
+                let data=website_icons::icon(url)?;
+                if self.commands.snapshot()?.scope!=scope {return Err(DomainError::Conflict);}
+                json!({"dataUrl":data})
+            },
+            w::Command::Files {action,args} if action=="github_upload_preview"=>self.github_upload_preview(args)?,
+            w::Command::Files {action,args} if action=="git_preview"=>self.local_git_preview(args)?,
+            w::Command::Files {action,args} if action=="git_dismiss"=>self.local_git_dismiss(args)?,
+            w::Command::Files {action,args} if action=="change_undo_status"=>self.change_undo_status(args)?,
+            w::Command::Files {action,args} if action=="diff" && args["paged"]==true=>self.diff_page(args)?,
+            w::Command::Files {action,args} if action=="changes"=>self.change_list(args)?,
+            w::Command::Files {action,args} if action=="change_read"=>self.change_read(args)?,
+            w::Command::Runtime {action,args} if action=="approval_policy"=>self.approval_policy(args)?,
+            w::Command::Runtime {action,args} if action=="live_block"=>self.observations.lock().map_err(|_|DomainError::Conflict)?.page(&self.commands.snapshot()?.scope,args)?,
             w::Command::Runtime {action,args} if action=="client_effect_result"=>self.client_effect_result(args)?,
             w::Command::Runtime {action,args} if action.starts_with("terminal_")=>self.terminal_command(action.trim_start_matches("terminal_"),args)?,
             w::Command::Runtime {action,args} if action=="detail_page"=>self.detail_page(args)?,
@@ -29,28 +56,42 @@ impl Host {
                 }
                 catalog
             },
-            w::Command::Files {action,args}=>match action.as_str() {
-                "list"=>json!(self.workspace.scan(1000)?),
-                "diff"=>{let t=self.config.tooling.as_ref().ok_or_else(||DomainError::Unavailable("Configure the native Git helper".into()))?;let spools=self.state.join("diff");fs::create_dir_all(&spools).map_err(crate::io_error)?;let diff=crate::git::GitService::new(&t.process_host,&t.git,&spools)?.status_diff(&self.workspace,None)?;json!({"view":format!("HEAD {}\n{}\n{}",diff.head,String::from_utf8_lossy(&diff.status),String::from_utf8_lossy(&diff.diff))})},
+            w::Command::Files {action,args}=>{let workspace=self.working_workspace()?; if action=="save" { self.folder_selection()?.resolve(args["path"].as_str().unwrap_or(""),true)?; } match action.as_str() {
+                "list"=>json!(workspace.scan(1000)?),
+                "diff"=>{let t=self.config.tooling.as_ref().ok_or_else(||DomainError::Unavailable("Configure the native Git helper".into()))?;let spools=self.state.join("diff");fs::create_dir_all(&spools).map_err(crate::io_error)?;let diff=crate::git::GitService::new(&t.process_host,&t.git,&spools)?.with_bubblewrap(&t.bubblewrap).status_diff(&workspace,None)?;json!({"view":format!("HEAD {}\n{}\n{}",diff.head,String::from_utf8_lossy(&diff.status),String::from_utf8_lossy(&diff.diff))})},
                 "read"|"save"=>{
                     let path=args["path"].as_str().ok_or_else(||DomainError::InvalidInput("file path".into()))?;
-                    let current=self.workspace.snapshot(path,32768)?;
+                    let current=workspace.snapshot(path,32768)?;
                     let token=format!("{:x}",Sha256::digest(format!("{:?}",current.revision).as_bytes()));
                     if action=="save" {
                         if args["revision"]!=token {return Err(DomainError::Conflict);}
                         let text=args["text"].as_str().ok_or_else(||DomainError::InvalidInput("file text".into()))?;
                         let bytes=preserve_text(&current,text)?;
                         if bytes.len()>32768 {return Err(DomainError::LimitExceeded("editor save".into()));}
-                        self.workspace.replace(path,&current.revision,&bytes)?;
+                        workspace.replace(path,&current.revision,&bytes)?;
                         return self.query(&w::Command::Files {action:"read".into(),args:json!({"path":path})});
                     }
                     json!({"path":path,"text":String::from_utf8(current.bytes).map_err(|_|DomainError::InvalidInput("binary file; use artifacts".into()))?,"revision":token})
                 },
                 _=>return Err(DomainError::Unavailable(format!("files.{action}"))),
-            },
+            }},
             w::Command::Model {action,..} if action=="status"=>json!({"models":self.config.models.iter().map(|m|json!({"id":m["id"],"profile":{"provider":m["provider"],"runtime":m["runtime"],"conflict":m["runtimeConflict"],"contextWindow":m["contextWindow"]}})).collect::<Vec<_>>(),"tuning":false}),
             w::Command::Model {action,..} if action=="tune"=>return Err(DomainError::Unavailable("Tuning requires a separately reviewed P06 tuning operation; client open/select never tunes".into())),
             w::Command::Diagnostics {action,..} if action=="status"=>json!(self.view()?.details),
+            w::Command::Session {action,args} if action=="catalog"=> {
+                let ids = if args["current"] == true { vec![self.commands.snapshot()?.scope.session.as_str().to_owned()] } else { self.store.client_sessions(1000)? };
+                let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+                let mut rows = Vec::new();
+                for id in ids.iter().skip(offset).take(50) {
+                    let journal = self.store.journal_snapshot(&SessionId::new(id)?)?;
+                    let records = journal.entries.iter().filter_map(|e| serde_json::from_slice::<Value>(&e.normalized).ok()).collect::<Vec<_>>();
+                    let title = records.iter().find(|e| e["message"]["role"] == "user").and_then(|e| projection::message(e)).and_then(|m| m.blocks.into_iter().find_map(|b| if let w::MessageBlock::Text { text } = b { Some(text.chars().take(90).collect::<String>()) } else { None })).unwrap_or_else(|| "New chat".into());
+                    let empty = !records.iter().any(|e| e["message"]["role"] == "user");
+                    rows.push(json!({"session":id,"title":title,"empty":empty,"workspace":self.workspace.root(),"updated":records.last().and_then(|r|r["timestamp"].as_str()).unwrap_or("")}));
+                    if serde_json::to_vec(&rows).map_err(json_error)?.len() > 30000 { rows.pop(); break; }
+                }
+                json!({"chats":rows,"next":if offset+rows.len()<ids.len(){Some(offset+rows.len())}else{None}})
+            },
             w::Command::Session {action,..} if action=="list"=>json!(self.store.client_sessions(1000)?),
             w::Command::Session {action,args} if action=="history"=>{
                 use ag1_core::storage::StoragePort;
@@ -103,7 +144,15 @@ impl Host {
             w::Command::Plan {action,..} if action=="view"=>json!(session.plan_snapshot(30)?.plans),
             w::Command::Artifacts {action,args} if action=="list"=>{
                 let before=args.get("before").filter(|v|!v.is_null()).map(|v|Ok::<_,DomainError>(ag1_storage::CatalogPosition {created_at:v["created_at"].as_str().ok_or(DomainError::NotFound)?.into(),id:v["id"].as_str().ok_or(DomainError::NotFound)?.into(),origin:v["origin"].as_str().ok_or(DomainError::NotFound)?.into()})).transpose()?;
-                let rows=self.store.artifact_catalog(self.commands.snapshot()?.scope.session.as_str(),before.as_ref(),20,args["kind"].as_str())?;
+                let rows=if let Some(turn)=args["turn"].as_str() {
+                    let records=session.client_records()?;
+                    let calls=crate::change_receipts::turn_calls(&records,turn)?;
+                    // A repeated call identity anywhere in this session is
+                    // ambiguous output provenance, including off-branch history.
+                    let all=self.store.journal_snapshot(&SessionId::new(self.commands.snapshot()?.scope.session.as_str())?)?.entries.into_iter().map(|e|serde_json::from_slice::<Value>(&e.normalized).map_err(json_error)).collect::<Result<Vec<_>>>()?;
+                    let calls=calls.into_iter().filter(|id| all.iter().flat_map(|e|e["message"]["content"].as_array().into_iter().flatten()).filter(|b|b["type"]=="toolCall"&&b["id"]==*id).count()==1).collect::<Vec<_>>();
+                    self.store.call_artifact_catalog(self.commands.snapshot()?.scope.session.as_str(),&calls,before.as_ref(),20)?
+                } else { self.store.artifact_catalog(self.commands.snapshot()?.scope.session.as_str(),before.as_ref(),20,args["kind"].as_str())? };
                 let next=rows.last().filter(|_|rows.len()==20).map(|r|json!({"created_at":r.position.created_at,"id":r.position.id,"origin":r.position.origin}));
                 json!({"artifacts":rows.iter().map(|r|json!({"id":r.position.id,"kind":r.record["kind"],"mime_type":r.record["mimeType"],"bytes":r.record["bytes"],"sha256":r.record["sha256"],"created_at":r.position.created_at})).collect::<Vec<_>>(),"next":next})
             },

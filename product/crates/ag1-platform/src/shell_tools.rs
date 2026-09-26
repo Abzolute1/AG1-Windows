@@ -77,6 +77,7 @@ impl ShellConfig {
     }
 }
 pub struct ShellService {
+    folders: Option<crate::folder_access::Snapshot>,
     workspace: Arc<Workspace>,
     processes: Arc<ProcessSupervisor>,
     spools: PathBuf,
@@ -123,6 +124,10 @@ impl Drop for RunningShell {
     }
 }
 impl ShellService {
+    pub fn boundary_status(&self) -> serde_json::Value {
+        serde_json::json!({"sandbox":self.config.sandbox,"filesystemEnforced":self.config.sandbox != Sandbox::Off,"networkAllowed":self.network,"workspace":self.workspace.root(),"note":"Host-selected mounts and folder grants control persistence when sandboxed. Sandbox off has no OS filesystem confinement; policy and named file-tool checks are distinct."})
+    }
+
     /// Separate capability and authorization stamp; cannot weaken this service
     /// or be selected by model arguments/environment sandbox settings.
     pub fn readonly(&self) -> Result<Self, DomainError> {
@@ -143,7 +148,7 @@ impl ShellService {
             &self.spools,
             config,
             false,
-        )
+        )?.with_folders(self.folders.clone())
     }
     pub fn new(
         workspace: Arc<Workspace>,
@@ -182,6 +187,7 @@ impl ShellService {
             Sha256::digest(bytes)
         );
         Ok(Self {
+            folders: None,
             workspace,
             processes,
             spools: spools.into(),
@@ -192,6 +198,13 @@ impl ShellService {
     }
     pub(crate) fn target_revision(&self) -> &str {
         &self.stamp
+    }
+    pub(crate) fn with_folders(mut self, folders: Option<crate::folder_access::Snapshot>) -> Result<Self, DomainError> {
+        if let Some(folders) = &folders {
+            self.stamp = format!("{}:{:x}", self.stamp, Sha256::digest(serde_json::to_vec(&folders.selection).map_err(|_|DomainError::Conflict)?));
+        }
+        self.folders = folders;
+        Ok(self)
     }
     pub(crate) fn workspace(&self) -> &Arc<Workspace> {
         &self.workspace
@@ -386,6 +399,10 @@ impl ShellService {
         deadline: Instant,
     ) -> Result<RunningShell, DomainError> {
         let pinned = self.workspace.pin_directory("")?;
+        let extra_pins = self.folders.as_ref().map(|folders| folders.roots.iter()
+            .filter(|root| root.root()!=self.workspace.root())
+            .map(|root| Ok((root.pin_directory("")?,folders.selection.folders.iter().find(|g|g.path==root.root()).ok_or(DomainError::Conflict)?.clone())))
+            .collect::<Result<Vec<_>,DomainError>>()).transpose()?.unwrap_or_default();
         let deadline = deadline.min(Instant::now() + Duration::from_secs_f64(timeout));
         let mut env = self.config.env.clone();
         // No interactive/login startup files or inherited environment are evaluated.
@@ -461,7 +478,7 @@ impl ShellService {
                     "/dev",
                     "--dir",
                     "/tmp/ag1-home",
-                    if readonly {
+                    if readonly || self.folders.as_ref().is_some_and(|f| !f.primary_writable()) {
                         "--ro-bind-fd"
                     } else {
                         "--bind-fd"
@@ -484,6 +501,14 @@ impl ShellService {
                 ]
                 .map(str::to_string),
             );
+            let insertion = sandbox.iter().position(|s|s=="--setenv").ok_or(DomainError::Conflict)?;
+            let mut mounts = Vec::new();
+            for (pin,grant) in &extra_pins {
+                pin.verify_identity()?;
+                mounts.extend([if readonly || grant.mode == crate::folder_access::AccessMode::ReadOnly { "--ro-bind-fd".into() } else { "--bind-fd".into() },
+                    format!("{}{}", crate::process::PINNED_DIRECTORY_PREFIX, pin.process_cwd().display()), grant.path.to_str().ok_or(DomainError::PermissionDenied)?.into()]);
+            }
+            sandbox.splice(insertion..insertion, mounts);
             sandbox.append(&mut argv);
             argv = sandbox;
         }

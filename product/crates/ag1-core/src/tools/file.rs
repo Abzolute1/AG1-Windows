@@ -2,6 +2,7 @@
 use super::{diff, edit};
 use crate::DomainError;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
 
 pub struct Transformation {
@@ -14,9 +15,15 @@ fn text(s: impl Into<String>) -> Value {
     json!({"type":"text","text":s.into()})
 }
 pub fn structured<T: Serialize>(value: &T) -> Result<Value, DomainError> {
-    Ok(
-        json!({"content":[text(serde_json::to_string_pretty(value).map_err(|_| DomainError::InvalidInput("tool result".into()))?)],"details":value}),
-    )
+    let details =
+        serde_json::to_value(value).map_err(|_| DomainError::InvalidInput("tool result".into()))?;
+    let mut result = json!({"content":[text(serde_json::to_string_pretty(value).map_err(|_| DomainError::InvalidInput("tool result".into()))?)],"details":details});
+    // An unsuccessful transformation is a failed tool result even when the
+    // adapter completed normally. Consumers must not infer success from Ok.
+    if !result["details"]["error"].is_null() {
+        result["isError"] = json!(true);
+    }
+    Ok(result)
 }
 fn field<'a>(args: &'a Value, name: &str) -> Result<&'a str, DomainError> {
     args[name]
@@ -48,6 +55,18 @@ pub fn transform(
     super::schema::bounded(args, 8 * 1024 * 1024, 64)?;
     if original.is_some_and(|s| s.len() > 8 * 1024 * 1024) {
         return Err(DomainError::LimitExceeded("file bytes".into()));
+    }
+    let preview = name == "edit" && args["mode"] == "preview";
+    if name == "edit" {
+        if args.get("mode").is_some_and(|mode| mode != "preview" && mode != "apply") {
+            return Err(DomainError::InvalidInput("edit mode must be preview or apply".into()));
+        }
+        if let Some(expected) = args.get("expectedSha256") {
+            let hash = original.map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+            if expected.as_str().is_none() || hash.as_deref() != expected.as_str() {
+                return Err(DomainError::InvalidInput("The file changed since this preview. Read or preview the current file before applying.".into()));
+            }
+        }
     }
     let path = field(args, "path")?;
     let old = String::from_utf8_lossy(original.unwrap_or_default());
@@ -87,7 +106,7 @@ pub fn transform(
                 args["allowFuzzyMatch"].as_bool().unwrap_or(false),
             )?;
             let d = diff::generate(&changed.base_content, &changed.new_content, 4)?;
-            let mut details = json!({"diff":d.diff,"diffSummary":d.summary});
+            let mut details = json!({"diff":d.diff,"diffSummary":d.summary,"sourceSha256":format!("{:x}", Sha256::digest(original.unwrap())),"mode":if preview {"preview"} else {"apply"}});
             if let Some(line) = d.first_changed_line {
                 details["firstChangedLine"] = json!(line);
             }
@@ -99,7 +118,12 @@ pub fn transform(
             } else {
                 ""
             };
-            let result = json!({"content":[text(format!("Patched {} block(s) in {path}.{note}",edits.len())),text(diff::format_summary(&d.summary)),text(d.diff)],"details":details});
+            let mut result = json!({"content":[text(format!("{} {} block(s) in {path}.{note}", if preview {"Previewed"} else {"Patched"}, edits.len())),text(diff::format_summary(&d.summary)),text(d.diff)],"details":details});
+            if preview {
+                let hash = result["details"]["sourceSha256"].as_str().unwrap();
+                let receipt = text(format!("Preview only; no file was written. Source SHA-256: {hash}. Apply the same edits with mode=apply and expectedSha256 set to this exact 64-character hash."));
+                result["content"].as_array_mut().unwrap().push(receipt);
+            }
             (edit::restore(&old, &changed.new_content), result, false)
         }
         "append" => {
@@ -139,9 +163,31 @@ pub fn transform(
                 return Err(DomainError::LimitExceeded("edit count".into()));
             }
             let mut new = old.into_owned();
-            for (applied, e) in edits.iter().enumerate() {
+            for e in &edits {
                 // Empty oldText is valid for editApply: the reference inserts at the start.
-                let Some(at) = new.find(&e.old_text) else {
+                let first = new.find(&e.old_text);
+                // Search after the first character, not after the whole match:
+                // overlapping occurrences ("aa" within "aaa") are ambiguous too.
+                let ambiguous = !e.old_text.is_empty()
+                    && first.is_some_and(|at| {
+                        let next = at + e.old_text.chars().next().unwrap().len_utf8();
+                        new[next..].contains(&e.old_text)
+                    });
+                if ambiguous {
+                    return Ok(Transformation {
+                        bytes: None,
+                        result: structured(&ApplyResult {
+                            path,
+                            applied: 0,
+                            verified: false,
+                            error: Some(format!(
+                                "oldText matches multiple locations in {path}. No changes from this call were written. Read the current target and include enough surrounding text to identify one unique location."
+                            )),
+                        })?,
+                        create_parents: false,
+                    });
+                }
+                let Some(at) = first else {
                     let mut units = 0;
                     let prefix: String = e
                         .old_text
@@ -155,9 +201,11 @@ pub fn transform(
                         bytes: None,
                         result: structured(&ApplyResult {
                             path,
-                            applied,
+                            applied: 0,
                             verified: false,
-                            error: Some(format!("oldText not found in {path}: {prefix}")),
+                            error: Some(format!(
+                                "oldText not found in {path}: {prefix}. No changes from this call were written."
+                            )),
                         })?,
                         create_parents: false,
                     });
@@ -186,7 +234,7 @@ pub fn transform(
         return Err(DomainError::LimitExceeded("edited file bytes".into()));
     }
     Ok(Transformation {
-        bytes: Some(new.into_bytes()),
+        bytes: if preview { None } else { Some(new.into_bytes()) },
         result,
         create_parents: parents,
     })

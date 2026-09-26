@@ -68,6 +68,10 @@ impl AuthorizedCall {
             now,
         } = fence;
         registry.validate_current(&self.call)?;
+        if let Some(identity) = self.call.mcp_identity() {
+            identity.check_scope(scope)?;
+            if identity.target_revision() != target_revision { return Err(DomainError::Conflict); }
+        }
         if self.scope != *scope
             || self.registry_revision != registry.revision()
             || self.policy_revision != policy_revision
@@ -128,6 +132,10 @@ impl Authorizer {
         call: ValidatedCall,
         context: PreflightContext<'_>,
     ) -> Result<Preflight, DomainError> {
+        self.preflight_in_folders(call,context,&[])
+    }
+    /// Folder grants are host-selected and must share the scope's lifetime fence.
+    pub fn preflight_in_folders(&mut self, call: ValidatedCall, context: PreflightContext<'_>, folders: &[String]) -> Result<Preflight, DomainError> {
         let PreflightContext {
             scope,
             policy,
@@ -142,12 +150,18 @@ impl Authorizer {
                 "approval lifetime or target revision".into(),
             ));
         }
+        if let Some(identity) = call.mcp_identity() {
+            identity.check_scope(scope)?;
+            if identity.target_revision() != target_revision { return Err(DomainError::Conflict); }
+            if let Some(review) = call.mcp_reviewed_policy() { review.check(identity)?; }
+        }
         if let Some(old) = self.pending.get(call.operation()) {
             if old.call.args_hash() != call.args_hash()
                 || old.call.name() != call.name()
                 || old.call.call_id() != call.call_id()
                 || old.scope != *scope
                 || old.call.registry_revision != call.registry_revision
+                || old.call.mcp_reviewed_policy() != call.mcp_reviewed_policy()
                 || old.request.binding.target_revision != target_revision
                 || old.request.binding.policy_revision != policy_revision
                 || now >= old.request.binding.expires_ms
@@ -156,7 +170,15 @@ impl Authorizer {
             }
             return Ok(Preflight::Approval(old.request.clone()));
         }
-        let decision = policy::evaluate(call.name(), call.args(), policy, untrusted_extensions)?;
+        let decision = if call.origin() == super::registry::Origin::Mcp {
+            super::mcp::decision(&call, policy)?
+        } else if call.origin() == super::registry::Origin::TrustedHost && call.name() == super::mcp::discovery::NAME {
+            // This native facade reads cached metadata and changes only the
+            // bounded request selection. It cannot connect or execute MCP calls.
+            policy::Decision { allow: true, reason: None, approval_request: None }
+        } else {
+            policy::evaluate_in_folders(call.name(), call.args(), policy, untrusted_extensions, folders)?
+        };
         if !decision.allow {
             return Ok(Preflight::Rejected(
                 decision
@@ -241,5 +263,26 @@ impl Authorizer {
             target_revision: target_revision.into(),
             expires_ms: Some(binding.expires_ms),
         }))
+    }
+
+    /// Review expiry is checked and consumed before issuing a separately bounded
+    /// execution capability. All identity, revision and replay checks still apply.
+    pub fn answer_for_execution(
+        &mut self,
+        binding: &Binding,
+        allow: bool,
+        registry: &Registry,
+        fence: ExecutionFence<'_>,
+        execution_ms: u64,
+    ) -> Result<Option<AuthorizedCall>, DomainError> {
+        if execution_ms == 0 || execution_ms > 86_430_000 {
+            return Err(DomainError::InvalidInput("execution lifetime".into()));
+        }
+        let expires = fence.now.checked_add(execution_ms).ok_or(DomainError::Conflict)?;
+        let mut authorization = self.answer(binding, allow, registry, fence)?;
+        if let Some(authorization) = &mut authorization {
+            authorization.expires_ms = Some(expires);
+        }
+        Ok(authorization)
     }
 }

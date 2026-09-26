@@ -1,0 +1,979 @@
+--- before/product/crates/ag1-core/src/tools/mcp.rs
++++ product/crates/ag1-core/src/tools/mcp.rs
+@@ -41,11 +41,39 @@
+ #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+ #[serde(rename_all = "camelCase", deny_unknown_fields)]
+ pub struct Identity {
++    /// Native conversation owner, independent of the canonical project grant.
++    /// Deserializing this provenance never creates an executable capability.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub execution_scope: Option<ExecutionScope>,
+     #[serde(default, skip_serializing_if = "Kind::is_tool")]
+     pub kind: Kind,
+     pub binding: Binding,
+     pub original_name: String,
+     pub metadata_digest: String,
++}
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase", deny_unknown_fields)]
++pub struct ExecutionScope {
++    pub workspace: String,
++    pub session: String,
++    pub epoch: u64,
++}
++impl ExecutionScope {
++    pub fn from_native(scope: &super::registry::Scope) -> Result<Self, DomainError> {
++        let value = Self {
++            workspace: scope.workspace.clone(),
++            session: scope.session.clone(),
++            epoch: scope.epoch,
++        };
++        value.validate()?;
++        Ok(value)
++    }
++    fn validate(&self) -> Result<(), DomainError> {
++        if !label(&self.workspace) || !label(&self.session) || self.epoch == 0 {
++            return Err(invalid());
++        }
++        Ok(())
++    }
+ }
+ fn invalid() -> DomainError {
+     DomainError::InvalidInput("MCP tool identity or metadata".into())
+@@ -83,6 +111,9 @@
+ impl Identity {
+     pub fn validate(&self) -> Result<(), DomainError> {
+         self.binding.validate()?;
++        if let Some(owner) = &self.execution_scope {
++            owner.validate()?;
++        }
+         let valid_name = if matches!(self.kind, Kind::Resource | Kind::ResourceTemplate) {
+             !self.original_name.is_empty()
+                 && self.original_name.len() <= 4096
+@@ -119,7 +150,14 @@
+         format!("mcp:{}", hash(&json!(self)))
+     }
+     pub fn check_scope(&self, scope: &super::registry::Scope) -> Result<(), DomainError> {
+-        if matches!(&self.binding.scope,Scope::Workspace(id) if id != &scope.workspace) {
++        if let Some(owner) = &self.execution_scope {
++            if owner.workspace != scope.workspace
++                || owner.session != scope.session
++                || owner.epoch != scope.epoch
++            {
++                return Err(DomainError::PermissionDenied);
++            }
++        } else if matches!(&self.binding.scope,Scope::Workspace(id) if id != &scope.workspace) {
+             return Err(DomainError::PermissionDenied);
+         }
+         Ok(())
+@@ -198,6 +236,7 @@
+             ));
+         }
+         let identity = Identity {
++            execution_scope: None,
+             kind: Kind::Tool,
+             binding,
+             original_name: name.into(),
+@@ -207,6 +246,18 @@
+             "parameters":original["inputSchema"],"sourceInfo":{"source":"mcp","serverId":identity.binding.server_id,
+                 "originalName":identity.original_name,"scope":identity.binding.scope,"identityDigest":identity.target_revision()}});
+         Ok(Self { identity, metadata })
++    }
++    /// Host-only typed publication: peer metadata cannot select this owner.
++    pub fn for_execution_scope(
++        mut self,
++        owner: Option<&ExecutionScope>,
++    ) -> Result<Self, DomainError> {
++        if let Some(owner) = owner {
++            owner.validate()?;
++        }
++        self.identity.execution_scope = owner.cloned();
++        self.metadata["sourceInfo"]["identityDigest"] = json!(self.identity.target_revision());
++        Ok(self)
+     }
+     pub fn identity(&self) -> &Identity {
+         &self.identity
+--- before/product/crates/ag1-core/src/tools/mcp/capability.rs
++++ product/crates/ag1-core/src/tools/mcp/capability.rs
+@@ -142,6 +142,7 @@
+             Kind::Tool => unreachable!(),
+         }
+         let identity = Identity {
++            execution_scope: None,
+             binding,
+             kind,
+             original_name: key.into(),
+--- before/product/crates/ag1-platform/src/client/conversations.rs
++++ product/crates/ag1-platform/src/client/conversations.rs
+@@ -91,6 +91,7 @@
+         let ui = Arc::new(extensions::Ui::default());
+         let source = &self.services;
+         let services = Arc::new(Services {
++            mcp: self.services.mcp.clone(),
+             github: source.github.clone(),
+             working_projects: Mutex::new(Default::default()),
+             folder_access: Mutex::new(Default::default()),
+--- before/product/crates/ag1-platform/src/client/mod.rs
++++ product/crates/ag1-platform/src/client/mod.rs
+@@ -223,7 +223,13 @@
+         })
+     }
+ }
++#[cfg(target_os = "linux")]
++pub use crate::mcp::service::Context as McpServices;
++#[cfg(not(target_os = "linux"))]
++#[derive(Clone)]
++pub struct McpServices;
+ struct Services {
++    mcp: Option<McpServices>,
+     github: Option<Arc<crate::github::service::Service>>,
+     working_projects: Mutex<std::collections::BTreeMap<String, Arc<Mutex<Option<crate::projects::Runtime>>>>>,
+     folder_access: Mutex<std::collections::BTreeMap<String, Arc<crate::folder_access::FolderAccess>>>,
+@@ -386,6 +392,14 @@
+             .map_err(|_| DomainError::Conflict)??;
+             if let Some(extension) = &adapters.extensions {
+                 extension.install_tools(&mut registry)?;
++            }
++            #[cfg(target_os = "linux")]
++            if let Some(mcp)=&self.mcp && let Some(catalog_scope)=mcp.catalog_scope(&self.workspace,&folders)? {
++                let scope=ag1_core::tools::registry::Scope {workspace:workspace.id().as_str().into(),session:input.target.session.as_str().into(),epoch:input.epoch,revision:0};
++                let session=mcp.service.session(catalog_scope,scope,Some(self.approval_policy.clone()))?;
++                session.discovery().register(&mut registry)?;
++                adapters.mcp_discovery=Some(session.discovery().clone());
++                adapters.mcp_management=Some(session);
+             }
+             let mut names = adapters.available_names();
+             names.push("task".into());
+@@ -570,7 +584,7 @@
+             None,
+             None,
+             None,
+-            None,
++            None, None,
+         )
+         .await
+     }
+@@ -591,7 +605,7 @@
+             None,
+             Some(observer),
+             None,
+-            None,
++            None, None,
+         )
+         .await
+     }
+@@ -615,7 +629,7 @@
+             Some(runtime),
+             None,
+             None,
+-            None,
++            None, None,
+         )
+         .await
+     }
+@@ -630,7 +644,7 @@
+             || serde_json::to_value(&config.runtime).map_err(json_error)?
+                 != serde_json::to_value(&parent.config.runtime).map_err(json_error)?
+         {
+-            return Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,parent.services.github.clone()).await;
++            return Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,parent.services.github.clone(),None).await;
+         }
+         parent.check_authority()?;
+         Self::open_composed(
+@@ -641,14 +655,37 @@
+             None,
+             None,
+             Some(parent),
+-            parent.services.github.clone(),
++            parent.services.github.clone(), None,
+         )
+         .await
+     }
+     /// Application-owned account capability, never a path supplied by model
+     /// arguments or imported project configuration.
+     pub async fn open_integrated(workspace:&Path,state:&Path,config:Config,github:Arc<crate::github::service::Service>) -> Result<Arc<Self>> {
+-        Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,Some(github)).await
++        Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,Some(github),None).await
++    }
++    /// Desktop supplies explicit account/project MCP context without changing
++    /// model configuration or inferring availability from imported metadata.
++    #[cfg(target_os = "linux")]
++    pub async fn open_with_mcp(workspace:&Path,state:&Path,config:Config,github:Arc<crate::github::service::Service>,mcp:McpServices,parent:Option<&Host>) -> Result<Arc<Self>> {
++        let shared=match parent {
++            Some(parent) if config.models==parent.config.models && serde_json::to_value(&config.runtime).map_err(json_error)?==serde_json::to_value(&parent.config.runtime).map_err(json_error)? => Some(parent),
++            _=>None,
++        };
++        if let Some(parent)=shared {parent.check_authority()?;}
++        Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,shared,Some(github),Some(mcp)).await
++    }
++    /// Owned offline acceptance uses the same composition with an isolated
++    /// authority registry. It cannot inject a live model runtime or credentials.
++    #[cfg(target_os = "linux")]
++    pub async fn open_mcp_rehearsal(
++        workspace: &Path, state: &Path, config: Config,
++        authority_registry: &crate::cutover::Registry, mcp: McpServices,
++    ) -> Result<Arc<Self>> {
++        if !config.fixture || config.runtime.is_some() || config.credential_env.is_some() {
++            return Err(DomainError::PermissionDenied);
++        }
++        Self::open_composed(workspace,state,config,authority_registry,None,None,None,None,Some(mcp)).await
+     }
+     async fn open_composed(
+         workspace: &Path,
+@@ -659,6 +696,7 @@
+         observer: Option<crate::provider::http::RequestObserver>,
+         shared: Option<&Host>,
+         github: Option<Arc<crate::github::service::Service>>,
++        mcp: Option<McpServices>,
+     ) -> Result<Arc<Self>> {
+         let workspace = WorkspaceService::new()?.register(workspace)?;
+         fs::create_dir_all(state).map_err(crate::io_error)?;
+@@ -800,6 +838,7 @@
+         }
+         let approval_policy = approval_policy::ApprovalPolicy::open(&state, &config.policy_mode)?;
+         let services = Arc::new(Services {
++            mcp,
+             github,
+             working_projects: Mutex::new(Default::default()),
+             folder_access: Mutex::new(Default::default()),
+--- before/product/crates/ag1-platform/src/client/queries.rs
++++ product/crates/ag1-platform/src/client/queries.rs
+@@ -7,6 +7,12 @@
+         let selected = self.registry.selected()?;
+         let session = selected.services.runtime();
+         Ok(Some(match command {
++            #[cfg(target_os = "linux")]
++            w::Command::Runtime {action,args} if action=="mcp_manager"=>{
++                let current=self.commands.snapshot()?.scope;
++                let scope=ag1_core::tools::registry::Scope {workspace:current.workspace.as_str().into(),session:current.session.as_str().into(),epoch:session.context_epoch()?,revision:session.journal_revision()?};
++                selected.services.tools().client_mcp().ok_or_else(||DomainError::Unavailable("MCP manager is unavailable for this chat; choose an available working folder or reopen the desktop".into()))?.dispatch(&scope,args)?
++            },
+             w::Command::Files {action,args} if action=="github_upload_preview"=>self.github_upload_preview(args)?,
+             w::Command::Files {action,args} if action=="git_preview"=>self.local_git_preview(args)?,
+             w::Command::Files {action,args} if action=="git_dismiss"=>self.local_git_dismiss(args)?,
+--- before/product/crates/ag1-platform/src/mcp/manager.rs
++++ product/crates/ag1-platform/src/mcp/manager.rs
+@@ -38,7 +38,9 @@
+ mod execution;
+ mod prepared;
+ pub(crate) use prepared::{PreparedOperation, RuntimeCheck};
++mod lease;
+ mod selection;
++pub use lease::SessionLease;
+ pub use selection::{SelectedTool, Selection, ToolMatch, ToolMatches};
+ 
+ const MAX_CONNECTIONS: usize = 4;
+@@ -66,11 +68,23 @@
+ #[serde(deny_unknown_fields)]
+ pub struct ServerRecord {
+     pub id: String,
+-    /// Changes for public configuration AND availability; conservatively fences
+-    /// every pending review and every connection to this definition.
++    /// Management CAS revision: configuration or availability changed.
+     pub revision: u64,
++    /// Separate connection identity keeps unrelated allowed scopes alive when
++    /// availability changes. Zero imports the legacy record's revision.
++    #[serde(default)]
++    config_revision: u64,
+     pub draft: Draft,
+     pub availability: Availability,
++}
++impl ServerRecord {
++    pub fn configuration_revision(&self) -> u64 {
++        if self.config_revision == 0 {
++            self.revision
++        } else {
++            self.config_revision
++        }
++    }
+ }
+ #[derive(Clone, Default, Serialize, Deserialize)]
+ #[serde(deny_unknown_fields)]
+@@ -128,6 +142,7 @@
+     pub encoded_bytes: usize,
+ }
+ struct Control {
++    lease: Option<Arc<lease::Token>>,
+     cancelled: AtomicBool,
+     send_gate: Mutex<()>,
+     busy: AtomicBool,
+@@ -181,6 +196,7 @@
+ /// Its public projection contains only the saved public configuration and launch
+ /// identity. It neither enables scope availability nor grants any tool call.
+ pub struct ConnectionReview {
++    lease: Option<Arc<lease::Token>>,
+     owner: Arc<()>,
+     pending: Arc<AtomicUsize>,
+     record: ServerRecord,
+@@ -311,7 +327,7 @@
+     helper: PathBuf,
+     limits: DiscoveryLimits,
+ }
+-fn new_id() -> Result<String, DomainError> {
++pub(super) fn new_id() -> Result<String, DomainError> {
+     let mut bytes = [0u8; 16];
+     File::open("/dev/urandom")
+         .and_then(|mut f| f.read_exact(&mut bytes))
+@@ -341,7 +357,10 @@
+                 return Err(invalid("stored server count"));
+             }
+             for (key, record) in &records.servers {
+-                if key != &record.id || record.revision == 0 {
++                if key != &record.id
++                    || record.revision == 0
++                    || record.config_revision > record.revision
++                {
+                     return Err(invalid("stored server identity"));
+                 }
+                 record.draft.validate()?;
+@@ -424,6 +443,7 @@
+                 ServerRecord {
+                     id: id.clone(),
+                     revision: 1,
++                    config_revision: 1,
+                     draft,
+                     availability: Availability::default(),
+                 },
+@@ -433,8 +453,8 @@
+         self.commit(&mut state, next)?;
+         Ok(ids)
+     }
+-    /// An edit invalidates grants as well as pending/live connections. Availability
+-    /// changes preserve configuration, but still require a fresh connection review.
++    /// Configuration edits invalidate all connections and grants. Availability
++    /// changes revoke denied scopes while preserving unrelated allowed leases.
+     pub fn edit(&self, id: &str, expected: u64, draft: Draft) -> Result<(), DomainError> {
+         draft.validate()?;
+         self.change(
+@@ -471,9 +491,12 @@
+         if record.revision != expected {
+             return Err(DomainError::Conflict);
+         }
++        record.config_revision = record.configuration_revision();
+         record.revision = expected.checked_add(1).ok_or(DomainError::Conflict)?;
++        let configuration_changed = draft.is_some();
+         if let Some(draft) = draft {
+             record.draft = draft;
++            record.config_revision = record.revision;
+         }
+         if let Some(availability) = availability {
+             record.availability = availability;
+@@ -484,14 +507,21 @@
+         // Block publication/cancel before persistence. Failure leaves the entire
+         // owner retired, so late work cannot revive permissive state.
+         for worker in state.live.values() {
+-            if worker
++            let status = worker
+                 .control
+                 .view
+                 .lock()
+                 .map_err(|_| DomainError::Conflict)?
+                 .status
+-                .server_id
+-                == id
++                .clone();
++            if status.server_id == id
++                && (remove
++                    || configuration_changed
++                    || status.inspection_only
++                    || !next
++                        .servers
++                        .get(id)
++                        .is_some_and(|r| r.availability.allows(&status.scope)))
+             {
+                 worker.control.cancel();
+             }
+@@ -557,6 +587,7 @@
+             })
+             .map_err(|_| DomainError::LimitExceeded("MCP pending reviews".into()))?;
+         Ok(ConnectionReview {
++            lease: None,
+             owner: self.owner.clone(),
+             pending: self.reviews.clone(),
+             record,
+@@ -598,6 +629,13 @@
+         }
+         self.reap_finished()?;
+         let mut state = self.state()?;
++        if review
++            .lease
++            .as_ref()
++            .is_some_and(|lease| lease.closed.load(Ordering::Acquire))
++        {
++            return Err(DomainError::PermissionDenied);
++        }
+         let record = state
+             .records
+             .servers
+@@ -617,6 +655,7 @@
+             w.control.view.lock().is_ok_and(|v| {
+                 v.status.server_id == record.id
+                     && v.status.scope == review.scope
++                    && lease::same(w.control.lease.as_ref(), review.lease.as_ref())
+                     && !matches!(
+                         v.status.health,
+                         ConnectionHealth::Stopped | ConnectionHealth::Failed
+@@ -630,6 +669,7 @@
+         let (http_cancel, token) = cancellation();
+         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+         let control = Arc::new(Control {
++            lease: review.lease.clone(),
+             cancelled: AtomicBool::new(false),
+             send_gate: Mutex::new(()),
+             busy: AtomicBool::new(false),
+@@ -751,7 +791,7 @@
+             .catalog
+             .as_ref()
+             .ok_or(DomainError::Unavailable("MCP catalog not ready".into()))?;
+-        if record.revision != catalog.binding.config_revision
++        if record.configuration_revision() != catalog.binding.config_revision
+             || view.status.health != ConnectionHealth::Ready
+         {
+             return Err(DomainError::Conflict);
+@@ -862,7 +902,7 @@
+     CatalogBinding {
+         server_id: record.id.clone(),
+         scope,
+-        config_revision: record.revision,
++        config_revision: record.configuration_revision(),
+         auth_profile: "mcp-unauthenticated".into(),
+         credential_generation: 0,
+         // Per-connection UUID is also carried by native status; this monotonically
+--- before/product/crates/ag1-platform/src/mcp/manager/capability.rs
++++ product/crates/ag1-platform/src/mcp/manager/capability.rs
+@@ -39,7 +39,7 @@
+             Kind::Prompt => self.prompts.iter().collect(),
+         }
+     }
+-    pub(super) fn definition(
++    pub(crate) fn definition(
+         &self,
+         kind: Kind,
+         key: &str,
+@@ -51,8 +51,13 @@
+             .ok_or(DomainError::NotFound)?;
+         SelectedDefinition::capability(binding(&self.binding), kind, row)
+     }
+-    pub(super) fn matches(&self, identity: &Identity) -> bool {
+-        if binding(&self.binding) != identity.binding {
++    pub(super) fn matches(
++        &self,
++        identity: &Identity,
++        owner: Option<&ag1_core::tools::mcp::ExecutionScope>,
++    ) -> bool {
++        if binding(&self.binding) != identity.binding || identity.execution_scope.as_ref() != owner
++        {
+             return false;
+         }
+         if identity.kind == Kind::Tool {
+@@ -61,6 +66,7 @@
+             });
+         }
+         self.definition(identity.kind, &identity.original_name)
++            .and_then(|d| d.for_execution_scope(owner))
+             .is_ok_and(|d| d.identity() == identity)
+     }
+ }
+@@ -74,6 +80,16 @@
+         query: &str,
+         limit: usize,
+     ) -> Result<CapabilityMatches, DomainError> {
++        self.search_capabilities_for(scope, kind, query, limit, None)
++    }
++    pub(super) fn search_capabilities_for(
++        &self,
++        scope: &CatalogScope,
++        kind: Kind,
++        query: &str,
++        limit: usize,
++        lease: Option<&std::sync::Arc<super::lease::Token>>,
++    ) -> Result<CapabilityMatches, DomainError> {
+         validate_scope(scope)?;
+         if query.len() > 256 || query.chars().any(char::is_control) || !(1..=20).contains(&limit) {
+             return Err(DomainError::InvalidInput(
+@@ -86,6 +102,9 @@
+         let mut found = 0;
+         let mut searched_entries = 0;
+         for (connection, worker) in &state.live {
++            if !super::lease::same(worker.control.lease.as_ref(), lease) {
++                continue;
++            }
+             let view = worker
+                 .control
+                 .view
+@@ -105,7 +124,7 @@
+             let Some(catalog) = &view.catalog else {
+                 continue;
+             };
+-            if catalog.binding.config_revision != record.revision {
++            if catalog.binding.config_revision != record.configuration_revision() {
+                 continue;
+             }
+             for row in catalog.rows(kind) {
+--- before/product/crates/ag1-platform/src/mcp/manager/execution.rs
++++ product/crates/ag1-platform/src/mcp/manager/execution.rs
+@@ -59,7 +59,13 @@
+         }
+         let catalog = view.catalog.as_ref().ok_or(DomainError::Conflict)?;
+         let identity = self.identity();
+-        if !catalog.matches(identity) {
++        if !catalog.matches(
++            identity,
++            control
++                .lease
++                .as_ref()
++                .and_then(|l| l.execution_scope.as_ref()),
++        ) {
+             return Err(DomainError::Conflict);
+         }
+         if let Some(check) = &self.check {
+--- before/product/crates/ag1-platform/src/mcp/manager/selection.rs
++++ product/crates/ag1-platform/src/mcp/manager/selection.rs
+@@ -117,9 +117,16 @@
+                 return Err(DomainError::Conflict);
+             }
+             let catalog = view.catalog.as_ref().ok_or(DomainError::Conflict)?;
+-            if record.revision != catalog.binding.config_revision
++            if record.configuration_revision() != catalog.binding.config_revision
+                 || binding(&catalog.binding) != identity.binding
+-                || !catalog.matches(identity)
++                || !catalog.matches(
++                    identity,
++                    worker
++                        .control
++                        .lease
++                        .as_ref()
++                        .and_then(|l| l.execution_scope.as_ref()),
++                )
+             {
+                 return Err(DomainError::Conflict);
+             }
+@@ -193,6 +200,9 @@
+         let mut found = 0;
+         let mut searched_tools = 0;
+         for (connection, worker) in &state.live {
++            if worker.control.lease.is_some() {
++                continue;
++            }
+             let view = worker
+                 .control
+                 .view
+@@ -215,7 +225,7 @@
+             let Some(catalog) = &view.catalog else {
+                 continue;
+             };
+-            if catalog.binding.config_revision != record.revision {
++            if catalog.binding.config_revision != record.configuration_revision() {
+                 continue;
+             }
+             for tool in &catalog.tools {
+@@ -285,6 +295,15 @@
+         scope: CatalogScope,
+         selected: &[SelectedCapability],
+     ) -> Result<Selection, DomainError> {
++        self.select_capabilities_for(registry, scope, selected, None)
++    }
++    pub(super) fn select_capabilities_for(
++        &self,
++        registry: &mut Registry,
++        scope: CatalogScope,
++        selected: &[SelectedCapability],
++        lease: Option<&Arc<super::lease::Token>>,
++    ) -> Result<Selection, DomainError> {
+         crate::mcp::definitions::validate_scope(&scope)?;
+         if selected.len() > mcp::MAX_SELECTED_TOOLS {
+             return Err(DomainError::LimitExceeded("MCP selected tool count".into()));
+@@ -298,6 +317,9 @@
+                 .live
+                 .get(&request.connection_id)
+                 .ok_or(DomainError::NotFound)?;
++            if !super::lease::same(worker.control.lease.as_ref(), lease) {
++                return Err(DomainError::PermissionDenied);
++            }
+             let view = worker
+                 .control
+                 .view
+@@ -320,10 +342,12 @@
+                 return Err(DomainError::PermissionDenied);
+             }
+             let catalog = view.catalog.as_ref().ok_or(DomainError::Conflict)?;
+-            if catalog.binding.config_revision != record.revision {
+-                return Err(DomainError::Conflict);
+-            }
+-            let definition = catalog.definition(request.kind, &request.key)?;
++            if catalog.binding.config_revision != record.configuration_revision() {
++                return Err(DomainError::Conflict);
++            }
++            let definition = catalog
++                .definition(request.kind, &request.key)?
++                .for_execution_scope(lease.and_then(|l| l.execution_scope.as_ref()))?;
+             schema_bytes = schema_bytes
+                 .checked_add(definition.metadata().to_string().len())
+                 .ok_or(DomainError::Conflict)?;
+--- before/product/crates/ag1-platform/src/mcp/mod.rs
++++ product/crates/ag1-platform/src/mcp/mod.rs
+@@ -8,6 +8,8 @@
+ pub mod http;
+ #[cfg(target_os = "linux")]
+ pub mod manager;
++#[cfg(target_os = "linux")]
++pub mod service;
+ pub(crate) mod operation;
+ mod sse;
+ #[cfg(target_os = "linux")]
+--- before/product/crates/ag1-platform/src/mcp/operation.rs
++++ product/crates/ag1-platform/src/mcp/operation.rs
+@@ -91,7 +91,8 @@
+         .iter()
+         .find(|row| row[identity.kind.key_field()] == identity.original_name)
+         .ok_or(DomainError::Conflict)?;
+-    let definition = SelectedDefinition::capability(identity.binding.clone(), identity.kind, row)?;
++    let definition = SelectedDefinition::capability(identity.binding.clone(), identity.kind, row)?
++        .for_execution_scope(identity.execution_scope.as_ref())?;
+     if definition.identity() != identity {
+         return Err(DomainError::Conflict);
+     }
+--- before/product/crates/ag1-platform/src/session.rs
++++ product/crates/ag1-platform/src/session.rs
+@@ -92,6 +92,8 @@
+ /// receipts. Implementations own policy/preflight and concurrency; they must
+ /// drain accepted effects even if cancellation is requested.
+ pub trait ToolRunner: Send + Sync {
++    #[cfg(target_os = "linux")]
++    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> { None }
+     /// Capture an immutable native MCP selection for this one request/batch.
+     #[cfg(target_os = "linux")]
+     fn mcp_request_runner(&self, _scope:&Scope) -> Result<Option<Arc<dyn ToolRunner>>,DomainError> { Ok(None) }
+--- before/product/crates/ag1-platform/src/session/adapters.rs
++++ product/crates/ag1-platform/src/session/adapters.rs
+@@ -38,6 +38,8 @@
+     pub mcp: Option<Arc<super::mcp::SessionCapabilities>>,
+     #[cfg(target_os = "linux")]
+     pub mcp_discovery: Option<Arc<super::mcp::discovery::Discovery>>,
++    #[cfg(target_os = "linux")]
++    pub mcp_management: Option<Arc<crate::mcp::service::Session>>,
+     pub local_git: Vec<Arc<crate::github::local::LocalGit>>,
+     pub github: Option<Arc<crate::github::service::Service>>,
+     pub folders: Option<Arc<crate::folder_access::Snapshot>>,
+--- before/product/crates/ag1-platform/src/session/files.rs
++++ product/crates/ag1-platform/src/session/files.rs
+@@ -481,6 +481,8 @@
+ }
+ impl ToolRunner for NativeToolRunner {
+     #[cfg(target_os = "linux")]
++    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> { self.adapters.mcp_management.clone() }
++    #[cfg(target_os = "linux")]
+     fn mcp_request_runner(&self,scope:&Scope)->Result<Option<Arc<dyn ToolRunner>>,DomainError> {
+         let Some(discovery)=&self.adapters.mcp_discovery else { return Ok(None); };
+         let mut runner=self.clone();
+@@ -507,6 +509,8 @@
+             } else { Some(tool.clone()) }
+         }).collect();
+         if dynamic && valid {
++            let facade=ag1_core::tools::mcp::discovery::NAME;
++            if !view.iter().any(|t|t["name"]==facade) && let Some(tool)=catalog.iter().find(|t|t["name"]==facade) { view.push(tool.clone()); }
+             view.extend(catalog.into_iter().filter(|t|self.registry.definitions().any(|d|d.origin==ag1_core::tools::registry::Origin::Mcp && d.metadata["name"]==t["name"])));
+         }
+         Ok(view)
+@@ -692,6 +696,8 @@
+         )
+     }
+     fn quiesce(&self, scope: &Scope, operation: &str) -> Result<(), DomainError> {
++        #[cfg(target_os = "linux")]
++        if let Some(mcp)=&self.adapters.mcp_management { mcp.close()?; }
+         if let Some(jobs) = &self.adapters.jobs {
+             let mut artifacts = ContextStore::new(
+                 &self.store,
+--- before/product/crates/ag1-platform/src/session/mcp/discovery.rs
++++ product/crates/ag1-platform/src/session/mcp/discovery.rs
+@@ -18,6 +18,7 @@
+     selection: Selection,
+ }
+ pub struct Discovery {
++    lease: Option<Arc<crate::mcp::manager::SessionLease>>,
+     manager: Arc<Manager>,
+     catalog_scope: CatalogScope,
+     scope: Scope,
+@@ -84,6 +85,7 @@
+             policy.clone(),
+         )?;
+         Ok(Self {
++            lease: None,
+             manager,
+             catalog_scope,
+             scope,
+@@ -95,10 +97,56 @@
+             revision: Arc::new(AtomicU64::new(1)),
+         })
+     }
++    pub fn owned(
++        lease: Arc<crate::mcp::manager::SessionLease>,
++        scope: Scope,
++        policy: Option<Arc<crate::client::approval_policy::ApprovalPolicy>>,
++    ) -> Result<Self, DomainError> {
++        if scope.workspace.is_empty() || scope.session.is_empty() || scope.epoch == 0 {
++            return Err(DomainError::PermissionDenied);
++        }
++        // The native folder resolver bound this lease to the canonical project.
++        // Its directory identity may differ from the conversation journal owner.
++        let selection = lease.select(&mut Registry::builtins()?, &[])?;
++        Ok(Self {
++            manager: lease.manager().clone(),
++            catalog_scope: lease.scope().clone(),
++            lease: Some(lease),
++            scope,
++            policy,
++            state: Mutex::new(State {
++                definitions: vec![],
++                selection,
++            }),
++            revision: Arc::new(AtomicU64::new(1)),
++        })
++    }
++
++    pub fn close(&self) -> Result<(), DomainError> {
++        if let Some(lease) = &self.lease {
++            lease.close()?;
++        }
++        Ok(())
++    }
++    fn capabilities(
++        &self,
++        registry: &mut Registry,
++        selected: &[SelectedCapability],
++    ) -> Result<Selection, DomainError> {
++        if let Some(lease) = &self.lease {
++            lease.select(registry, selected)
++        } else {
++            self.manager
++                .select_capabilities(registry, self.catalog_scope.clone(), selected)
++        }
++    }
+     pub fn register(&self, registry: &mut Registry) -> Result<(), DomainError> {
+         registry.register_sdk(ag1_core::tools::mcp::discovery::metadata())
+     }
+     fn owner(&self, scope: &Scope) -> Result<(), DomainError> {
++        if let Some(lease) = &self.lease {
++            lease.check()?;
++        }
+         if scope.workspace != self.scope.workspace
+             || scope.session != self.scope.session
+             || scope.epoch != self.scope.epoch
+@@ -128,11 +176,7 @@
+             .checked_add(1)
+             .ok_or(DomainError::Conflict)?;
+         let mut registry = Registry::builtins()?;
+-        let selection = self.manager.select_capabilities(
+-            &mut registry,
+-            self.catalog_scope.clone(),
+-            selected,
+-        )?;
++        let selection = self.capabilities(&mut registry, selected)?;
+         let definitions = registry.mcp_selection();
+         state.definitions = definitions;
+         state.selection = selection;
+@@ -219,22 +263,22 @@
+         )?;
+         let value = match plan.action {
+             Action::Search { kind, query, limit } => {
+-                let found = self.manager.search_capabilities(
+-                    &self.catalog_scope,
+-                    kind,
+-                    &query,
+-                    limit.unwrap_or(10),
+-                )?;
++                let found = if let Some(lease) = &self.lease {
++                    lease.search(kind, &query, limit.unwrap_or(10))?
++                } else {
++                    self.manager.search_capabilities(
++                        &self.catalog_scope,
++                        kind,
++                        &query,
++                        limit.unwrap_or(10),
++                    )?
++                };
+                 let rows: Vec<_> = found.matches.into_iter().map(|r| json!({"connectionId":r.connection_id,"serverId":r.server_id,"kind":r.kind,"key":r.key,"name":r.name,"description":r.description,"available":r.available})).collect();
+                 json!({"matches":rows,"searchedEntries":found.searched_entries,"truncated":found.truncated,"source":"cached MCP metadata"})
+             }
+             Action::Inspect { entry } => {
+                 let mut registry = Registry::builtins()?;
+-                self.manager.select_capabilities(
+-                    &mut registry,
+-                    self.catalog_scope.clone(),
+-                    &[entry.into()],
+-                )?;
++                self.capabilities(&mut registry, &[entry.into()])?;
+                 json!({"definitions":registry.mcp_selection().iter().map(|d|json!({"identity":d.identity(),"metadata":d.metadata()})).collect::<Vec<_>>(),"selected":false})
+             }
+             Action::Select { entries } => {
+--- before/product/crates/ag1-platform/src/session/subagent.rs
++++ product/crates/ag1-platform/src/session/subagent.rs
+@@ -505,6 +505,10 @@
+         .ok_or_else(|| DomainError::InvalidInput("subagent clock".into()))?
+         .to_rfc3339();
+         let mut adapters = services.tools.adapters.clone();
++        // Parent MCP leases belong to its session epoch. Child profiles do not
++        // inherit them, and child cleanup must never close a parent's lease.
++        #[cfg(target_os = "linux")]
++        { adapters.mcp=None; adapters.mcp_discovery=None; adapters.mcp_management=None; }
+         adapters.delegation = None;
+         adapters.extensions = None;
+         // Share host launch configuration, with an isolated durable job book
+--- before/product/crates/ag1-platform/src/workspace.rs
++++ product/crates/ag1-platform/src/workspace.rs
+@@ -141,6 +141,14 @@
+     pub(crate) fn directory_identity(&self) -> (u64, u64) { (self.device, self.inode) }
+     pub fn id(&self) -> &WorkspaceId {
+         &self.id
++    }
++    /// Directory identity is distinct from the conversation journal owner after
++    /// a user changes the working folder. Only a verified native root supplies it.
++    pub(crate) fn canonical_id(&self) -> Result<WorkspaceId, DomainError> {
++        self.verify_root()?;
++        WorkspaceId::new(format!("ws-{:x}", Sha256::digest(
++            format!("{}:{}:{}", self.root.display(), self.device, self.inode).as_bytes()
++        )))
+     }
+     pub fn root(&self) -> &Path {
+         &self.root
+--- before/product/crates/ag1-platform/tests/mcp_runtime/mod.rs
++++ product/crates/ag1-platform/tests/mcp_runtime/mod.rs
+@@ -1,6 +1,8 @@
+ #![allow(dead_code, unused_imports)] // Shared native fixture also supports broader session tests.
+ include!("../support/session_fixture.rs");
+ mod discovery;
++mod management;
++mod composition;
+ use ag1_core::tools::executor::ExecutionArtifacts;
+ use ag1_core::tools::{approval::ApprovalRequest, mcp::Kind, registry::Scope};
+ use ag1_platform::{
+--- before/product/apps/desktop/src/App.tsx
++++ product/apps/desktop/src/App.tsx
+@@ -20,10 +20,11 @@
+ import { previewDocument } from "./preview";
+ import { ModelPicker } from "./ModelPicker";
+ import { Settings } from "./Settings";
++import { MCPManager } from "./MCPManager";
+ import { usePreferences, applyPreferences } from "./preferences";
+ import { ApprovalIcon, ApprovalChoices, approvalModes, type ApprovalMode } from "./ApprovalMenu";
+ const Editor = lazy(() => import("./Editor"));
+-type Page = "chat" | "files" | "settings";
++type Page = "chat" | "files" | "settings" | "mcp";
+ type FileView = { path: string; text: string; revision: string };
+ const safeApproval = (mode: string | null | undefined): ApprovalMode => mode === "autonomous" ? "autonomous" : "interactive";
+ const savedApproval = () => safeApproval(window.localStorage?.getItem("ag1.approval"));
+@@ -76,6 +77,7 @@
+   const queryScope = active ? JSON.stringify(active.scope) : "";
+   // Read-only display requests stay bound to the mounted conversation.
+   const query = useCallback(async (command: Command) => { const s = activeRef.current; if (!s || JSON.stringify(s.scope) !== queryScope) throw new Error("The conversation changed before this request could start"); return (await api.command(s, command)).data; }, [queryScope]);
++  const mcpRun = useCallback((args: JsonValue) => { if (!active) return Promise.reject(new Error("Open a chat first")); return run({ kind: "runtime", action: "mcp_manager", args }, active.scope); }, [run, queryScope]);
+   const scope = active ? `${active.workspace_path}/${active.scope.session}` : "";
+   const general = !!active && normalizedPath(active.workspace_path).endsWith("/general-chat");
+   const folderSelection = (view.details?.context as any)?.folder_access as FolderSelection | undefined;
+@@ -317,8 +319,8 @@
+   const chats = (catalog.chats ?? []).filter(c => !c.empty && !c.deleted && !!c.archived === archived && c.title.toLowerCase().includes(search.toLowerCase())).sort((a, b) => (b.updated ?? "").localeCompare(a.updated ?? ""));
+   function chatRow(chat: Chat) { const state = conversationStatuses.find(s => s.workspace === chat.workspace && s.session === chat.session); const working = state && ["streaming", "running", "queued"].includes(state.status); const label = state?.pending ? "Needs approval" : state?.error || state?.status === "failed" ? "Failed" : working ? state?.status === "queued" ? "Queued" : "Working" : state?.status === "completed" ? "Finished" : ""; return <div className={`chat-row ${chat.session === active?.scope.session && chat.workspace === active?.workspace_path ? "selected" : ""}`} key={`${chat.workspace}/${chat.session}`}><button disabled={busy} title={chat.title} onClick={() => void action(() => openChat(chat))}><MessageSquare size={14} /><span>{chat.title}</span>{label && <span className={`chat-run-state ${working ? "working" : ""}`} title={label} aria-label={label}>{working ? <LoaderCircle size={12} className="spin" /> : state?.pending ? "!" : state?.error || state?.status === "failed" ? "!" : <Check size={12} />}</span>}</button><details className="chat-options"><summary aria-label={`Options for ${chat.title}`}><MoreHorizontal size={16} /></summary><div className="menu"><button onClick={() => { setRenaming(chat); setNewTitle(chat.title); }}>Rename</button><button onClick={() => void action(() => saveChat({ ...chat, archived: !chat.archived }))}>{chat.archived ? "Restore chat" : "Archive chat"}</button><button className="danger-text" disabled={busy || !!working || !!state?.pending} onClick={() => setDeleting(chat)}>Delete chat</button></div></details></div>; }
+   return <GitHubReviewContext.Provider value={{ open: openGitHubReview, clear: clearGitHubReview }}><div className="shell redesigned">
+-    {sidebar && page !== "settings" && <aside className="chat-sidebar"><div className="sidebar-brand"><span>AG1</span><button aria-label="Hide sidebar" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></button></div><button className="new-chat" disabled={busy} onClick={() => void action(newChat)}><Plus size={17} />New chat</button><label className="chat-search"><Search size={15} /><input aria-label="Search chats" placeholder="Search chats" value={search} onChange={e => setSearch(e.target.value)} /></label><div className="sidebar-scroll"><div className="sidebar-section-title">Projects<button aria-label="Add project" disabled={busy} onClick={browseProject}><Plus size={15} /></button></div>{catalog.projects.map(p => <details className="project-chats" key={p} open><summary><FolderOpen size={14} /><span>{basename(p)}</span></summary><button className="project-open" title={p} disabled={busy} onClick={() => void action(() => openWorkspace(p))}>Open project</button>{chats.filter(c => c.workspace.replace(/\/+$/, "") === p.replace(/\/+$/, "")).map(chatRow)}</details>)}{!catalog.projects.length && <p className="sidebar-empty">Attach a project when you need one.</p>}<div className="sidebar-section-title">{archived ? "Archived chats" : "Chats"}</div>{chats.filter(c => c.general || !catalog.projects.some(p => p.replace(/\/+$/, "") === c.workspace.replace(/\/+$/, ""))).map(chatRow)}{!chats.length && <p className="sidebar-empty">Your conversations will appear here.</p>}</div><div className="sidebar-bottom"><button onClick={() => setArchived(!archived)}>{archived ? "Back to chats" : "Archived chats"}</button><button onClick={() => { setSettingsSection("github"); setPage("settings"); }}><Github size={16} />GitHub</button><button aria-label="Settings" onClick={() => { setSettingsSection("appearance"); setPage("settings"); }}><Settings2 size={16} />Settings</button></div></aside>}
+-    <main className="main"><header className="chat-header">{!sidebar && <button aria-label="Show sidebar" onClick={() => setSidebar(true)}><PanelLeftClose size={18} /></button>}<button className="chat-heading" onClick={() => setPage("chat")}>{page === "settings" ? "Settings" : navigating || currentChat?.title || "New chat"}</button><div className="header-actions"><button className="workspace-pill" aria-label={folderSelection ? "Chat folders" : undefined} title={folderSelection ? workingFolder : undefined} disabled={busy} onClick={() => folderSelection ? setFoldersDialog(true) : setProjectDialog(true)}><FolderOpen size={15} />{folderSelection ? normalizedPath(workingFolder || "").endsWith("/general-chat") ? "Chat folders" : basename(workingFolder || "") : active && !general ? basename(active.workspace_path) : "Attach project"}</button>{active && <><button aria-label="Files" title="Files" onClick={() => void action(() => navigate("files"))}><FileCode2 size={17} /></button><button aria-label="Changes" title="Review changes" aria-expanded={review?.scope === scope && review.open && review.tab === "changes"} onClick={() => openReview("changes")}><GitCompareArrows size={17} /></button><button aria-label="Artifacts" title="Artifacts" aria-expanded={review?.scope === scope && review.open && review.tab === "artifacts"} onClick={() => openReview("artifacts")}><PanelRightOpen size={17} /></button><button aria-label="Task and activity" title="Task and activity" onClick={() => { setReview(old => old ? { ...old, open: false } : null); setDetailsOpen(!detailsOpen); }}><MoreHorizontal size={18} /></button></>}</div></header>
++    {sidebar && page !== "settings" && <aside className="chat-sidebar"><div className="sidebar-brand"><span>AG1</span><button aria-label="Hide sidebar" onClick={() => setSidebar(false)}><PanelLeftClose size={17} /></button></div><button className="new-chat" disabled={busy} onClick={() => void action(newChat)}><Plus size={17} />New chat</button><label className="chat-search"><Search size={15} /><input aria-label="Search chats" placeholder="Search chats" value={search} onChange={e => setSearch(e.target.value)} /></label><div className="sidebar-scroll"><div className="sidebar-section-title">Projects<button aria-label="Add project" disabled={busy} onClick={browseProject}><Plus size={15} /></button></div>{catalog.projects.map(p => <details className="project-chats" key={p} open><summary><FolderOpen size={14} /><span>{basename(p)}</span></summary><button className="project-open" title={p} disabled={busy} onClick={() => void action(() => openWorkspace(p))}>Open project</button>{chats.filter(c => c.workspace.replace(/\/+$/, "") === p.replace(/\/+$/, "")).map(chatRow)}</details>)}{!catalog.projects.length && <p className="sidebar-empty">Attach a project when you need one.</p>}<div className="sidebar-section-title">{archived ? "Archived chats" : "Chats"}</div>{chats.filter(c => c.general || !catalog.projects.some(p => p.replace(/\/+$/, "") === c.workspace.replace(/\/+$/, ""))).map(chatRow)}{!chats.length && <p className="sidebar-empty">Your conversations will appear here.</p>}</div><div className="sidebar-bottom"><button onClick={() => setArchived(!archived)}>{archived ? "Back to chats" : "Archived chats"}</button><button onClick={() => { setSettingsSection("github"); setPage("settings"); }}><Github size={16} />GitHub</button><button disabled={busy} onClick={() => void action(async () => { if (!activeRef.current) await openWorkspace(undefined, true); setPage("mcp"); })}>MCP</button><button aria-label="Settings" onClick={() => { setSettingsSection("appearance"); setPage("settings"); }}><Settings2 size={16} />Settings</button></div></aside>}
++    <main className="main"><header className="chat-header">{!sidebar && <button aria-label="Show sidebar" onClick={() => setSidebar(true)}><PanelLeftClose size={18} /></button>}<button className="chat-heading" onClick={() => setPage("chat")}>{page === "settings" ? "Settings" : page === "mcp" ? "MCP" : navigating || currentChat?.title || "New chat"}</button><div className="header-actions"><button className="workspace-pill" aria-label={folderSelection ? "Chat folders" : undefined} title={folderSelection ? workingFolder : undefined} disabled={busy} onClick={() => folderSelection ? setFoldersDialog(true) : setProjectDialog(true)}><FolderOpen size={15} />{folderSelection ? normalizedPath(workingFolder || "").endsWith("/general-chat") ? "Chat folders" : basename(workingFolder || "") : active && !general ? basename(active.workspace_path) : "Attach project"}</button>{active && <><button aria-label="Files" title="Files" onClick={() => void action(() => navigate("files"))}><FileCode2 size={17} /></button><button aria-label="Changes" title="Review changes" aria-expanded={review?.scope === scope && review.open && review.tab === "changes"} onClick={() => openReview("changes")}><GitCompareArrows size={17} /></button><button aria-label="Artifacts" title="Artifacts" aria-expanded={review?.scope === scope && review.open && review.tab === "artifacts"} onClick={() => openReview("artifacts")}><PanelRightOpen size={17} /></button><button aria-label="Task and activity" title="Task and activity" onClick={() => { setReview(old => old ? { ...old, open: false } : null); setDetailsOpen(!detailsOpen); }}><MoreHorizontal size={18} /></button></>}</div></header>
+       {((stoppable && page !== "chat") || busy && !executing) && <div className="operation-banner" role="status"><span><LoaderCircle size={14} className="spin" />{executing ? `${status} · ${formatTime(elapsed)}` : "Recovering the stopped response…"}{executing && active?.model && <small> · {active.model}</small>}</span>{stoppable && <button aria-label="Stop current response" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={13} />Stop</button>}</div>}
+       {(error || view.error) && <div className="error" role="alert"><span>{error || view.error}</span><button aria-label="Dismiss error" onClick={() => { setError(""); setView(v => ({ ...v, error: null })); }}><X size={16} /></button></div>}
+       {recovery && <RecoveryPanel record={recovery} onClose={() => setRecovery(null)} />}
+@@ -329,7 +331,7 @@
+       <div className="composer-shell" ref={menus}>{addMenu && <div className="composer-menu menu" aria-label="Add to chat"><div className="menu-heading">Add</div><button onClick={() => { fileInput.current?.click(); setAddMenu(false); }}><Plus size={16} />Files</button><button onClick={() => { folderInput.current?.click(); setAddMenu(false); }}><FolderOpen size={16} />Folder contents</button><button aria-pressed={plan} onClick={() => { setPlan(!plan); setAddMenu(false); }}><MessageSquare size={16} />Plan mode <small>{plan ? "On" : "Plan before making changes"}</small>{plan && <Check size={14} />}</button><div className="menu-heading">Plugins</div><button onClick={() => { setPlugins(true); setAddMenu(false); }}>Browse plugins and skills</button><button onClick={() => { folderSelection ? setFoldersDialog(true) : setProjectDialog(true); setAddMenu(false); }}><FolderOpen size={16} />{folderSelection ? "Chat folders" : "Attach project"}</button></div>}
+       <input hidden type="file" multiple ref={fileInput} aria-label="Attach files" onChange={e => { addAttachments(Array.from(e.target.files ?? [])); e.target.value = ""; }} /><input hidden type="file" multiple ref={folderInput} aria-label="Attach folder contents" onChange={e => { addAttachments(Array.from(e.target.files ?? [])); e.target.value = ""; }} />
+       <form className={`composer${plan ? " is-planning" : ""}`} onSubmit={e => { e.preventDefault(); if (!actions.current && (!executing || !plan)) void action(send); }}>{(plan || attachments.length > 0) && <div className="composer-chips">{plan && <button type="button" onClick={() => setPlan(false)}>Plan mode <X size={12} /></button>}{attachments.map((f, i) => <DraftAttachment key={`${f.name}/${f.lastModified}/${i}`} file={f} remove={() => setAttachments(old => old.filter((_, n) => n !== i))} />)}</div>}<textarea onPaste={e => { const files = Array.from(e.clipboardData.files).filter(f => f.type.startsWith("image/")); if (!files.length) return; e.preventDefault(); addAttachments(files); const text = e.clipboardData.getData("text/plain"); if (text) { const { selectionStart: start, selectionEnd: end } = e.currentTarget; setDraft(old => old.slice(0, start) + text + old.slice(end)); } }} aria-label="Message AG1" placeholder={executing ? "Add a direction…" : plan ? "What would you like to plan?" : "Ask anything"} value={draft} onChange={e => setDraft(e.target.value)} onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && (preferences.sendKey === "enter" || e.ctrlKey || e.metaKey)) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+-      <div className="composer-toolbar"><div className="composer-left"><button type="button" aria-label="Add to chat" aria-expanded={addMenu} onClick={() => { setAddMenu(!addMenu); setModelMenu(false); setApprovalMenu(false); }}><Plus size={19} /></button><div className="approval-anchor"><button type="button" className="permission-label" aria-label="Tool approvals" aria-expanded={approvalMenu} title={`Next response: ${approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}`} onClick={() => { setApprovalMenu(!approvalMenu); setAddMenu(false); setModelMenu(false); }}><ApprovalIcon value={approvalValue} /><span>{approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}{(view.details?.context as any)?.approval_policy?.mode !== approvalValue ? " · next response" : ""}</span></button>{approvalMenu && <div className="approval-menu menu"><div className="menu-heading">Tool approvals</div><ApprovalChoices value={approvalValue} onChange={chooseApproval} /><p>{plan ? "Plan mode keeps its read-only restrictions." : `Selected for your next response. Current policy: ${(view.details?.context as any)?.approval_policy?.mode || "not yet confirmed"}.`}</p></div>}</div></div><div className="composer-right"><div className="model-anchor"><button type="button" className="model-picker" aria-label="Choose model" aria-expanded={modelMenu} onClick={() => { setModelMenu(!modelMenu); setAddMenu(false); setApprovalMenu(false); }}><span>{modelName}</span><ChevronDown size={13} /></button>{modelMenu && <ModelPicker key={chosenModel ? `${chosenModel.provider}/${chosenModel.id}` : "none"} models={available} selected={chosenModel} choose={m => void chooseModel(m)} mode={chosenModel ? reasoning[`${chosenModel.provider}/${chosenModel.id}`] : undefined} setMode={mode => { if (chosenModel) setReasoning(old => ({...old, [`${chosenModel.provider}/${chosenModel.id}`]:mode})); }} activeLevel={(view.details?.context as any)?.selected_model?.provider === chosenModel?.provider && (view.details?.context as any)?.selected_model?.id === chosenModel?.id ? (view.details?.context as any)?.thinking : undefined} />}</div>{stoppable ? <button type="button" className="send-button" aria-label="Stop generation" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={16} /></button> : <button type="submit" className="send-button" aria-label="Send message" disabled={busy || !draft.trim() && !attachments.length}><ArrowUp size={18} /></button>}{executing && !!draft.trim() && <button type="submit" aria-label="Send steering" disabled={busy || plan}><ArrowUp size={18} /></button>}</div></div></form></div><div className="composer-note">{requestModel && requestModel !== modelName ? `This request uses ${requestModel}. ${modelName} is selected for your next message.` : busy && !executing ? "Preparing your request…" : (preferences.sendKey === "enter" ? "Enter to send · Shift Enter for a new line" : "Ctrl / ⌘ Enter to send · Enter for a new line")}</div></div></section>{page === "settings" ? <Settings gitRun={query} gitEffect={reviewEffect} changes={() => { setPage("chat"); openReview("changes"); }} key={`${settingsSection}/${scope}/${active?.scope.epoch ?? 0}`} initialSection={settingsSection} discuss={text => { setDraft(old => old ? `${old}\n\n${text}` : text); setPage("chat"); }} theme={catalog.theme} setTheme={theme} plugins={catalog.themes ?? []} refreshThemes={async () => { const c = await api.catalog(); setCatalog(old => ({ ...old, themes: c.themes ?? [] })); }} preferences={preferences} update={updatePreferences} models={available} modelName={modelName} chooseModel={m => void chooseModel(m)} runningModel={requestModel} approval={approvalValue} setApproval={chooseApproval} back={() => setPage("chat")} quit={() => setQuitDialog(true)} chats={catalog.chats ?? []} restore={c => void action(() => saveChat({ ...c, archived: false, deleted: false }))} workspace={workingFolder && !normalizedPath(workingFolder).endsWith("/general-chat") ? workingFolder : undefined} attach={path => void action(() => openWorkspace(path))} /> : page === "files" ? <div className="files-layout"><aside className="file-tree"><button onClick={() => void action(refreshFiles)}>Refresh files</button>{files.map(name => <button key={name} onClick={() => void action(() => readFile(name))}>{name}</button>)}</aside><section className="editor-panel file-pane"><header className="file-toolbar"><span><span className="file-name" title={file?.path}>{file?.path || "Project files"}</span>{dirty && <span className="dirty" aria-label="Unsaved changes">●</span>}</span><div><button disabled={!dirty || busy} onClick={() => void action(save)}>Save</button><button disabled={!file} onClick={() => { if (file) { setEdit(file.text); setEditorReset(v => v + 1); } }}>Discard</button><button disabled={!file} onClick={() => setPreview(!preview)}>Preview</button></div></header>{file ? preview ? <iframe title="Isolated static preview" sandbox="" referrerPolicy="no-referrer" srcDoc={previewDocument(edit)} /> : <Suspense fallback={<p>Loading editor…</p>}><Editor path={file.path} text={edit} theme={catalog.theme} fontSize={preferences.codeSize} fontFamily={preferences.codeFont} wordWrap={preferences.codeWrap} resetKey={`${file.path}/${editorReset}`} onChange={setEdit} /></Suspense> : <div className="empty"><h2>Your project files</h2><p>Select a file from the sidebar.</p></div>}</section></div> : null}
++      <div className="composer-toolbar"><div className="composer-left"><button type="button" aria-label="Add to chat" aria-expanded={addMenu} onClick={() => { setAddMenu(!addMenu); setModelMenu(false); setApprovalMenu(false); }}><Plus size={19} /></button><div className="approval-anchor"><button type="button" className="permission-label" aria-label="Tool approvals" aria-expanded={approvalMenu} title={`Next response: ${approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}`} onClick={() => { setApprovalMenu(!approvalMenu); setAddMenu(false); setModelMenu(false); }}><ApprovalIcon value={approvalValue} /><span>{approvalModes.find(m => m.id === approvalValue)?.label || "Tool approvals"}{(view.details?.context as any)?.approval_policy?.mode !== approvalValue ? " · next response" : ""}</span></button>{approvalMenu && <div className="approval-menu menu"><div className="menu-heading">Tool approvals</div><ApprovalChoices value={approvalValue} onChange={chooseApproval} /><p>{plan ? "Plan mode keeps its read-only restrictions." : `Selected for your next response. Current policy: ${(view.details?.context as any)?.approval_policy?.mode || "not yet confirmed"}.`}</p></div>}</div></div><div className="composer-right"><div className="model-anchor"><button type="button" className="model-picker" aria-label="Choose model" aria-expanded={modelMenu} onClick={() => { setModelMenu(!modelMenu); setAddMenu(false); setApprovalMenu(false); }}><span>{modelName}</span><ChevronDown size={13} /></button>{modelMenu && <ModelPicker key={chosenModel ? `${chosenModel.provider}/${chosenModel.id}` : "none"} models={available} selected={chosenModel} choose={m => void chooseModel(m)} mode={chosenModel ? reasoning[`${chosenModel.provider}/${chosenModel.id}`] : undefined} setMode={mode => { if (chosenModel) setReasoning(old => ({...old, [`${chosenModel.provider}/${chosenModel.id}`]:mode})); }} activeLevel={(view.details?.context as any)?.selected_model?.provider === chosenModel?.provider && (view.details?.context as any)?.selected_model?.id === chosenModel?.id ? (view.details?.context as any)?.thinking : undefined} />}</div>{stoppable ? <button type="button" className="send-button" aria-label="Stop generation" disabled={stopping} onClick={() => void action(stopResponse)}><Square size={16} /></button> : <button type="submit" className="send-button" aria-label="Send message" disabled={busy || !draft.trim() && !attachments.length}><ArrowUp size={18} /></button>}{executing && !!draft.trim() && <button type="submit" aria-label="Send steering" disabled={busy || plan}><ArrowUp size={18} /></button>}</div></div></form></div><div className="composer-note">{requestModel && requestModel !== modelName ? `This request uses ${requestModel}. ${modelName} is selected for your next message.` : busy && !executing ? "Preparing your request…" : (preferences.sendKey === "enter" ? "Enter to send · Shift Enter for a new line" : "Ctrl / ⌘ Enter to send · Enter for a new line")}</div></div></section>{page === "settings" ? <Settings gitRun={query} gitEffect={reviewEffect} changes={() => { setPage("chat"); openReview("changes"); }} key={`${settingsSection}/${scope}/${active?.scope.epoch ?? 0}`} initialSection={settingsSection} discuss={text => { setDraft(old => old ? `${old}\n\n${text}` : text); setPage("chat"); }} theme={catalog.theme} setTheme={theme} plugins={catalog.themes ?? []} refreshThemes={async () => { const c = await api.catalog(); setCatalog(old => ({ ...old, themes: c.themes ?? [] })); }} preferences={preferences} update={updatePreferences} models={available} modelName={modelName} chooseModel={m => void chooseModel(m)} runningModel={requestModel} approval={approvalValue} setApproval={chooseApproval} back={() => setPage("chat")} quit={() => setQuitDialog(true)} chats={catalog.chats ?? []} restore={c => void action(() => saveChat({ ...c, archived: false, deleted: false }))} workspace={workingFolder && !normalizedPath(workingFolder).endsWith("/general-chat") ? workingFolder : undefined} attach={path => void action(() => openWorkspace(path))} /> : page === "mcp" ? <MCPManager key={`${scope}/${active?.scope.epoch ?? 0}`} scope={queryScope} run={mcpRun} back={() => setPage("chat")} /> : page === "files" ? <div className="files-layout"><aside className="file-tree"><button onClick={() => void action(refreshFiles)}>Refresh files</button>{files.map(name => <button key={name} onClick={() => void action(() => readFile(name))}>{name}</button>)}</aside><section className="editor-panel file-pane"><header className="file-toolbar"><span><span className="file-name" title={file?.path}>{file?.path || "Project files"}</span>{dirty && <span className="dirty" aria-label="Unsaved changes">●</span>}</span><div><button disabled={!dirty || busy} onClick={() => void action(save)}>Save</button><button disabled={!file} onClick={() => { if (file) { setEdit(file.text); setEditorReset(v => v + 1); } }}>Discard</button><button disabled={!file} onClick={() => setPreview(!preview)}>Preview</button></div></header>{file ? preview ? <iframe title="Isolated static preview" sandbox="" referrerPolicy="no-referrer" srcDoc={previewDocument(edit)} /> : <Suspense fallback={<p>Loading editor…</p>}><Editor path={file.path} text={edit} theme={catalog.theme} fontSize={preferences.codeSize} fontFamily={preferences.codeFont} wordWrap={preferences.codeWrap} resetKey={`${file.path}/${editorReset}`} onChange={setEdit} /></Suspense> : <div className="empty"><h2>Your project files</h2><p>Select a file from the sidebar.</p></div>}</section></div> : null}
+     </main>
+     {(active || review?.github) && review?.scope === scope && <ReviewPanel key={`${scope}/${workingFolder}`} open={review.open && (page !== "settings" || review.tab === "github")} tab={review.tab} turn={review.turn} artifactTurn={review.artifactTurn} github={review.github} localAvailable={!!active} onTab={tab => { if (tab !== "github") setPage("chat"); setReview(old => old ? { ...old, tab } : null); }} run={query} effect={reviewEffect} onClose={closeReview} />}
+     <Modal open={foldersDialog} close={() => setFoldersDialog(false)} title="Chat folders"><ChatFolders key={scope} selection={folderSelection} blocked={executing ? "Finish or stop the current response to change folders." : dirty ? "Save or discard your editor changes before changing folders." : undefined} change={changeFolder} /></Modal>
+--- before/product/apps/desktop/src-tauri/src/github_workflow_fixture.rs
++++ product/apps/desktop/src-tauri/src/github_workflow_fixture.rs
+@@ -27,5 +27,5 @@
+   "notifications.mark_all"|"notifications.mark_repository"=>{changes["read"]=json!({"70":true,"71":true});status=202;json!({"message":"Owned inbox change accepted"})},
+   _=>return None,
+  };
+- Some(Ok(Reply{data,status,next,rate_remaining:Some(4999),rate_reset:None,outcome:if op["risk"]=="read"{Outcome::Read}else{Outcome::Applied}}))
++ Some(Ok(Reply{data,status,next,rate_remaining:Some(4999),rate_reset:None,rate_limit:None,rate_resource:None,outcome:if op["risk"]=="read"{Outcome::Read}else{Outcome::Applied}}))
+ }
+--- before/product/apps/desktop/src-tauri/src/native_client.rs
++++ product/apps/desktop/src-tauri/src/native_client.rs
+@@ -177,24 +177,17 @@
+                 .map_err(|e| format!("{e:?}"))?;
+         }
+         let github=ag1_platform::github::service::Service::shared(state).map_err(|e|e.message.to_string())?;
+-        let host = match parent {
+-            Some(parent) => Host::open_shared(&canonical, &private, config, &parent).await,
+-            None => {
+-                #[cfg(feature = "visual-test")]
+-                {
+-                    if let Some(runtime) = crate::cancellation_fixture::from_environment(&config)? {
+-                        let registry = ag1_platform::cutover::Registry::for_user()
+-                            .map_err(|e| format!("{e:?}"))?;
+-                        Host::open_rehearsal_with_runtime(&canonical, &private, config, &registry, runtime).await
+-                    } else {
+-                        Host::open_integrated(&canonical, &private, config, github).await
+-                    }
+-                }
+-                #[cfg(not(feature = "visual-test"))]
+-                Host::open_integrated(&canonical, &private, config, github).await
+-            },
+-        }
+-        .map_err(|e| format!("{e:?}"))?;
++        #[cfg(feature = "visual-test")]
++        let injected=crate::cancellation_fixture::from_environment(&config)?;
++        let host = {
++            #[cfg(feature = "visual-test")]
++            if let Some(runtime)=injected {
++                let registry=ag1_platform::cutover::Registry::for_user().map_err(|e|format!("{e:?}"))?;
++                Host::open_rehearsal_with_runtime(&canonical,&private,config,&registry,runtime).await
++            } else { let mcp=Self::mcp_context(&config,&canonical,state)?; Host::open_with_mcp(&canonical,&private,config,github,mcp,parent.as_deref()).await }
++            #[cfg(not(feature = "visual-test"))]
++            { let mcp=Self::mcp_context(&config,&canonical,state)?; Host::open_with_mcp(&canonical,&private,config,github,mcp,parent.as_deref()).await }
++        }.map_err(|e|format!("{e:?}"))?;
+         let value = serde_json::to_value(host.view().map_err(|e| format!("{e:?}"))?)
+             .map_err(|e| e.to_string())?;
+         if let Err(error) = self.close_preview() {
+@@ -206,6 +199,10 @@
+         self.active
+             .store(true, std::sync::atomic::Ordering::Release);
+         Ok(value)
++    }
++    fn mcp_context(config:&Config,canonical:&Path,state:&Path)->Result<ag1_platform::client::McpServices,String> {
++        let helper=config.tooling.as_ref().map(|t|t.process_host.clone()).unwrap_or(std::env::current_exe().map_err(|e|e.to_string())?.with_file_name("ag1-process-host"));
++        Ok(ag1_platform::mcp::service::Context {service:ag1_platform::mcp::service::Service::shared(state,&helper).map_err(|e|format!("{e:?}"))?,general_chat:canonical==state.join("general-chat")})
+     }
+     pub fn close_preview(&self) -> Result<(), String> {
+         let mut preview = self.preview.lock().map_err(|_| "Preview lock")?;
+--- before/product/apps/desktop/src-tauri/src/github_secret_fixture.rs
++++ product/apps/desktop/src-tauri/src/github_secret_fixture.rs
+@@ -22,5 +22,5 @@
+  "secrets.delete"=>{rows.retain(|r|!endpoint.ends_with(r["name"].as_str().unwrap()));serde_json::Value::Null},
+  "secrets.repositories"=>json!({"total_count":1,"repositories":[{"id":42,"full_name":"owned/fixture"}]}),
+  "secrets.set_repositories"=>serde_json::Value::Null,_=>return Err(ApiError::new("fixture","Unsupported secret fixture operation.")),
+- };Ok(Reply{data,status:if value["method"]=="GET"{200}else{204},next:None,rate_remaining:Some(4999),rate_reset:None,outcome:if value["method"]=="GET"{Outcome::Read}else{Outcome::Applied}})
++ };Ok(Reply{data,status:if value["method"]=="GET"{200}else{204},next:None,rate_remaining:Some(4999),rate_reset:None,rate_limit:None,rate_resource:None,outcome:if value["method"]=="GET"{Outcome::Read}else{Outcome::Applied}})
+ }
+--- before/product/apps/desktop/src-tauri/src/github_fixture.rs
++++ product/apps/desktop/src-tauri/src/github_fixture.rs
+@@ -19,7 +19,7 @@
+         let name=op["endpoint"].as_str().unwrap().split_once("?name=").unwrap().1;
+         std::fs::write(self.root.join(format!("uploaded-{id}.bin")),upload.bytes()).map_err(|_|ApiError::new("fixture","Cannot retain fixture upload."))?;
+         let data=json!({"id":id,"name":name,"size":upload.bytes().len(),"state":"uploaded","digest":format!("sha256:{}",upload.preview()["sha256"].as_str().unwrap())});assets.push(data.clone());
+-        Ok(Reply{data,status:201,next:None,rate_remaining:Some(4999),rate_reset:None,outcome:Outcome::Applied})
++        Ok(Reply{data,status:201,next:None,rate_remaining:Some(4999),rate_reset:None,rate_limit:None,rate_resource:None,outcome:Outcome::Applied})
+     }
+ 
+     fn download(&self,expected:&Account,operation:&Operation,control:&ScanControl<'_>)->Result<ag1_platform::github::downloads::Payload> {
+@@ -85,7 +85,7 @@
+             _=>json!([]),
+         }};
+         let next=if !second&&(base.ends_with("/files")||base.ends_with("/check-runs")||base.ends_with("/comments")){Some(format!("{base}?page=2&per_page=30"))}else{None};
+-        Ok(Reply{data,status:200,next,rate_remaining:Some(4999),rate_reset:None,outcome:if op["risk"]=="read" {Outcome::Read}else{Outcome::Applied}})
++        Ok(Reply{data,status:200,next,rate_remaining:Some(4999),rate_reset:None,rate_limit:None,rate_resource:None,outcome:if op["risk"]=="read" {Outcome::Read}else{Outcome::Applied}})
+     }
+ }
+ fn graph(op:&serde_json::Value,changes:&mut serde_json::Value)->serde_json::Value {

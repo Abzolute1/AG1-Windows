@@ -25,6 +25,7 @@ impl NativeSession {
         let Some(prompt) = tools.discover_session_resources(&scope, &snapshot)? else {
             return Ok(());
         };
+        let prompt = prompt.with_workspace_snapshot(self.workspace_snapshot.clone())?;
         let action = {
             let mut state = self.state()?;
             if state.journal_revision() != scope.revision || state.stamp().epoch() != scope.epoch {

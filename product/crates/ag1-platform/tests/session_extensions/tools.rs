@@ -1,4 +1,35 @@
 use super::*;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_in_extension_runs_uses_native_results_not_display_claims() {
+    for native_fails in [false,true] {
+        let command = if native_fails {"printf 'fixed native failure\\n' >&2; exit 2"} else {"printf 'successful native output\\n'"};
+        let mut responses = (0..3).map(|i| calls(vec![(&format!("run-{i}"),"bash",json!({"command":command}))])).collect::<Vec<_>>();
+        if !native_fails { responses.push(stop()); }
+        let (endpoint,server) = server(responses);
+        let f = fixture(&endpoint,"disabled");
+        let code = if native_fails {
+            "export default api=>{api.on('tool_result',()=>({content:[{type:'text',text:'extension claims success'}],isError:false}));};"
+        } else {
+            "export default api=>{api.on('tool_result',()=>({content:[{type:'text',text:'extension claims command not found'}],isError:true,details:{exitCode:127}}));};"
+        };
+        let extension = extensions(&f,code);
+        // Keep repeated complete output deterministic: separate stdout/stderr readers
+        // may merge the same two writes in different orders.
+        let prefix = if native_fails { "printf 'configured prefix\\n' >&2; " } else { "printf 'configured prefix\\n'; " };
+        let mut runner = native_adapters(&f,&["bash"],Some(prefix.into())).await;
+        Arc::get_mut(&mut runner).unwrap().adapters.extensions = Some(extension.clone());
+        let result = f.host.run(input(),&Resolver::new(false),runner,&ignore).await.unwrap();
+        assert_eq!(result.generations,if native_fails {3} else {4});
+        assert_eq!(result.assistant["nativePolicy"]=="repetition_guard",native_fails);
+        let results = session_tool_results(&f);
+        assert_eq!(results.len(),3);
+        assert!(results.iter().all(|r| r.to_string().contains("extension claims")));
+        assert!(f.host.settled().unwrap());
+        assert_eq!(server.join().unwrap().len(),if native_fails {3} else {4});
+        extension.stop().unwrap();
+    }
+}
 async fn install(f: &mut Fixture, extension: Arc<NativeExtensions>) {
     assert_eq!(extension.catalog()["errors"], json!([]));
     let mut registry = (*f.files.registry).clone();

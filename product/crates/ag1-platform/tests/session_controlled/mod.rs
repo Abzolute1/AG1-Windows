@@ -181,7 +181,7 @@ async fn controlled_nonmutating_policy_blocks_native_mutation_aliases_before_pre
                 "append",
                 json!({"path":"value.txt","content":"changed"}),
             ),
-            ("apply", "editApply", json!({"path":"value.txt"})),
+            ("apply", "editApply", json!({"path":"value.txt","edits":[{"oldText":"original","newText":"changed"}]})),
             (
                 "write",
                 "write",

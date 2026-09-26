@@ -1,7 +1,7 @@
 //! GUI-independent isolated client composition. No TypeScript parent session.
 use crate::{
-    executor::BlockingPool,
     file_tools::FileService,
+    executor::BlockingPool,
     provider::{
         generation::{GenerationLimits, GenerationRequest},
         http::ProviderHttp,
@@ -42,28 +42,53 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 pub mod actions;
+pub mod approval_policy;
+mod conversations;
 pub mod credentials;
 mod details;
 mod effects;
+mod model_loading;
 pub mod export;
 pub mod extensions;
 mod factory;
+mod folders;
 pub mod imported;
 pub mod local_runtime;
 mod observations;
 pub mod projection;
 mod projects;
 mod queries;
+mod website_icons;
 pub mod resource_actions;
 mod resources;
 mod terminal;
 pub mod tooling;
+mod changes;
+mod diff_review;
+mod change_undo;
+mod local_git;
 mod uploads;
 pub mod workflow;
 
 type Result<T> = std::result::Result<T, DomainError>;
 fn json_error(_: serde_json::Error) -> DomainError {
     DomainError::InvalidInput("client JSON".into())
+}
+const DEFAULT_GENERATION_BYTES: usize = 4 * 1024 * 1024;
+const LOCAL_LLAMA_GENERATION_BYTES: usize = 32 * 1024 * 1024;
+
+/// Local llama sessions may legitimately stream long reasoning traces. Keep
+/// remote and extension provider budgets conservative, while aligning the
+/// owned runtime with the reducer's existing 32 MiB safety ceiling.
+fn generation_byte_budget(model: &Value) -> usize {
+    if matches!(
+        model["provider"].as_str(),
+        Some("llamacpp" | "llama.cpp")
+    ) {
+        LOCAL_LLAMA_GENERATION_BYTES
+    } else {
+        DEFAULT_GENERATION_BYTES
+    }
 }
 pub struct WallClock;
 impl Clock for WallClock {
@@ -108,6 +133,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<local_runtime::Runtime>,
     pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_append: Option<String>,
     pub fixture: bool,
 }
 fn interactive_policy() -> String {
@@ -150,6 +177,7 @@ impl ProviderResolver for Resolver {
                 &input.configuration.thinking,
                 input.options,
             )?;
+            let generation_bytes = generation_byte_budget(model);
             let request = generation_http_request(
                 &RequestContext {
                     model,
@@ -165,7 +193,7 @@ impl ProviderResolver for Resolver {
                     request_id: input.operation,
                 },
                 credentials::borrowed(&credential),
-                4 * 1024 * 1024,
+                generation_bytes,
             )?;
             Ok(ResolvedRequest {
                 model: model.clone(),
@@ -186,7 +214,7 @@ impl ProviderResolver for Resolver {
                         .map_err(|_| DomainError::InvalidInput("provider API".into()))?,
                     request,
                     limits: GenerationLimits {
-                        max_output_bytes: 4 * 1024 * 1024,
+                        max_output_bytes: generation_bytes,
                         prefill_ms: 0,
                         idle_ms: 0,
                         overall_ms: 0,
@@ -197,7 +225,17 @@ impl ProviderResolver for Resolver {
         })
     }
 }
+#[cfg(target_os = "linux")]
+pub use crate::mcp::service::Context as McpServices;
+#[cfg(not(target_os = "linux"))]
+#[derive(Clone)]
+pub struct McpServices;
 struct Services {
+    mcp: Option<McpServices>,
+    github: Option<Arc<crate::github::service::Service>>,
+    working_projects: Mutex<std::collections::BTreeMap<String, Arc<Mutex<Option<crate::projects::Runtime>>>>>,
+    folder_access: Mutex<std::collections::BTreeMap<String, Arc<crate::folder_access::FolderAccess>>>,
+    approval_policy: Arc<approval_policy::ApprovalPolicy>,
     imported_settings: imported::Settings,
     workspace: Arc<Workspace>,
     store: Arc<Store>,
@@ -214,6 +252,25 @@ struct Services {
 impl ServiceFactory for Services {
     fn prepare<'a>(&'a self, input: ServiceInput<'a>) -> PortFuture<'a, ScopedServices> {
         Box::pin(async move {
+            let access = {
+                let mut cached = self.folder_access.lock().map_err(|_|DomainError::Conflict)?;
+                if !cached.contains_key(input.target.session.as_str()) {
+                    cached.insert(input.target.session.as_str().into(), crate::folder_access::FolderAccess::open(self.workspace.clone(), &self.state, input.target.session.as_str())?);
+                }
+                cached.get(input.target.session.as_str()).cloned().ok_or(DomainError::Conflict)?
+            };
+            let folders = Arc::new(access.snapshot()?);
+            let workspace = folders.primary();
+            let project = if workspace.root() == self.workspace.root() { self.project.clone() } else {
+                let key = ag1_storage::digest(format!("{}:{}",input.target.session.as_str(),workspace.root().display()).as_bytes());
+                let mut projects = self.working_projects.lock().map_err(|_|DomainError::Conflict)?;
+                if !projects.contains_key(&key) {
+                    let state = self.state.join("chat-projects").join(&key);
+                    fs::create_dir_all(&state).map_err(crate::io_error)?;
+                    projects.insert(key.clone(), Arc::new(Mutex::new(projects::load(&workspace,&state,self.config.tooling.as_ref())?)));
+                }
+                projects.get(&key).cloned().ok_or(DomainError::Conflict)?
+            };
             let mut selected = self.config.selected.clone();
             let mut selected_provider = None;
             // StoredRuntimeFactory verifies all restored labels against this
@@ -245,27 +302,40 @@ impl ServiceFactory for Services {
             // before capability-filtered activation. Registration grants no
             // preview, vision or process authority.
             ag1_core::tools::targets::register_visual_tools(&mut registry)?;
+            if self.github.is_some() { crate::github::tool::register(&mut registry)?; }
             self.store.ensure_output_origin(
                 input.target.session.as_str(),
                 input.target.session.as_str(),
             )?;
             let mut adapters = tooling::adapters(
-                self.workspace.clone(),
+                workspace.clone(),
                 self.store.clone(),
                 &self.state,
                 input.target.session.as_str(),
                 input.epoch,
                 self.clock.clone(),
                 self.config.tooling.as_ref(),
+                Some(&folders),
             )?;
-            if self
-                .project
+            if self.github.is_some() && let Some(t)=&self.config.tooling {
+                adapters.local_git=folders.roots.iter().filter_map(|root| {
+                    let build=||->Result<Arc<crate::github::local::LocalGit>> {
+                    let writable=folders.resolve(root.root().to_str().ok_or(DomainError::PermissionDenied)?,true).is_ok();
+                    crate::github::local::LocalGit::new(root.clone(),&t.process_host,&t.git,&t.bubblewrap,&self.state.join("local-git"))
+                        .map(|g|Arc::new(g.with_grant(access.clone(),folders.selection.revision,writable).with_github(self.github.as_ref().unwrap().clone())))
+                    };build().ok()
+                }).collect();
+            }
+            adapters.folder_authority = Some(access);
+            adapters.github = self.github.clone();
+            adapters.folders = Some(folders.clone());
+            if project
                 .lock()
                 .map_err(|_| DomainError::Conflict)?
                 .is_some()
             {
                 let check = crate::projects::SharedCheck {
-                    runtime: self.project.clone(),
+                    runtime: project.clone(),
                 };
                 let port = if let Some(tooling) = &self.config.tooling
                     && let Some(browser) = &tooling.browser
@@ -282,14 +352,16 @@ impl ServiceFactory for Services {
                 };
                 adapters.project = Some(Arc::new(Mutex::new(port)));
             }
-            let resources = resources::load(
-                &self.workspace,
+            let mut resources = resources::load(
+                &workspace,
                 &self.state,
                 &self.config.system_prompt,
+                self.config.prompt_append.as_deref(),
                 self.config.packages.as_ref(),
             )?;
+            resources.append_system.push(folders.prompt());
             let (ws, root, session, epoch, revision, config, ui, discovered) = (
-                self.workspace.clone(),
+                workspace.clone(),
                 self.state.clone(),
                 input.target.session.as_str().to_owned(),
                 input.epoch,
@@ -323,12 +395,21 @@ impl ServiceFactory for Services {
             if let Some(extension) = &adapters.extensions {
                 extension.install_tools(&mut registry)?;
             }
+            #[cfg(target_os = "linux")]
+            if let Some(mcp)=&self.mcp && let Some(catalog_scope)=mcp.catalog_scope(&self.workspace,&folders)? {
+                let scope=ag1_core::tools::registry::Scope {workspace:workspace.id().as_str().into(),session:input.target.session.as_str().into(),epoch:input.epoch,revision:0};
+                let project=matches!(catalog_scope,crate::mcp::catalog::CatalogScope::Workspace(_)).then(||folders.primary());
+                let session=mcp.service.session_with_project(catalog_scope,scope,Some(self.approval_policy.clone()),project)?;
+                session.discovery().register(&mut registry)?;
+                adapters.mcp_discovery=Some(session.discovery().clone());
+                adapters.mcp_management=Some(session);
+            }
             let mut names = adapters.available_names();
             names.push("task".into());
             names.push("explore".into());
             registry.activate(&names, &names.iter().cloned().collect())?;
             let mut tools: Vec<_> = registry
-                .public_tools()
+                .native_tools()
                 .into_iter()
                 .filter(|t| names.iter().any(|n| t["name"] == *n))
                 .collect();
@@ -356,29 +437,35 @@ impl ServiceFactory for Services {
                             .ok_or(DomainError::Conflict)
                     })
                     .collect::<Result<Vec<_>>>()?;
+            } else {
+                tools = ag1_core::tools::surface::preferred(tools);
             }
             let prompt = crate::session::NativeSession::client_prompt(
-                self.workspace.root(),
+                &workspace,
                 &timestamp(),
                 &resources,
                 registry.clone(),
             )?;
             let approvals = Arc::new(PendingApprovals::new(self.clock.clone()));
-            adapters.resources = Some(Arc::new(resource_actions::Actions::new(
-                self.workspace.clone(),
-                self.store.clone(),
-                &self.state,
-                self.config.packages.as_ref(),
-                approvals.clone(),
-                self.clock.clone(),
-                &self.config.policy_mode,
-            )?));
+            adapters.approval_policy = Some(self.approval_policy.clone());
+            adapters.resources = Some(Arc::new(
+                resource_actions::Actions::new(
+                    workspace.clone(),
+                    self.store.clone(),
+                    &self.state,
+                    self.config.packages.as_ref(),
+                    approvals.clone(),
+                    self.clock.clone(),
+                    &self.config.policy_mode,
+                )?
+                .with_policy(self.approval_policy.clone()),
+            ));
             let runner = Arc::new(FileRunner {
-                files: Arc::new(FileService::new(self.workspace.clone())),
+                files: folders.roots.iter().position(|r| Arc::ptr_eq(r,&workspace)).and_then(|i|adapters.folder_files.get(i)).cloned().unwrap_or_else(||Arc::new(FileService::new(workspace.clone()).with_reviews(self.store.clone()))),
                 adapters,
                 registry: Arc::new(registry),
                 policy: serde_json::from_value(
-                    json!({"mode":self.config.policy_mode,"cwd":self.workspace.root()}),
+                    json!({"mode":self.config.policy_mode,"cwd":workspace.root()}),
                 )
                 .map_err(|_| DomainError::Conflict)?,
                 policy_revision: 1,
@@ -394,7 +481,7 @@ impl ServiceFactory for Services {
                 .map_err(|_| DomainError::Conflict)?
                 .insert(input.target.session.as_str().into(), runner.clone());
             Ok(ScopedServices {
-                workspace: self.workspace.clone(),
+                workspace: workspace.clone(),
                 origin: input.target.session.as_str().into(),
                 configuration: Configuration {
                     model,
@@ -425,8 +512,21 @@ pub fn timestamp() -> String {
 }
 
 pub struct Host {
+    live_changed: tokio::sync::Notify,
+    live_revision: std::sync::atomic::AtomicU64,
+    approval_policy: Arc<approval_policy::ApprovalPolicy>,
     local_runtime: Option<Arc<dyn crate::provider::http::GenerationRuntime>>,
-    authority: Mutex<crate::cutover::Lease>,
+    authority: Arc<Mutex<crate::cutover::Lease>>,
+    owns_resources: bool,
+    owns_runtime: bool,
+    closing: AtomicBool,
+    workspace_closing: Arc<AtomicBool>,
+    runtime_closing: Arc<AtomicBool>,
+    shared_hosts: Arc<tokio::sync::Mutex<Vec<std::sync::Weak<Host>>>>,
+    services: Arc<Services>,
+    conversation_owners:
+        Arc<tokio::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Host>>>>,
+    pool: Arc<BlockingPool>,
     endpoint_leases: Mutex<Vec<crate::cutover::EndpointLease>>,
     pub commands: Arc<RuntimeCommands>,
     pub registry: Arc<RuntimeRegistry>,
@@ -440,8 +540,11 @@ pub struct Host {
     pub(crate) progress: Mutex<String>,
     pub(crate) failure: Mutex<Option<String>>,
     pub(crate) uploads: Mutex<std::collections::BTreeMap<String, (String, Vec<u8>)>>,
+    diff_review: Mutex<Option<diff_review::DiffReview>>,
+    local_git_plans:Mutex<std::collections::BTreeMap<String,local_git::Pending>>,
     pub(crate) project: Arc<Mutex<Option<crate::projects::Runtime>>>,
     pub(crate) controls: tokio::sync::Mutex<()>,
+    workspace_controls: Arc<tokio::sync::Mutex<()>>,
     last_view: Mutex<Option<w::ClientView>>,
     wake: tokio::sync::Notify,
     driver: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -476,7 +579,17 @@ impl Host {
         config: Config,
         authority_registry: &crate::cutover::Registry,
     ) -> Result<Arc<Self>> {
-        Self::open_composed(workspace, state, config, authority_registry, None, None).await
+        Self::open_composed(
+            workspace,
+            state,
+            config,
+            authority_registry,
+            None,
+            None,
+            None,
+            None, None,
+        )
+        .await
     }
     /// Host-only evaluation observation. This preserves normal authority and
     /// runtime admission; no observer configuration is exposed over client RPC.
@@ -494,6 +607,8 @@ impl Host {
             authority_registry,
             None,
             Some(observer),
+            None,
+            None, None,
         )
         .await
     }
@@ -516,8 +631,64 @@ impl Host {
             authority_registry,
             Some(runtime),
             None,
+            None,
+            None, None,
         )
         .await
+    }
+    /// Reuse an already admitted runtime only for the exact same configured catalog/capture.
+    pub async fn open_shared(
+        workspace: &Path,
+        state: &Path,
+        config: Config,
+        parent: &Host,
+    ) -> Result<Arc<Self>> {
+        if config.models != parent.config.models
+            || serde_json::to_value(&config.runtime).map_err(json_error)?
+                != serde_json::to_value(&parent.config.runtime).map_err(json_error)?
+        {
+            return Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,parent.services.github.clone(),None).await;
+        }
+        parent.check_authority()?;
+        Self::open_composed(
+            workspace,
+            state,
+            config,
+            &crate::cutover::Registry::for_user()?,
+            None,
+            None,
+            Some(parent),
+            parent.services.github.clone(), None,
+        )
+        .await
+    }
+    /// Application-owned account capability, never a path supplied by model
+    /// arguments or imported project configuration.
+    pub async fn open_integrated(workspace:&Path,state:&Path,config:Config,github:Arc<crate::github::service::Service>) -> Result<Arc<Self>> {
+        Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,None,Some(github),None).await
+    }
+    /// Desktop supplies explicit account/project MCP context without changing
+    /// model configuration or inferring availability from imported metadata.
+    #[cfg(target_os = "linux")]
+    pub async fn open_with_mcp(workspace:&Path,state:&Path,config:Config,github:Arc<crate::github::service::Service>,mcp:McpServices,parent:Option<&Host>) -> Result<Arc<Self>> {
+        let shared=match parent {
+            Some(parent) if config.models==parent.config.models && serde_json::to_value(&config.runtime).map_err(json_error)?==serde_json::to_value(&parent.config.runtime).map_err(json_error)? => Some(parent),
+            _=>None,
+        };
+        if let Some(parent)=shared {parent.check_authority()?;}
+        Self::open_composed(workspace,state,config,&crate::cutover::Registry::for_user()?,None,None,shared,Some(github),Some(mcp)).await
+    }
+    /// Owned offline acceptance uses the same composition with an isolated
+    /// authority registry. It cannot inject a live model runtime or credentials.
+    #[cfg(target_os = "linux")]
+    pub async fn open_mcp_rehearsal(
+        workspace: &Path, state: &Path, config: Config,
+        authority_registry: &crate::cutover::Registry, mcp: McpServices,
+    ) -> Result<Arc<Self>> {
+        if !config.fixture || config.runtime.is_some() || config.credential_env.is_some() {
+            return Err(DomainError::PermissionDenied);
+        }
+        Self::open_composed(workspace,state,config,authority_registry,None,None,None,None,Some(mcp)).await
     }
     async fn open_composed(
         workspace: &Path,
@@ -526,6 +697,9 @@ impl Host {
         authority_registry: &crate::cutover::Registry,
         injected: Option<Arc<dyn crate::provider::http::GenerationRuntime>>,
         observer: Option<crate::provider::http::RequestObserver>,
+        shared: Option<&Host>,
+        github: Option<Arc<crate::github::service::Service>>,
+        mcp: Option<McpServices>,
     ) -> Result<Arc<Self>> {
         let workspace = WorkspaceService::new()?.register(workspace)?;
         fs::create_dir_all(state).map_err(crate::io_error)?;
@@ -584,8 +758,14 @@ impl Host {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let scheduler = Scheduler::default();
-        let endpoint_leases = authority_registry.endpoint_leases(&origins)?;
+        let scheduler = shared
+            .map(|h| h.services.scheduler.clone())
+            .unwrap_or_default();
+        let endpoint_leases = if shared.is_some() {
+            Vec::new()
+        } else {
+            authority_registry.endpoint_leases(&origins)?
+        };
         if !config.fixture && !endpoint_leases.is_empty() && config.runtime.is_none() {
             return Err(DomainError::Unavailable("Local runtime ownership has not been transferred; an endpoint probe is not an ownership grant".into()));
         }
@@ -607,18 +787,24 @@ impl Host {
                         .as_ref()
                             == Ok(origin)
                 });
-            scheduler.register(
-                origin,
-                if local {
-                    EndpointKind::Local
-                } else {
-                    EndpointKind::Remote
-                },
-            )?;
+            if shared.is_none() {
+                scheduler.register(
+                    origin,
+                    if local {
+                        EndpointKind::Local
+                    } else {
+                        EndpointKind::Remote
+                    },
+                )?;
+            }
         }
-        let local_runtime = match &config.runtime {
-            Some(runtime) => Some(runtime.open(&config, &state, authority_registry).await?),
-            None => injected,
+        let local_runtime = if let Some(parent) = shared {
+            parent.local_runtime.clone()
+        } else {
+            match &config.runtime {
+                Some(runtime) => Some(runtime.open(&config, &state, authority_registry).await?),
+                None => injected,
+            }
         };
         let imported_settings = imported::Settings::load(&config, &state)?;
         let store = Arc::new(Store::open(&state.join("store"))?);
@@ -653,7 +839,13 @@ impl Host {
         if let Some(runtime) = &local_runtime {
             http = http.with_runtime(runtime.clone());
         }
+        let approval_policy = approval_policy::ApprovalPolicy::open(&state, &config.policy_mode)?;
         let services = Arc::new(Services {
+            mcp,
+            github,
+            working_projects: Mutex::new(Default::default()),
+            folder_access: Mutex::new(Default::default()),
+            approval_policy: approval_policy.clone(),
             imported_settings: imported_settings.clone(),
             scheduler: scheduler.clone(),
             http: http.clone(),
@@ -675,8 +867,9 @@ impl Host {
                 http,
                 services: services.clone(),
             },
-            services,
+            services: services.clone(),
         });
+        let pool = factory.inner.pool.clone();
         let epoch = previous.as_ref().map_or(1, |p| p.selection.epoch + 1);
         let prepared = factory
             .prepare(
@@ -711,11 +904,29 @@ impl Host {
         )?;
         commands.initialize().await?;
         let host = Arc::new(Self {
+            live_changed: tokio::sync::Notify::new(),
+            live_revision: std::sync::atomic::AtomicU64::new(0),
+            approval_policy,
             local_runtime,
             endpoint_leases: Mutex::new(endpoint_leases),
-            authority: Mutex::new(authority),
+            authority: Arc::new(Mutex::new(authority)),
+            conversation_owners: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            pool,
+            closing: AtomicBool::new(false),
+            workspace_closing: Arc::new(AtomicBool::new(false)),
+            runtime_closing: shared
+                .map(|h| h.runtime_closing.clone())
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+            shared_hosts: shared
+                .map(|h| h.shared_hosts.clone())
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(Vec::new()))),
+            owns_resources: true,
+            owns_runtime: shared.is_none(),
+            services,
             ui,
             uploads: Mutex::new(Default::default()),
+            diff_review: Mutex::new(None),
+            local_git_plans:Mutex::new(Default::default()),
             project,
             commands,
             registry,
@@ -728,35 +939,18 @@ impl Host {
             progress: Mutex::new(String::new()),
             failure: Mutex::new(None),
             controls: tokio::sync::Mutex::new(()),
+            workspace_controls: Arc::new(tokio::sync::Mutex::new(())),
             last_view: Mutex::new(None),
             wake: tokio::sync::Notify::new(),
             driver: tokio::sync::Mutex::new(None),
             stopping: AtomicBool::new(false),
         });
-        let weak = Arc::downgrade(&host);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let Some(owner) = weak.upgrade() else {
-                    break;
-                };
-                if owner.stopping.load(Ordering::Acquire) {
-                    break;
-                }
-                if let Ok(_control) = owner.controls.try_lock()
-                    && let Ok(mut slot) = owner.project.try_lock()
-                    && let Some(runtime) = slot.as_mut()
-                {
-                    let _ = projects::poll(
-                        runtime,
-                        &crate::resource_fs::ScanControl {
-                            cancel: &AtomicBool::new(false),
-                            deadline: std::time::Instant::now() + Duration::from_millis(80),
-                        },
-                    );
-                }
-            }
-        });
+        host.conversation_owners.lock().await.insert(
+            host.commands.snapshot()?.scope.session.as_str().into(),
+            Arc::downgrade(&host),
+        );
+        host.shared_hosts.lock().await.push(Arc::downgrade(&host));
+        host.start_folder_project_poll();
         let owner = host.clone();
         *host.driver.lock().await = Some(tokio::spawn(async move {
             owner.drive().await;
@@ -800,7 +994,10 @@ impl Host {
                     {
                         observations.begin(scope.clone(), started);
                     }
-                    if let Some(text) = observations.event(event) {
+                    let delta = observations.event(event);
+                    self.live_revision.fetch_add(1, Ordering::Release);
+                    self.live_changed.notify_waiters();
+                    if let Some(text) = delta {
                         let mut p = self.progress.lock().unwrap();
                         p.push_str(&text);
                         while p.len() > 16384 {
@@ -822,20 +1019,102 @@ impl Host {
             }
         }
     }
-    pub async fn dispatch(
-        self: &Arc<Self>,
-        mut envelope: w::CommandEnvelope,
-    ) -> Result<w::BridgeFrame> {
+    /// Serialize an explicit desktop repository change with prompt/session
+    /// admission, and keep that boundary held until the caller has finished.
+    pub async fn idle_client_guard(&self) -> Result<tokio::sync::MutexGuard<'_, ()>> {
+        let guard = self.workspace_controls.lock().await;
+        let working = self.working_folder(false)?;
+        for host in self
+            .shared_hosts
+            .lock()
+            .await
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+        {
+            if !host.commands.snapshot()?.queued.is_empty()
+                && host.folder_selection().map_or(true, |f|f.selection.folders.iter().any(|g|working.root().starts_with(&g.path)||g.path.starts_with(working.root())))
+            {
+                return Err(DomainError::Unavailable(
+                    "Wait for this project’s running conversations before changing its repository"
+                        .into(),
+                ));
+            }
+        }
         self.authority
             .lock()
             .map_err(|_| DomainError::DurabilityUnknown)?
             .admit()?;
+        if !self.commands.snapshot()?.queued.is_empty()
+            || !self.registry.selected()?.services.runtime().settled()?
+        {
+            return Err(DomainError::Unavailable(
+                "Stop the current response before changing the repository".into(),
+            ));
+        }
+        Ok(guard)
+    }
+    /// Streaming display waits for actual events, independent of durable journal
+    /// projection. The client paints at its display cadence and keeps one waiter.
+    pub async fn live_display(&self, after: u64) -> Result<Value> {
+        let notified = self.live_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.live_revision.load(Ordering::Acquire) == after {
+            let _ = tokio::time::timeout(Duration::from_millis(500), notified).await;
+        }
+        let scope = self.commands.snapshot()?.scope;
+        let observations = self
+            .observations
+            .lock()
+            .map_err(|_| DomainError::Conflict)?;
+        Ok(
+            json!({"revision":self.live_revision.load(Ordering::Acquire),"scope":scope,"observations":observations.view(&scope)}),
+        )
+    }
+    pub async fn dispatch(
+        self: &Arc<Self>,
+        mut envelope: w::CommandEnvelope,
+    ) -> Result<w::BridgeFrame> {
+        if !matches!(envelope.command, w::Command::Cancel { .. }) {
+            self.authority
+                .lock()
+                .map_err(|_| DomainError::DurabilityUnknown)?
+                .admit()?;
+        }
         envelope
             .version
             .negotiate()
             .map_err(|_| DomainError::InvalidInput("protocol version".into()))?;
         w::encode(&w::WireMessage::Command(envelope.clone()))
             .map_err(|_| DomainError::LimitExceeded("command envelope".into()))?;
+        let current_scope = self.commands.scope()?;
+        // Session transitions retire the submitting scope. Receipt lookup must
+        // still reach RuntimeCommands, which authenticates the original command
+        // owner. All mutating commands, including emergency cancellation, retain
+        // the exact current-scope requirement.
+        let historical_receipt = matches!(envelope.command, w::Command::CommandResult { .. })
+            && envelope.scope.workspace == current_scope.workspace;
+        if envelope.scope != current_scope && !historical_receipt {
+            return Err(DomainError::Conflict);
+        }
+        // Cancellation must remain available after a provider, journal, or
+        // admission failure. The protocol scope check above still applies;
+        // this only signals an operation owned by this host's live queue.
+        if let w::Command::Cancel { operation } = &envelope.command
+            && self.commands.emergency_cancel(operation)?
+        {
+            let snapshot = self.commands.snapshot().ok();
+            return Ok(w::BridgeFrame::Reply {
+                id: envelope.id,
+                scope: envelope.scope.clone(),
+                revision: snapshot
+                    .map(|snapshot| snapshot.revision)
+                    .unwrap_or(envelope.expected_revision.clone()),
+                durable: false,
+                status: "accepted".into(),
+                data: json!({"kind":"accepted","operation":operation}),
+            });
+        }
         if let w::Command::Runtime { action, args } = &envelope.command
             && action == "client_action"
         {
@@ -850,13 +1129,35 @@ impl Host {
         {
             envelope.command = self.workflow(args)?;
         }
+        let _workspace_guard = self.workspace_controls.lock().await;
         let _guard = self.controls.lock().await;
         self.authority
             .lock()
             .map_err(|_| DomainError::DurabilityUnknown)?
             .admit()?;
+        self.check_authority()?;
         if self.stopping.load(Ordering::Acquire) {
             return Err(DomainError::Unavailable("Client host is stopping".into()));
+        }
+        if let w::Command::Session { action, args } = &envelope.command {
+            if action == "resume" {
+                if let Some(target) = args["session"].as_str() {
+                    let owners = self.conversation_owners.lock().await;
+                    if owners
+                        .get(target)
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some_and(|host| {
+                            !Arc::ptr_eq(&host, self)
+                                && !host.stopping.load(Ordering::Acquire)
+                        })
+                    {
+                        return Err(DomainError::Unavailable(
+                            "This conversation is already open. Select it in the chat sidebar."
+                                .into(),
+                        ));
+                    }
+                }
+            }
         }
         let snapshot = self.commands.snapshot()?;
         // A retired scope can observe its own durable command receipt, but
@@ -867,12 +1168,18 @@ impl Host {
         {
             return Err(DomainError::Conflict);
         }
-        if matches!(&envelope.command,w::Command::Files {action,..} if action=="save")
+        if matches!(&envelope.command,w::Command::Files {action,..} if matches!(action.as_str(), "save" | "change_undo" | "change_undo_recover" | "git_confirm"))
             && envelope.expected_revision != snapshot.revision
         {
             return Err(DomainError::Conflict);
         }
         if let w::Command::Runtime { action, args } = &envelope.command {
+            if action == "folder_access" {
+                if envelope.expected_revision != snapshot.revision { return Err(DomainError::Conflict); }
+                let data = self.folder_access_command(args).await?;
+                let snapshot = self.commands.snapshot()?;
+                return Ok(w::BridgeFrame::Reply { id: envelope.id, scope: snapshot.scope, revision: snapshot.revision, durable: args.get("action").is_some(), status: "query".into(), data });
+            }
             if action == "recover_acknowledgement" {
                 if self.commands.client_transition_pending()? {
                     self.commands.reconcile().await?;
@@ -927,7 +1234,19 @@ impl Host {
                 });
             }
         }
+        // A failed capability reload must not leave the old grants usable.
+        if !matches!(envelope.command, w::Command::CommandResult { .. } | w::Command::Cancel { .. } | w::Command::Approve { .. } | w::Command::ArtifactRead { .. })
+            && !matches!(&envelope.command,w::Command::Runtime {action,..} if action=="terminal_stop")
+        {
+            let folders = self.folder_selection()?;
+            if !folders.primary_available() { return Err(DomainError::Unavailable("Choose an available working folder in Chat folders before continuing".into())); }
+        }
+        if matches!(&envelope.command, w::Command::Runtime { action, .. } if action == "load_model") {
+            return self.load_local_model(envelope).await;
+        }
         if effects::is_effect(&envelope.command) {
+            if let w::Command::Files {action,args}=&envelope.command && action=="git_confirm" {self.ensure_local_git_idle(args).await?;}
+            if let w::Command::Files {action,args} = &envelope.command && (action == "change_undo" || action == "change_undo_recover") { self.ensure_undo_idle(args).await?; }
             let owner = self.clone();
             return tokio::task::spawn_blocking(move || {
                 if owner.commands.client_transition_pending()? {
@@ -1010,6 +1329,12 @@ impl Host {
         }
     }
     pub fn check_authority(&self) -> Result<()> {
+        if self.closing.load(Ordering::Acquire)
+            || self.workspace_closing.load(Ordering::Acquire)
+            || self.runtime_closing.load(Ordering::Acquire)
+        {
+            return Err(DomainError::Unavailable("Conversation is closing".into()));
+        }
         self.authority
             .lock()
             .map_err(|_| DomainError::DurabilityUnknown)?
@@ -1027,6 +1352,32 @@ impl Host {
     }
     pub async fn shutdown(&self) -> Result<()> {
         let _guard = self.controls.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.closing.store(true, Ordering::Release);
+        if self.owns_runtime {
+            self.runtime_closing.store(true, Ordering::Release);
+        }
+        if self.owns_resources {
+            self.workspace_closing.store(true, Ordering::Release);
+        }
+        if self.owns_resources {
+            let others: Vec<_> = self
+                .shared_hosts
+                .lock()
+                .await
+                .iter()
+                .filter_map(std::sync::Weak::upgrade)
+                .filter(|h| {
+                    !std::ptr::eq(h.as_ref(), self)
+                        && (self.owns_runtime || h.workspace.root() == self.workspace.root())
+                })
+                .collect();
+            for other in others.into_iter().rev() {
+                Box::pin(other.shutdown()).await?;
+            }
+        }
         self.terminal_command("stop", &json!({}))?;
         let selected = self.registry.selected()?;
         selected.services.runtime().cancel()?;
@@ -1068,16 +1419,24 @@ impl Host {
         tokio::task::spawn_blocking(move || tools.quiesce(&scope, &operation))
             .await
             .map_err(|_| DomainError::DurabilityUnknown)??;
-        if let Some(runtime) = self.project.lock().unwrap().as_mut() {
-            runtime.stop()?;
+        self.release_unused_working_projects(true)?;
+        if self.owns_resources {
+            if let Some(runtime) = self.project.lock().unwrap().as_mut() {
+                runtime.stop()?;
+            }
         }
         self.stopping.store(true, Ordering::Release);
         self.wake.notify_one();
         if let Some(driver) = self.driver.lock().await.take() {
             driver.await.map_err(|_| DomainError::DurabilityUnknown)?;
         }
-        if let Some(runtime) = &self.local_runtime {
-            runtime.shutdown().await?;
+        if !self.owns_resources {
+            return Ok(());
+        }
+        if self.owns_runtime {
+            if let Some(runtime) = &self.local_runtime {
+                runtime.shutdown().await?;
+            }
         }
         self.authority
             .lock()

@@ -1,6 +1,7 @@
 //! Deterministic research projections ported from the pinned AG1 reference.
 //! Text is untrusted source material; classifications never create verified claims.
 use crate::task::units;
+mod document;
 use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -122,7 +123,12 @@ fn api(query: &str) -> bool {
     )
 }
 pub fn code_lookup(query: &str) -> bool {
-    explicit_code(query) || (has(r"\b[a-z][A-Za-z0-9]+[A-Z][A-Za-z0-9]*\b", query) && !api(query))
+    explicit_code(query)
+        || has(
+            r"(?i)\b(rust|cargo|rustc|python|typescript|javascript|compiler|stdlib)\b",
+            query,
+        )
+        || (has(r"\b[a-z][A-Za-z0-9]+[A-Z][A-Za-z0-9]*\b", query) && !api(query))
 }
 pub fn intent(query: &str) -> &'static str {
     let docs = has(
@@ -134,10 +140,11 @@ pub fn intent(query: &str) -> &'static str {
         r"(?i)\b(news|incident|leak|announcement|security advisory|outage|breach)\b",
         query,
     ) || (has(
-        r"(?i)\b(latest|recent|today|current|update|released?|\d{4})\b",
+        r"(?i)\b(latest|recent|today|current|update|released?)\b",
         query,
     ) && !docs
-        && !api)
+        && !api
+        && !code_lookup(query))
     {
         "current_events"
     } else if (docs || api) && !explicit_code(query) {
@@ -257,16 +264,28 @@ pub fn meta_description(html: &str) -> Option<String> {
     )
 }
 fn clean(text: &str) -> String {
-    compact(&replace(
-        &replace(
-            &replace(text, r"(?i)\bpageCopy\b", "page Copy"),
-            r"(?i)\bcopy page\b",
+    // A copy-button label is chrome; `copy()` and prose about copying are data.
+    let text = compact(text);
+    if matches!(
+        text.to_ascii_lowercase().as_str(),
+        "copy" | "copy page" | "pagecopy"
+    ) {
+        String::new()
+    } else if text.contains("pageCopy") {
+        compact(&replace(
+            &replace(
+                &replace(&text, r"(?i)\bpageCopy\b", "page Copy"),
+                r"(?i)\bcopy page\b",
+                " ",
+            ),
+            r"(?i)\bcopy\b",
             " ",
-        ),
-        r"(?i)\bcopy\b",
-        " ",
-    ))
+        ))
+    } else {
+        text
+    }
 }
+
 fn noise(text: &str) -> bool {
     let text = compact(text);
     units(&text) < 8
@@ -580,38 +599,10 @@ fn coverage_guidance(coverage: &Coverage) -> Vec<String> {
             coverage.present.join(", ")
         }
     )];
-    let kind = coverage.kind.as_deref().unwrap_or_default();
-    let guidance = if !coverage.missing.is_empty() {
+    if !coverage.missing.is_empty() {
         lines.push(format!("Missing: {}", coverage.missing.join(", ")));
-        match kind {
-            "docs" => {
-                "Only continue docs research for the missing API slot. If signature, parameter, and behavior are present, answer now; examples or version notes are optional unless requested."
-            }
-            "pricing" => {
-                "Continue pricing research only if model, input price, output price, or currency is missing. Prefer an official pricing page for any missing price."
-            }
-            "release" => {
-                "Continue release research only for missing version, date, change summary, or migration notes. Migration notes are required only when the user asks about upgrading or breaking changes."
-            }
-            "error" => {
-                "Answer if cause and fix are present. If either is missing, search the exact error string with the affected version or framework."
-            }
-            _ => {
-                "Only continue web research for the missing coverage items, not by repeating the same broad query."
-            }
-        }
-    } else {
-        match kind {
-            "docs" => "Coverage complete for a concise docs/API answer.",
-            "pricing" => {
-                "Coverage complete for a pricing answer. Reuse this source unless the user requested corroboration."
-            }
-            "release" => "Coverage complete for a release/changelog answer.",
-            "error" => "Coverage complete for an error-cause-and-fix answer.",
-            _ => "Coverage complete for a brief current-events answer.",
-        }
-    };
-    lines.push(guidance.into());
+    }
+    lines.push("Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims.".into());
     lines
 }
 #[derive(Deserialize)]
@@ -679,10 +670,10 @@ pub fn fetch_transcript(input: &FetchTranscript) -> String {
     match input.status.as_deref(){
         Some("thin")=>{lines.push(format!("Fetch status: thin extract{}",input.status_reason.as_ref().filter(|v|!v.is_empty()).map(|v|format!(" ({v})")).unwrap_or_default()));lines.push("This source yielded limited article text. Use another source if key facts are still missing.".into());},
         Some("rich")=>match (input.intent.as_deref(),input.authoritative){
-            (Some("current_events"),Some(true))=>{lines.push("This authoritative current-events source is likely sufficient for a brief summary. Answer from it now unless the user explicitly asked for corroboration or a key fact is still missing.".into());lines.push("If the user asked for the strongest source, this fetch is enough. Reuse this source directly instead of fetching another article first.".into());},
+            (Some("current_events"),Some(true))=>{lines.push("This extract is from an authoritative source; verify that its facts address the active task.".into());lines.push("Source classification and coverage describe this extract, not completion of the active task.".into());},
             (Some("current_events"),_)=>lines.push("This source summary is usable as a fallback, but corroborate with an authoritative or independent source before treating it as final.".into()),
-            (Some("docs_reference"),Some(true))=>lines.push("This authoritative docs page is likely sufficient for a brief API or parameter answer. Do not refetch the same URL unless the requested concept is still missing.".into()),
-            _=>lines.push("This source summary is likely sufficient to answer or cite without refetching.".into()),
+            (Some("docs_reference"),Some(true))=>lines.push("This extract is from an authoritative documentation page; its applicability depends on the active task and version.".into()),
+            _=>lines.push("This source extract is available as evidence for the active task.".into()),
         },
         _ if input.truncated||input.profile.mode!="normal"=>lines.push("This fetch was compacted to preserve context.".into()),_=>{},
     }
@@ -915,15 +906,24 @@ pub fn fetch_projection(
         .any(|prefix| content_type.starts_with(prefix))
         {
             return Ok(FetchProjection {
-                result: json!({"details":details,"content":[{"type":"text","text":format!("Binary content detected ({content_type}). WebFetch only supports text/HTML content.")}]}),
+                result: json!({"isError":true,"details":details,"content":[{"type":"text","text":format!("Binary content detected ({content_type}). WebFetch only supports text/HTML content.")}]}),
                 status: None,
             });
         }
     }
     let decoded = String::from_utf8_lossy(document.bytes);
     let content = decoded.strip_prefix('\u{feff}').unwrap_or(&decoded);
-    let meta = meta_description(content);
-    let markdown = html_markdown(&primary_html(content))?;
+    let is_html = document.content_type.is_some_and(|t| {
+        let t = t.to_ascii_lowercase();
+        t.starts_with("text/html") || t.starts_with("application/xhtml+xml")
+    }) || document.content_type.is_none()
+        && has(
+            r"(?i)<(?:!doctype|html|head|body|main|article|p)[ >]",
+            content,
+        );
+    let extracted = document::extract(content, is_html, document.final_url);
+    let meta = extracted.description;
+    let markdown = extracted.markdown;
     let focus = hint.map(|h| h.focus_terms.as_slice()).unwrap_or_default();
     let preview = preview(&markdown, 12, 180, focus);
     let compression = effective_profile(base, hint.is_some_and(|h| h.rich_fetch));
@@ -933,7 +933,7 @@ pub fn fetch_projection(
         compression.fetch_transcript_line_chars,
         focus,
     );
-    let title = title(content).or_else(|| {
+    let title = extracted.title.or_else(|| {
         rx(r"(?m)^#\s+(.+)$")
             .captures(&markdown)
             .map(|c| trim(&c[1]).to_string())
@@ -962,7 +962,35 @@ pub fn fetch_projection(
     }
     details["facts"] = json!(facts);
     details["preview"] = json!(preview);
-    details["truncated"] = json!(units(&markdown) > 4000);
+    let anchor_focus = url::Url::parse(document.url)
+        .ok()
+        .and_then(|u| u.fragment().map(str::to_string))
+        .map(|s| {
+            s.split(['-', '.', '_'])
+                .filter(|t| t.len() >= 3)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut excerpt_focus = focus.to_vec();
+    excerpt_focus.extend(anchor_focus);
+    let excerpt = document::excerpt(
+        &markdown,
+        &excerpt_focus,
+        match compression.mode.as_str() {
+            "ultra" => 3500,
+            "tight" => 7000,
+            _ => 12000,
+        },
+    );
+    details["truncated"] = json!(excerpt.truncated);
+    details["extractionMethod"] = json!(if is_html {
+        "dom-markdown-v1"
+    } else {
+        "plain-text-v1"
+    });
+    details["extractedChars"] = json!(markdown.chars().count());
+    details["excerptChars"] = json!(excerpt.text.chars().count());
     details["compressionMode"] = json!(compression.mode);
     if let Some(hint) = hint {
         details["intent"] = json!(hint.intent);
@@ -982,13 +1010,13 @@ pub fn fetch_projection(
     if let Some(coverage) = &assessment.coverage {
         details["coverage"] = json!(coverage);
     }
-    let text = fetch_transcript(&FetchTranscript {
+    let mut text = fetch_transcript(&FetchTranscript {
         url: document.url.into(),
         title,
         facts,
         preview: Some(preview),
         profile: compression,
-        truncated: units(&markdown) > 4000,
+        truncated: excerpt.truncated,
         meta_description: meta,
         status: Some(assessment.status.clone()),
         status_reason: assessment.reason,
@@ -996,8 +1024,20 @@ pub fn fetch_projection(
         authoritative: Some(authoritative),
         coverage: assessment.coverage,
     });
+    if !excerpt.text.trim().is_empty() {
+        text.push_str("\n\nSource excerpt (untrusted page content):\n");
+        text.push_str(&excerpt.text);
+    }
+    let unavailable = assessment.status == "placeholder";
+    if unavailable {
+        details["error"] = json!("The page did not yield usable source content.");
+    }
+    let mut result = json!({"details":details,"content":[{"type":"text","text":text}]});
+    if unavailable {
+        result["isError"] = json!(true);
+    }
     Ok(FetchProjection {
-        result: json!({"details":details,"content":[{"type":"text","text":text}]}),
+        result,
         status: Some(assessment.status),
     })
 }

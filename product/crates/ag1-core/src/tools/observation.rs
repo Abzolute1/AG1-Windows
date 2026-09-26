@@ -42,6 +42,12 @@ pub fn prepare(
     now: &str,
     ids: ObservationIdentity<'_>,
 ) -> Result<JournalToolPlan, DomainError> {
+    let current = latest_task(branch);
+    if let Some(objective) = args.get("taskObjective") {
+        if objective.as_str().is_none_or(str::is_empty) || current.as_ref().is_none_or(|task| task.value()["objective"] != *objective) {
+            return Err(DomainError::InvalidInput("Runtime observation taskObjective does not match the current task. Inspect taskState show before associating this event.".into()));
+        }
+    }
     let sources = args
         .get("sources")
         .cloned()
@@ -54,8 +60,9 @@ pub fn prepare(
     let mut records =
         vec![json!({"type":"custom","customType":"runtime_observation","data":record.value()})];
     let mut task_entry = None;
-    if let Some(current) = latest_task(branch)
-        && related(feature, current.value())
+    if let Some(current) = current
+        && args["updateTaskState"].as_bool().unwrap_or(true)
+        && (args.get("taskObjective").is_some() || related(feature, current.value()))
     {
         let statement = format!(
             "{feature}: {result} in {}. {}",
@@ -70,7 +77,7 @@ pub fn prepare(
         task_entry = Some(id);
     }
     let mut details =
-        json!({"id":ids.observation,"entryId":ids.entry,"result":result,"feature":feature});
+        json!({"id":ids.observation,"entryId":ids.entry,"result":result,"feature":feature,"verification":"recorded_claim","sourceReference":format!("session-entry:{}",ids.entry)});
     let suffix = if let Some(id) = task_entry {
         details["taskStateEntryId"] = json!(id);
         format!(" (task state {id} updated)")
@@ -79,6 +86,6 @@ pub fn prepare(
     };
     Ok(JournalToolPlan {
         records,
-        result: json!({"content":[{"type":"text","text":format!("Recorded runtime observation {}: {} — {feature}{suffix}", ids.observation, result.to_uppercase())}],"details":details}),
+        result: json!({"content":[{"type":"text","text":format!("Recorded runtime observation {}: {} — {feature}{suffix}. Recording this claim does not independently verify its result; cite a matching check receipt for verification.", ids.observation, result.to_uppercase())}],"details":details}),
     })
 }

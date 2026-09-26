@@ -1,0 +1,89 @@
+--- a/product/crates/ag1-storage/src/context.rs
++++ b/product/crates/ag1-storage/src/context.rs
+@@ -92,19 +92,24 @@
+         reduce: impl FnOnce(&[Value], &mut Self) -> Result<Compilation, DomainError>,
+     ) -> Result<ShadowCompilation, DomainError> {
+         validate_history(messages)?;
+-        let journal = self.store.journal_snapshot(&self.session)?;
+-        if journal.revision != expected {
+-            return Err(DomainError::Conflict);
+-        }
+-        // Base64 retains exact bytes without expanding each source byte into a JSON number.
+-        let original = json!({"version":1,"session":self.session.as_str(),"revision":journal.revision,"leaf":journal.leaf,"headerBase64":B64.encode(&journal.header),"entries":journal.entries.iter().map(|e| json!({"id":e.id,"parent":e.parent,"physicalOrder":e.physical_order,"rawBase64":B64.encode(&e.raw)})).collect::<Vec<_>>()});
+-        let original_journal = self.put_text(
+-            &original.to_string(),
+-            "context-original-journal",
+-            "contextCompiler",
+-            "journal",
+-            &[],
+-        )?;
++        // Release the raw/normalized snapshot and base64 JSON before building
++        // the original request and invoking the compiler. Only its durable
++        // artifact handle needs to live across reduction.
++        let original_journal = {
++            let journal = self.store.journal_snapshot(&self.session)?;
++            if journal.revision != expected {
++                return Err(DomainError::Conflict);
++            }
++            // Base64 retains exact bytes without expanding each source byte into a JSON number.
++            let original = json!({"version":1,"session":self.session.as_str(),"revision":journal.revision,"leaf":journal.leaf,"headerBase64":B64.encode(&journal.header),"entries":journal.entries.iter().map(|e| json!({"id":e.id,"parent":e.parent,"physicalOrder":e.physical_order,"rawBase64":B64.encode(&e.raw)})).collect::<Vec<_>>()});
++            self.put_text(
++                &original.to_string(),
++                "context-original-journal",
++                "contextCompiler",
++                "journal",
++                &[],
++            )?
++        };
+         let original_request = self.put_text(
+             &serde_json::to_string(messages)
+                 .map_err(|_| DomainError::InvalidInput("request JSON".into()))?,
+@@ -119,7 +124,14 @@
+                 "context projection has an orphan tool result".into(),
+             ));
+         }
+-        if self.store.journal_snapshot(&self.session)?.revision != expected {
++        // Custody already retained the exact journal above. Recheck admission
++        // without materializing every raw and normalized entry a second time.
++        let revision = {
++            let db = self.store.conn().map_err(domain_error)?;
++            Store::ready(&db).map_err(domain_error)?;
++            crate::journal::active_session(&db, self.session.as_str()).map_err(domain_error)?
++        };
++        if revision != expected {
+             return Err(DomainError::Conflict);
+         }
+         Ok(ShadowCompilation {
+--- a/product/crates/ag1-storage/tests/context_storage_contract.rs
++++ b/product/crates/ag1-storage/tests/context_storage_contract.rs
+@@ -483,3 +483,30 @@
+     });
+     assert!(matches!(changed, Err(DomainError::Conflict)));
+ }
++
++
++#[test]
++fn shadow_revision_guard_retains_archived_session_and_import_fences() {
++    use ag1_core::context::compiler::Compilation;
++    for archive in [true, false] {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("store");
++        let store = Store::open(&path).unwrap();
++        create(&store, "session");
++        let messages = vec![json!({"role":"user","content":"exact original"})];
++        let result = adapter(&store, "session", "guard").project(&messages, 0, |messages, _| {
++            if archive {
++                store.archive_session("session").unwrap();
++            } else {
++                let external = rusqlite::Connection::open(path.join("storage.sqlite")).unwrap();
++                external.execute("INSERT INTO imports(id,manifest,state) VALUES('fixture',X'7b7d','staging')", []).unwrap();
++            }
++            Ok(Compilation { messages: messages.to_vec(), stats: json!({}) })
++        });
++        if archive {
++            assert!(matches!(result, Err(DomainError::NotFound)));
++        } else {
++            assert!(matches!(result, Err(DomainError::Io(message)) if message == "ImportIncomplete"));
++        }
++    }
++}

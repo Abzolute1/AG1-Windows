@@ -186,6 +186,7 @@ fn config(origin: &str) -> Config {
         runtime: None,
         credentials: Default::default(),
         system_prompt: "Isolated fixture".into(),
+        prompt_append: None,
         fixture: true,
     }
 }
@@ -235,14 +236,10 @@ async fn detached_projection_does_not_cancel_and_jsonl_matches_desktop_domain() 
     assert_eq!(w::decode(&bytes).unwrap(), frame);
     let duplicate = host.dispatch(envelope).await.unwrap();
     assert!(matches!(duplicate,w::BridgeFrame::Reply{id:reply,..} if reply==id));
-    assert_eq!(
-        server.join().unwrap()["messages"]
-            .as_array()
-            .unwrap()
-            .last()
-            .unwrap()["content"][0]["text"],
-        "Say hello"
-    );
+    let request = server.join().unwrap();
+    assert_eq!(request["messages"].as_array().unwrap().iter()
+        .filter(|message| message["role"] == "user" && message["content"][0]["text"] == "Say hello")
+        .count(), 1, "the original prompt reaches the provider exactly once alongside request-local state");
     host.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -334,6 +331,7 @@ async fn export_escapes_untrusted_blocks_and_never_embeds_invoke() {
     view.details.messages.push(w::ClientMessage {
         id: "x".into(),
         role: "assistant".into(),
+        tool: None,
         blocks: vec![w::MessageBlock::Text {
             text: "<script>__TAURI_INTERNALS__.invoke('quit')</script>".into(),
         }],
@@ -1579,11 +1577,9 @@ async fn configured_browser_host_registers_visual_schemas_without_starting_a_pre
                     catalog.iter().any(|tool| tool["name"] == name),
                     browser_available
                 );
-                assert_eq!(
-                    active.iter().any(|tool| tool["name"] == name),
-                    browser_available
-                );
+                assert!(!active.iter().any(|tool| tool["name"] == name));
             }
+            assert_eq!(active.iter().any(|tool| tool["name"] == "ui"), browser_available);
             assert!(
                 selected
                     .services
@@ -1602,4 +1598,142 @@ async fn configured_browser_host_registers_visual_schemas_without_starting_a_pre
             assert!(record.quiescent);
         }
     }
+}
+
+#[tokio::test]
+async fn long_user_input_with_a_full_workspace_snapshot_survives_completion_and_fork() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let (origin, server) = provider_requests(2);
+    let (_dir, initial) = host(&origin).await;
+    let workspace = _dir.path().join("workspace");
+    for index in 0..100 {
+        std::fs::write(
+            workspace.join(format!("workspace-entry-{index:03}.txt")),
+            "fixture",
+        )
+        .unwrap();
+    }
+    initial.shutdown().await.unwrap();
+    drop(initial);
+    let host = Host::open(&workspace, &_dir.path().join("private"), config(&origin))
+        .await
+        .unwrap();
+    let text = "Fork input Ω ".repeat(3500);
+    let id = upload(&host, text.as_bytes()).await;
+    command(
+        &host,
+        w::Command::Prompt {
+            input: w::PromptInput::Artifact {
+                artifact: id.try_into().unwrap(),
+            },
+        },
+    )
+    .await;
+    wait(&host).await;
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0]["messages"].to_string().contains("summar"));
+    assert!(
+        requests[1]["messages"]
+            .to_string()
+            .contains("workspace-entry-098.txt")
+    );
+    let before = host.view().unwrap();
+    let entry = before
+        .details
+        .messages
+        .iter()
+        .find(|m| m.role == "user")
+        .unwrap()
+        .id
+        .clone();
+    let mut bytes = vec![];
+    let mut offset = json!("0");
+    loop {
+        let page = data(
+            command(
+                &host,
+                w::Command::Session {
+                    action: "user_text".into(),
+                    args: json!({"id":entry,"offset":offset}),
+                },
+            )
+            .await,
+        );
+        bytes.extend(STANDARD.decode(page["base64"].as_str().unwrap()).unwrap());
+        offset = page["next"].clone();
+        if offset.is_null() {
+            break;
+        }
+    }
+    assert_eq!(String::from_utf8(bytes).unwrap(), text);
+    let reply = data(
+        command(
+            &host,
+            w::Command::Session {
+                action: "fork".into(),
+                args: json!({"entry":entry}),
+            },
+        )
+        .await,
+    );
+    wait(&host).await;
+    let after = host.view().unwrap();
+    assert_ne!(before.snapshot.scope.session, after.snapshot.scope.session);
+    assert_eq!(
+        after.details.activity["last_terminal"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        after.details.activity["last_terminal"]["operation"],
+        reply["operation"]
+    );
+    host.shutdown().await.unwrap();
+}
+
+fn provider_requests(count: usize) -> (String, std::thread::JoinHandle<Vec<Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let thread = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        for _ in 0..count {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut input = vec![];
+            let mut buf = [0; 4096];
+            let body = loop {
+                let n = socket.read(&mut buf).unwrap();
+                assert!(n > 0);
+                input.extend_from_slice(&buf[..n]);
+                if let Some(end) = input.windows(4).position(|s| s == b"\r\n\r\n") {
+                    let header = String::from_utf8_lossy(&input[..end]);
+                    let length: usize = header
+                        .lines()
+                        .find_map(|s| {
+                            s.to_lowercase()
+                                .strip_prefix("content-length: ")
+                                .map(str::to_owned)
+                        })
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if input.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&input[end + 4..end + 4 + length])
+                            .unwrap();
+                    }
+                }
+            };
+            std::thread::sleep(Duration::from_millis(40));
+            let body_out = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"content":"Hello from native"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":3}})
+            );
+            write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body_out.len(),body_out).unwrap();
+            requests.push(body);
+        }
+        requests
+    });
+    (origin, thread)
 }

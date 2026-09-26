@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
+import { fonts } from "./preferences";
+import type { Theme } from "./themes";
 import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 (globalThis as typeof globalThis & { MonacoEnvironment: unknown }).MonacoEnvironment = {
   getWorker: () => new EditorWorker(),
@@ -7,13 +9,19 @@ import EditorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 export default function Editor({
   text,
   path,
-  dark,
+  theme,
+  fontSize,
+  fontFamily,
+  wordWrap,
   onChange,
   resetKey,
 }: {
   text: string;
   path: string;
-  dark: boolean;
+  theme: Theme;
+  fontSize: number;
+  fontFamily: string;
+  wordWrap: boolean;
   resetKey: string;
   onChange: (text: string) => void;
 }) {
@@ -26,10 +34,10 @@ export default function Editor({
     const instance = monaco.editor.create(element.current, {
       value: text,
       language: path.endsWith(".json") ? "json" : path.endsWith(".md") ? "markdown" : "plaintext",
-      theme: dark ? "vs-dark" : "vs",
+      theme: "ag1",
       automaticLayout: true,
       fontFamily: "Geist Mono, monospace",
-      fontSize: 13,
+      fontSize,
       minimap: { enabled: false },
       scrollBeyondLastLine: false,
       padding: { top: 16 },
@@ -45,8 +53,17 @@ export default function Editor({
     };
   }, [path]);
   useEffect(() => {
-    monaco.editor.setTheme(dark ? "vs-dark" : "vs");
-  }, [dark]);
+    const update = () => {
+      const style = getComputedStyle(document.documentElement), color = (key: string) => style.getPropertyValue(`--${key}`).trim();
+      const light = !document.documentElement.classList.contains("dark");
+      monaco.editor.defineTheme("ag1", { base: light ? "vs" : "vs-dark", inherit: true,
+        rules: [{ token: "keyword", foreground: color("link").slice(1) }, { token: "comment", foreground: color("muted-foreground").slice(1) }],
+        colors: { "editor.background": color("background"), "editor.foreground": color("foreground"), "editorLineNumber.foreground": color("muted-foreground") } });
+      monaco.editor.setTheme("ag1"); editor.current?.updateOptions({ fontSize, fontFamily: fonts[fontFamily as keyof typeof fonts], wordWrap: wordWrap ? "on" : "off" });
+    };
+    update(); const media = matchMedia("(prefers-color-scheme: dark)"); media.addEventListener?.("change", update);
+    return () => media.removeEventListener?.("change", update);
+  }, [theme, fontSize, fontFamily, wordWrap, path]);
   useEffect(() => {
     if (editor.current && text !== editor.current.getValue()) editor.current.setValue(text);
   }, [resetKey]);

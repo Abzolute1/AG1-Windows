@@ -1,0 +1,252 @@
+--- a/product/crates/ag1-platform/src/session/working_set.rs
++++ b/product/crates/ag1-platform/src/session/working_set.rs
+@@ -57,40 +57,76 @@
+     pub(super) fn new(
+         stamp: Stamp,
+         key: Value,
+-        branch: Vec<Value>,
+-        original: Vec<Value>,
++        branch: &[Value],
++        original: &[Value],
+         compiled: Vec<Value>,
+         request: RequestIdentity,
+     ) -> Self {
+         Self {
+             stamp,
+             key,
+-            branch: Prefix::of(&branch),
+-            original: Prefix::of(&original),
++            branch: Prefix::of(branch),
++            original: Prefix::of(original),
+             compiled: Arc::new(compiled),
+             request,
+         }
+     }
+ 
+-    pub(super) fn extend(
++    pub(super) fn extend<'a>(
+         &self,
+-        stamp: &Stamp,
+-        key: &Value,
+-        branch: &[Value],
+-        original: &[Value],
+-    ) -> Option<Vec<Value>> {
++        stamp: &'a Stamp,
++        key: &'a Value,
++        branch: &'a [Value],
++        original: &'a [Value],
++    ) -> Option<Continuation<'a>> {
+         // Equality of message text alone cannot authorize cross-branch reuse.
+         // Exact committed ancestry and current owner/epoch must also agree.
+-        if !self.stamp.same_owner_epoch(stamp)
+-            || &self.key != key
+-            || !self.branch.matches(branch)
+-            || !self.original.matches(original)
+-        {
++        if !self.stamp.same_owner_epoch(stamp) || &self.key != key {
+             return None;
+         }
++        let branch_identity = self.branch.checked_extension(branch)?;
++        let original_identity = self.original.checked_extension(original)?;
+         let mut messages = self.compiled.as_ref().clone();
+         messages.extend_from_slice(&original[self.original.len..]);
+-        Some(messages)
++        Some(Continuation {
++            stamp,
++            key,
++            branch,
++            original,
++            branch_identity,
++            original_identity,
++            messages,
++        })
++    }
++}
++
++/// The validated inputs remain immutably borrowed until the prospective cache is
++/// built. A caller cannot change them after verification and reuse their hashes.
++/// Final admission still independently checks owner/revision and source freshness.
++pub(super) struct Continuation<'a> {
++    stamp: &'a Stamp,
++    key: &'a Value,
++    branch: &'a [Value],
++    original: &'a [Value],
++    branch_identity: Prefix,
++    original_identity: Prefix,
++    messages: Vec<Value>,
++}
++impl Continuation<'_> {
++    pub(super) fn messages(&self) -> &[Value] {
++        &self.messages
++    }
++    pub(super) fn finish(self, compiled: Vec<Value>, request: RequestIdentity) -> WorkingSet {
++        debug_assert_eq!(self.branch.len(), self.branch_identity.len);
++        debug_assert_eq!(self.original.len(), self.original_identity.len);
++        WorkingSet {
++            stamp: self.stamp.clone(),
++            key: self.key.clone(),
++            branch: self.branch_identity,
++            original: self.original_identity,
++            compiled: Arc::new(compiled),
++            request,
++        }
+     }
+ }
+ 
+@@ -110,7 +146,129 @@
+             digest: digest.finalize().into(),
+         }
+     }
+-    fn matches(&self, values: &[Value]) -> bool {
+-        values.len() >= self.len && Self::of(&values[..self.len]).digest == self.digest
+-    }
+-}
++    fn checked_extension(&self, values: &[Value]) -> Option<Self> {
++        if values.len() < self.len {
++            return None;
++        }
++        // Reproduce serde's complete array bytes while retaining the hash state
++        // just before its closing bracket. Verify the entire old prefix, then
++        // extend that same pass with the appended values for the next witness.
++        let mut hash = Sha256::new();
++        hash.update(b"[");
++        for (index, value) in values[..self.len].iter().enumerate() {
++            if index != 0 {
++                hash.update(b",");
++            }
++            serde_json::to_writer(&mut hash, value).expect("JSON values serialize to a digest");
++        }
++        let mut previous = hash.clone();
++        previous.update(b"]");
++        if <[u8; 32]>::from(previous.finalize()) != self.digest {
++            return None;
++        }
++        for (index, value) in values[self.len..].iter().enumerate() {
++            if self.len + index != 0 {
++                hash.update(b",");
++            }
++            serde_json::to_writer(&mut hash, value).expect("JSON values serialize to a digest");
++        }
++        hash.update(b"]");
++        Some(Self {
++            len: values.len(),
++            digest: hash.finalize().into(),
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use ag1_core::{SessionId, runtime::boundary::Boundary};
++    #[test]
++    fn checked_extension_matches_whole_array_hash_and_rejects_changed_prefixes() {
++        let rows = vec![
++            json!({"text":"β\n\"","nested":[null,true,1.25],"id":"a"}),
++            json!({"id":"b","parent":"a"}),
++            json!({"role":"user","content":"new turn"}),
++        ];
++        for length in 0..=rows.len() {
++            let prefix = Prefix::of(&rows[..length]);
++            let next = prefix.checked_extension(&rows).unwrap();
++            assert_eq!(next.len, rows.len());
++            assert_eq!(next.digest, Prefix::of(&rows).digest);
++            assert_eq!(
++                prefix.checked_extension(&rows[..length]).unwrap().digest,
++                prefix.digest
++            );
++            if length != 0 {
++                assert!(prefix.checked_extension(&rows[..length - 1]).is_none());
++                let mut edited = rows.clone();
++                edited[0]["id"] = json!("replacement");
++                assert!(prefix.checked_extension(&edited).is_none());
++            }
++        }
++    }
++    #[test]
++    fn continuation_keeps_owner_configuration_and_branch_fences_across_publication() {
++        let mut owner = Boundary::new(SessionId::new("session").unwrap(), 1).unwrap();
++        let other = Boundary::new(SessionId::new("session").unwrap(), 1).unwrap();
++        let key = json!({"model":"same","tools":["read"]});
++        let branch = vec![json!({"id":"a","parent":null,"message":"first"})];
++        let original = vec![json!({"role":"user","content":"first"})];
++        let identity = || RequestIdentity::new(&key, &original);
++        let cache = WorkingSet::new(
++            owner.stamp().clone(),
++            key.clone(),
++            &branch,
++            &original,
++            original.clone(),
++            identity(),
++        );
++        assert!(
++            cache
++                .extend(other.stamp(), &key, &branch, &original)
++                .is_none()
++        );
++        assert!(
++            cache
++                .extend(
++                    owner.stamp(),
++                    &json!({"model":"different"}),
++                    &branch,
++                    &original
++                )
++                .is_none()
++        );
++        let mut changed_branch = branch.clone();
++        changed_branch[0]["parent"] = json!("other");
++        assert!(
++            cache
++                .extend(owner.stamp(), &key, &changed_branch, &original)
++                .is_none()
++        );
++        let mut changed_original = original.clone();
++        changed_original[0]["content"] = json!("changed");
++        assert!(
++            cache
++                .extend(owner.stamp(), &key, &branch, &changed_original)
++                .is_none()
++        );
++        owner.changed().unwrap();
++        let mut appended = original.clone();
++        appended.push(json!({"role":"assistant","content":"reply"}));
++        let next = cache
++            .extend(owner.stamp(), &key, &branch, &appended)
++            .unwrap();
++        assert_eq!(next.messages(), appended);
++        let compiled = next.messages().to_vec();
++        let next = next.finish(compiled, identity());
++        assert!(
++            next.extend(owner.stamp(), &key, &branch, &appended)
++                .is_some()
++        );
++        assert!(
++            next.extend(owner.stamp(), &key, &branch, &original)
++                .is_none()
++        );
++    }
++}
+--- a/product/crates/ag1-platform/src/session/context.rs
++++ b/product/crates/ag1-platform/src/session/context.rs
+@@ -184,7 +184,7 @@
+                 let reused = reuse.as_ref().and_then(|cache|cache.extend(&stamp,&key,&branch,&messages));
+                 let cache_hit = reused.is_some();
+                 let admitted_prefix = reused.as_ref().and(reuse.as_ref()).map(|cache| cache.compiled_len());
+-                let compiler_input = reused.as_deref().unwrap_or(&messages);
++                let compiler_input = reused.as_ref().map(|reuse| reuse.messages()).unwrap_or(&messages);
+                 let query = context::latest_query(&messages).unwrap_or_default();
+                 let selected = memory.select(&query, 1600, 16, |entry| {
+                     memory_sources(entry, |source| {
+@@ -285,7 +285,10 @@
+                 }
+                 artifacts.put_evidence(&custody::compiled(&configuration, &projection.messages, &memory_revision, &projection.stats),
+                     "runtime-request-compiled", &json!({"type":"session","name":"compiled-request-context"}), &[], None)?;
+-                let working_set = canonical_working.map(|compiled| super::working_set::WorkingSet::new(stamp,key,branch,messages,compiled,request_identity));
++                let working_set = canonical_working.map(|compiled| match reused {
++                    Some(reuse) => reuse.finish(compiled, request_identity),
++                    None => super::working_set::WorkingSet::new(stamp.clone(),key.clone(),&branch,&messages,compiled,request_identity),
++                });
+                 Ok(PreparedContext {
+                     projection,
+                     working_set,

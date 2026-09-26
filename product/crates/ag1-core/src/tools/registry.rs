@@ -3,17 +3,40 @@ use crate::DomainError;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Responses retains both the provider call ID and output item ID for replay.
+/// This is provider metadata, not the host operation/storage identity.
+pub(super) fn validate_call_id(id: &str) -> Result<(), DomainError> {
+    if id.len() > 128 {
+        return Err(DomainError::InvalidInput("tool call identity".into()));
+    }
+    if let Some((call, item)) = id.split_once('|') {
+        crate::OperationId::new(call)?;
+        crate::OperationId::new(item)?;
+    } else {
+        crate::OperationId::new(id)?;
+    }
+    Ok(())
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Origin {
     BuiltIn,
     Extension,
     TrustedHost,
+    Mcp,
 }
 #[derive(Clone, Debug)]
 pub struct Definition {
     pub metadata: Value,
     pub schema: Schema,
     pub origin: Origin,
+    pub mcp: Option<super::mcp::Identity>,
+    mcp_reviewed_policy: Option<super::mcp::trust::ReviewedPolicy>,
+}
+impl Definition {
+    pub fn mcp_reviewed_policy(&self) -> Option<&super::mcp::trust::ReviewedPolicy> {
+        self.mcp_reviewed_policy.as_ref()
+    }
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
@@ -32,6 +55,8 @@ pub struct ValidatedCall {
     pub(crate) args_hash: String,
     pub(crate) registry_revision: u64,
     pub(crate) origin: Origin,
+    pub(crate) mcp: Option<std::sync::Arc<super::mcp::Identity>>,
+    mcp_reviewed_policy: Option<super::mcp::trust::ReviewedPolicy>,
 }
 impl ValidatedCall {
     pub fn operation(&self) -> &str {
@@ -48,6 +73,12 @@ impl ValidatedCall {
     }
     pub fn args_hash(&self) -> &str {
         &self.args_hash
+    }
+    pub fn mcp_identity(&self) -> Option<&super::mcp::Identity> {
+        self.mcp.as_deref()
+    }
+    pub fn mcp_reviewed_policy(&self) -> Option<&super::mcp::trust::ReviewedPolicy> {
+        self.mcp_reviewed_policy.as_ref()
     }
     pub fn origin(&self) -> Origin {
         self.origin
@@ -72,6 +103,7 @@ impl Registry {
         for row in rows {
             registry.register(row, Origin::BuiltIn)?;
         }
+        super::surface::register(&mut registry)?;
         Ok(registry)
     }
     pub fn revision(&self) -> u64 {
@@ -128,7 +160,15 @@ impl Registry {
             "episode",
             "job",
             "check",
+            "preview",
             "verify",
+            "inspect",
+            "ui",
+            "work",
+            "evidence",
+            "retainEvidence",
+            "releaseEvidence",
+            "capability",
         ];
         let selected = self
             .definitions
@@ -201,6 +241,18 @@ impl Registry {
         crate::context::prompt::build(&input)
     }
     pub fn register(&mut self, metadata: Value, origin: Origin) -> Result<(), DomainError> {
+        if origin == Origin::Mcp {
+            return Err(DomainError::PermissionDenied);
+        }
+        self.insert(metadata, origin, None, None)
+    }
+    fn insert(
+        &mut self,
+        metadata: Value,
+        origin: Origin,
+        mcp: Option<super::mcp::Identity>,
+        mcp_reviewed_policy: Option<super::mcp::trust::ReviewedPolicy>,
+    ) -> Result<(), DomainError> {
         super::schema::bounded(&metadata, 256 * 1024, 32)?;
         let name = metadata["name"]
             .as_str()
@@ -228,8 +280,76 @@ impl Registry {
                 metadata,
                 schema,
                 origin,
+                mcp,
+                mcp_reviewed_policy,
             },
         );
+        Ok(())
+    }
+    /// Copy native-validated MCP capabilities without reconstructing authority
+    /// from serialized model metadata. Includes only this registry's MCP origin.
+    pub fn mcp_selection(&self) -> Vec<super::mcp::SelectedDefinition> {
+        self.definitions
+            .values()
+            .filter(|d| d.origin == Origin::Mcp)
+            .map(|d| super::mcp::SelectedDefinition {
+                identity: d.mcp.clone().expect("MCP definition identity"),
+                metadata: d.metadata.clone(),
+                reviewed_policy: d.mcp_reviewed_policy.clone(),
+            })
+            .collect()
+    }
+    /// Replace only MCP's selected definitions, atomically. Other origins and
+    /// their active selection are preserved. Identical selections do not churn
+    /// registry revisions; any bound identity/metadata change invalidates calls.
+    pub fn replace_mcp_selection(
+        &mut self,
+        selected: &[super::mcp::SelectedDefinition],
+    ) -> Result<(), DomainError> {
+        if selected.len() > super::mcp::MAX_SELECTED_TOOLS {
+            return Err(DomainError::LimitExceeded("MCP selected tool count".into()));
+        }
+        let mut bytes = 0usize;
+        for definition in selected {
+            bytes = bytes
+                .checked_add(definition.metadata().to_string().len())
+                .ok_or(DomainError::Conflict)?;
+            if bytes > super::mcp::MAX_SELECTION_BYTES {
+                return Err(DomainError::LimitExceeded(
+                    "MCP selected schema bytes".into(),
+                ));
+            }
+        }
+        let mut next = self.clone();
+        next.definitions.retain(|_, d| d.origin != Origin::Mcp);
+        next.active.retain(|n| next.definitions.contains_key(n));
+        for definition in selected {
+            if let Some(review) = &definition.reviewed_policy {
+                review.check(definition.identity())?;
+            }
+            let name = definition.identity().wire_name();
+            next.insert(
+                definition.metadata().clone(),
+                Origin::Mcp,
+                Some(definition.identity().clone()),
+                definition.reviewed_policy.clone(),
+            )?;
+            next.active.insert(name);
+        }
+        let identical = self.active == next.active
+            && self.definitions.len() == next.definitions.len()
+            && self.definitions.iter().all(|(name, d)| {
+                next.definitions.get(name).is_some_and(|n| {
+                    d.origin == n.origin
+                        && d.mcp == n.mcp
+                        && d.metadata == n.metadata
+                        && d.mcp_reviewed_policy == n.mcp_reviewed_policy
+                })
+            });
+        if !identical {
+            next.revision = self.revision.checked_add(1).ok_or(DomainError::Conflict)?;
+            *self = next;
+        }
         Ok(())
     }
     /// Validate the entire extension contribution before publishing any definition.
@@ -328,7 +448,7 @@ impl Registry {
         complete: bool,
     ) -> Result<ValidatedCall, DomainError> {
         crate::OperationId::new(operation)?;
-        crate::OperationId::new(call_id)?;
+        validate_call_id(call_id)?;
         if !complete {
             return Err(DomainError::InvalidInput("Tool call arguments were truncated or malformed (stream interrupted). The call was not executed. Retry the tool call with complete arguments.".into()));
         }
@@ -337,11 +457,32 @@ impl Registry {
             .get(name)
             .filter(|_| self.active.contains(name))
             .ok_or_else(|| DomainError::Unavailable(format!("Tool {name} not available")))?;
+        if let Some(review) = &definition.mcp_reviewed_policy {
+            review.check(definition.mcp.as_ref().ok_or(DomainError::Conflict)?)?;
+        }
         super::schema::bounded(args, 8 * 1024 * 1024, 64)?;
+        if name == "editPreview"
+            && definition.origin == Origin::BuiltIn
+            && !args["newText"].is_string()
+        {
+            return Err(DomainError::InvalidInput("editPreview requires newText as a string. Use an explicit empty string only for intentional deletion; null and omitted values are not replacements.".into()));
+        }
         if args.to_string().len() > 8 * 1024 * 1024 {
             return Err(DomainError::LimitExceeded("tool arguments".into()));
         }
-        let args = definition.schema.coerce(&arguments::prepare(name, args))?;
+        let args = if definition.origin == Origin::Mcp {
+            super::schema::bounded(args, 256 * 1024, 32)?;
+            if args.to_string().len() > 256 * 1024 {
+                return Err(DomainError::LimitExceeded("MCP argument bytes".into()));
+            }
+            definition.schema.validate(args)?;
+            args.clone()
+        } else {
+            definition.schema.coerce(&arguments::prepare(name, args))?
+        };
+        if name == "check" || name == "artifact" && args["action"] == "lease" {
+            super::verification::scope(&args)?;
+        }
         let args_hash = format!("{:x}", Sha256::digest(args.to_string().as_bytes()));
         Ok(ValidatedCall {
             operation: operation.into(),
@@ -351,10 +492,26 @@ impl Registry {
             args_hash,
             registry_revision: self.revision,
             origin: definition.origin,
+            mcp_reviewed_policy: definition.mcp_reviewed_policy.clone(),
+            mcp: definition
+                .mcp
+                .as_ref()
+                .map(|identity| std::sync::Arc::new(identity.clone())),
         })
     }
     pub fn validate_current(&self, call: &ValidatedCall) -> Result<(), DomainError> {
-        if self.revision != call.registry_revision || !self.active.contains(&call.name) {
+        if let Some(review) = &call.mcp_reviewed_policy {
+            review.check(call.mcp_identity().ok_or(DomainError::Conflict)?)?;
+        }
+        if self.revision != call.registry_revision
+            || !self.active.contains(&call.name)
+            || (call.origin == Origin::Mcp
+                && self.definitions.get(&call.name).is_none_or(|definition| {
+                    definition.origin != Origin::Mcp
+                        || definition.mcp.as_ref() != call.mcp_identity()
+                        || definition.mcp_reviewed_policy != call.mcp_reviewed_policy
+                }))
+        {
             Err(DomainError::Conflict)
         } else {
             Ok(())

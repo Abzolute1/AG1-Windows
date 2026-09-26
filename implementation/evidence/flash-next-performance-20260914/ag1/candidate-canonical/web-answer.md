@@ -1,0 +1,3 @@
+**Why `time.monotonic()` is good for measuring elapsed time** (per [docs.python.org/3/library/time.html](https://docs.python.org/3/library/time.html)):
+
+It returns a clock that "cannot go backwards" and "is not affected by system clock updates." Wall-clock `time.time()` can jump when the system clock is adjusted, NTP-corrected, or set manually, producing negative or distorted durations. Since a monotonic clock only ever advances, differences between two calls are always valid and stable. Its reference point is undefined, so only the difference between two calls matters — exactly what elapsed-time measurement needs. Use `monotonic_ns()` for integer nanosecond precision.

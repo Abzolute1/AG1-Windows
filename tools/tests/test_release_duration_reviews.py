@@ -49,6 +49,24 @@ class Reviews(unittest.TestCase):
             runner.activity("task", lambda _: called.append(True))
         self.assertEqual(called, [])
         self.assertFalse((self.out / "activities").exists())
+    def test_semantic_continuation_requires_explicit_investigation_and_safe_review(self):
+        self.review.update(investigation_continuation="semantic-only", unexpected_effects=[],
+                           unresolved_commands=[], forbidden_avoidance=True)
+        self.publish()
+        with self.assertRaisesRegex(RuntimeError, "Quality review failed"):
+            reject_failed_reviews(self.out, [self.task])
+        reject_failed_reviews(self.out, [self.task], allow_semantic_continuation=True)
+        self.assertEqual(json.loads(self.path.read_text())["status"], "failed")
+        for field, value in [("unexpected_effects", ["outside scope"]),
+                             ("unresolved_commands", ["pending"]),
+                             ("forbidden_avoidance", False)]:
+            previous = self.review[field]
+            self.review[field] = value
+            self.publish()
+            with self.assertRaisesRegex(RuntimeError, "Quality review failed"):
+                reject_failed_reviews(self.out, [self.task], allow_semantic_continuation=True)
+            self.review[field] = previous
+
     def test_failed_review_for_another_task_is_not_silently_used(self):
         self.review["task_index"] = 1
         self.publish()

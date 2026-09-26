@@ -1,0 +1,95 @@
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -520,6 +520,8 @@
+         size = file->size();
+         int fd = file->file_id();
+         int flags = MAP_SHARED;
++        // A writable registration must never target a shared file mapping.
++        if (getenv("AG1_FLASH_REGISTER_COW")) flags = MAP_PRIVATE;
+         if (numa) { prefetch = 0; }
+ #ifdef __linux__
+         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -41,6 +41,8 @@
+ #include <vector>
+ #ifdef __linux__
+ #include <unistd.h>
++#include <dlfcn.h>
++#include <sys/mman.h>
+ #endif
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -1154,6 +1156,12 @@
+ struct llama_model::impl {
+     impl() = default;
+     ~impl() {
++#ifdef __linux__
++        if (unregister_cow) {
++            for (void * address : cow_host) unregister_cow(address);
++        }
++        if (cuda_driver_handle) dlclose(cuda_driver_handle);
++#endif
+         if (unregister_host) {
+             for (void * address : registered_host) {
+                 unregister_host(address);
+@@ -1161,6 +1169,9 @@
+         }
+     }
+ 
++    int (*unregister_cow)(void *) = nullptr;
++    void * cuda_driver_handle = nullptr;
++    std::vector<void *> cow_host;
+     void (*unregister_host)(void *) = nullptr;
+     std::vector<void *> registered_host;
+ 
+@@ -1873,7 +1884,7 @@
+ 
+     std::vector<std::pair<uintptr_t, uintptr_t>> register_ranges;
+ #ifdef __linux__
+-    if (ml.use_mmap && std::getenv("AG1_FLASH_REGISTER_MMAP")) {
++    if (ml.use_mmap && (std::getenv("AG1_FLASH_REGISTER_MMAP") || std::getenv("AG1_FLASH_REGISTER_COW"))) {
+         const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+         for (const auto & [ctx, buffers] : ctx_buf_maps) {
+             bool lazy = false;
+@@ -1904,6 +1915,40 @@
+             return false;
+         }
+     }
++
++#ifdef __linux__
++    if (!register_ranges.empty() && std::getenv("AG1_FLASH_REGISTER_COW")) {
++        // llama_mmap used MAP_PRIVATE for this mode. The driver may create private
++        // pages while pinning; it cannot write the original read-only-opened file.
++        pimpl->cuda_driver_handle = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
++        auto register_cow = pimpl->cuda_driver_handle ? reinterpret_cast<int (*)(void *, size_t, unsigned)>(
++                dlsym(pimpl->cuda_driver_handle, "cuMemHostRegister_v2")) : nullptr;
++        pimpl->unregister_cow = pimpl->cuda_driver_handle ? reinterpret_cast<int (*)(void *)>(
++                dlsym(pimpl->cuda_driver_handle, "cuMemHostUnregister")) : nullptr;
++        if (!register_cow || !pimpl->unregister_cow) throw std::runtime_error("CUDA driver registration entry points unavailable");
++        std::sort(register_ranges.begin(), register_ranges.end());
++        std::vector<std::pair<uintptr_t, uintptr_t>> merged;
++        for (const auto & range : register_ranges) {
++            if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
++            else merged.push_back(range);
++        }
++        size_t total = 0;
++        const int64_t begin_us = ggml_time_us();
++        for (const auto & [first, last] : merged) {
++            if (mprotect((void *) first, last - first, PROT_READ | PROT_WRITE)) throw std::runtime_error("private host mapping mprotect failed");
++            const int result = register_cow((void *) first, last - first, 1u);
++            if (result) {
++                mprotect((void *) first, last - first, PROT_READ);
++                throw std::runtime_error(format("CUDA private mapping registration failed: %d", result));
++            }
++            pimpl->cow_host.push_back((void *) first);
++            total += last - first;
++        }
++        LLAMA_LOG_INFO("%s: registered %.2f MiB private host weights in %.3f s (%zu ranges)\n", __func__,
++                total / 1048576.0, (ggml_time_us() - begin_us) / 1e6, pimpl->cow_host.size());
++        register_ranges.clear();
++    }
++#endif
+ 
+     if (!register_ranges.empty()) {
+         auto reg = ggml_backend_reg_by_name("CUDA");

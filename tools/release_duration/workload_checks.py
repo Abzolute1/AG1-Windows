@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import zlib
 from faults import retain,digest
 
 
@@ -106,6 +107,43 @@ def verify(client, workspace, state, specs, spec, before, output, node, context_
 def artifacts_intact(state, seed):
     for artifact in seed['artifacts']:
         expected = artifact['sha256']
-        if digest(state / 'store/blobs' / expected) != expected:
+        if logical_blob_digest(state / 'store/blobs', expected) != expected:
             raise RuntimeError('Original externalized artifact changed')
     return True
+
+
+def logical_blob_digest(directory, expected):
+    """Hash the complete bounded logical bytes of a v1/raw or v2/custody blob."""
+    if len(expected) != 64 or any(c not in '0123456789abcdef' for c in expected):
+        raise RuntimeError('Invalid logical blob digest')
+    raw = directory / expected
+    if os.path.lexists(raw):
+        if raw.is_symlink() or not raw.is_file():
+            raise RuntimeError('Invalid raw blob')
+        return digest(raw)
+    path = directory / (expected + '.z1')
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 256 * 1024 * 1024:
+        raise RuntimeError('Invalid compressed blob')
+    hasher = hashlib.sha256()
+    total = 0
+    with path.open('rb') as source:
+        header = source.read(16)
+        if len(header) != 16 or header[:8] != b'AG1ZLIB1':
+            raise RuntimeError('Unsupported compressed blob')
+        length = int.from_bytes(header[8:], 'little')
+        if length > 256 * 1024 * 1024:
+            raise RuntimeError('Oversized compressed blob')
+        decoder = zlib.decompressobj()
+        while block := source.read(65536):
+            while block:
+                decoded = decoder.decompress(block, min(65536, length - total + 1))
+                total += len(decoded)
+                if total > length:
+                    raise RuntimeError('Compressed blob length exceeded')
+                hasher.update(decoded)
+                block = decoder.unconsumed_tail
+                if decoder.eof:
+                    if decoder.unused_data or source.read(1) or total != length:
+                        raise RuntimeError('Compressed blob length mismatch or trailing bytes')
+                    return hasher.hexdigest()
+        raise RuntimeError('Truncated compressed blob')

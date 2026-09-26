@@ -1,0 +1,359 @@
+[
+  {
+    "name": "screenshot_url",
+    "label": "Screenshot URL",
+    "description": "Screenshot a page. For static HTML/CSS/JS pass the file path (index.html) — the harness opens it directly. For running apps pass http://localhost:…. Returns the image plus console errors and failed requests. fullPage defaults to false.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "url"
+      ],
+      "properties": {
+        "url": {
+          "description": "Workspace HTML path (index.html) or a live http(s) URL. Static pages: pass the file path — do not start a server. Live apps: http://localhost:5173",
+          "type": "string"
+        },
+        "fullPage": {
+          "description": "Capture the full scrollable page height. Defaults to false — only the viewport is captured. Set true when you need to see content below the fold. Full-page screenshots are large and consume significant context.",
+          "type": "boolean"
+        },
+        "viewport": {
+          "description": "Viewport dimensions. Defaults to 1280x900 (desktop). Use e.g. { width: 390, height: 844 } for mobile.",
+          "type": "object",
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "description": "Viewport width in pixels. Defaults to 1280.",
+              "type": "number"
+            },
+            "height": {
+              "description": "Viewport height in pixels. Defaults to 900.",
+              "type": "number"
+            }
+          }
+        },
+        "timeoutMs": {
+          "description": "Navigation timeout in milliseconds. Defaults to 15000. Increase for slow apps.",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Screenshot a workspace HTML file or a live URL (no server needed for static pages)",
+    "promptGuidelines": [
+      "After creating or modifying frontend code, verify with verify_ui or screenshot_url before claiming done",
+      "Static HTML: pass the file path (index.html). Do not start Python, Node, PHP, or any HTTP server just to screenshot",
+      "Live apps (Vite/Next/API): pass the http://localhost URL of the already-running app",
+      "Default is viewport-only — set fullPage: true only when you need content below the fold",
+      "Use viewport option to simulate mobile (e.g. { width: 390, height: 844 })",
+      "Check console errors and failed requests in the metadata to diagnose issues",
+      "The screenshot is already visible in the transcript. Do not mkdir Snapshots or write the image to disk"
+    ]
+  },
+  {
+    "name": "interact_then_screenshot",
+    "label": "Interact & Screenshot",
+    "description": "Perform a sequence of interactions on a page then take a screenshot of the resulting state. Use for login flows, form submissions, navigation to protected routes, or any UI state that requires user actions to reach. Each browser session is isolated — you must perform login and navigation in a single call to reach authenticated state.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "url",
+        "actions"
+      ],
+      "properties": {
+        "url": {
+          "description": "Workspace HTML path or live http(s) URL to open first. Static pages: pass the file. Do not start a server just to screenshot.",
+          "type": "string"
+        },
+        "actions": {
+          "description": "Ordered list of actions to perform before screenshotting. Use this for login flows, form submissions, or any UI state requiring interaction.",
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "selector",
+                  "value"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "fill",
+                    "type": "string"
+                  },
+                  "selector": {
+                    "description": "CSS selector for the input element.",
+                    "type": "string"
+                  },
+                  "value": {
+                    "description": "Text to type into the selected element.",
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "selector"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "click",
+                    "type": "string"
+                  },
+                  "selector": {
+                    "description": "CSS selector for the element to click.",
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "ms"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "wait",
+                    "type": "string"
+                  },
+                  "ms": {
+                    "description": "Milliseconds to wait before continuing.",
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "url"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "navigate",
+                    "type": "string"
+                  },
+                  "url": {
+                    "description": "Full URL to navigate to.",
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "fullPage": {
+          "description": "Capture the full scrollable page height. Defaults to false. Only set true when you need to see content below the fold.",
+          "type": "boolean"
+        },
+        "viewport": {
+          "description": "Viewport dimensions. Defaults to 1280x900 (desktop).",
+          "type": "object",
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "description": "Viewport width in pixels. Defaults to 1280.",
+              "type": "number"
+            },
+            "height": {
+              "description": "Viewport height in pixels. Defaults to 900.",
+              "type": "number"
+            }
+          }
+        },
+        "timeoutMs": {
+          "description": "Navigation timeout in milliseconds. Defaults to 15000.",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Interact with a page (click, fill, navigate) then take a screenshot",
+    "promptGuidelines": [
+      "Use interact_then_screenshot for flows that need clicks/fills — login, forms, modals",
+      "Static HTML: pass the file path. Do not start a local server just to screenshot",
+      "After creating or modifying frontend flows, verify before claiming done — verify_ui with actions gives a verdict without loading the image into context",
+      "Each call starts with a fresh browser session — log in in the same call to reach protected routes",
+      "Actions are executed sequentially: fill → click → wait → navigate"
+    ]
+  },
+  {
+    "name": "verify_ui",
+    "label": "Verify UI claim",
+    "description": "Verify a concrete claim about a web page by screenshotting it and judging the image against the claim. Returns PASS, FAIL, or UNCLEAR with one line of evidence — the screenshot itself is not returned unless no vision-capable judge is available. Use after building or modifying UI to confirm the result before claiming the work is done. State one specific, visible claim per call.",
+    "parameters": {
+      "type": "object",
+      "required": [
+        "url",
+        "claim"
+      ],
+      "properties": {
+        "url": {
+          "description": "Workspace HTML path (index.html) or a live http(s) URL. Static pages: pass the file — do not start a server.",
+          "type": "string"
+        },
+        "claim": {
+          "description": "Concrete, checkable claim about the page, e.g. \"the login button is visible and enabled\" or \"the snake game canvas renders a grid\". One claim per call.",
+          "type": "string"
+        },
+        "actions": {
+          "description": "Optional interactions (fill/click/wait/navigate) to reach the state under test before judging.",
+          "type": "array",
+          "items": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "selector",
+                  "value"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "fill",
+                    "type": "string"
+                  },
+                  "selector": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "selector"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "click",
+                    "type": "string"
+                  },
+                  "selector": {
+                    "type": "string"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "ms"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "wait",
+                    "type": "string"
+                  },
+                  "ms": {
+                    "type": "number"
+                  }
+                }
+              },
+              {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "type",
+                  "url"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "navigate",
+                    "type": "string"
+                  },
+                  "url": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "viewport": {
+          "description": "Viewport dimensions. Defaults to 1280x900. Use 390x844 for mobile.",
+          "type": "object",
+          "required": [
+            "width",
+            "height"
+          ],
+          "properties": {
+            "width": {
+              "type": "number"
+            },
+            "height": {
+              "type": "number"
+            }
+          }
+        },
+        "fullPage": {
+          "description": "Capture the full scrollable page height. Defaults to false (viewport only).",
+          "type": "boolean"
+        },
+        "timeoutMs": {
+          "description": "Navigation timeout in milliseconds. Defaults to 15000.",
+          "type": "number"
+        }
+      }
+    },
+    "promptSnippet": "Verify a concrete UI claim against a real screenshot (LLM judge)",
+    "promptGuidelines": [
+      "After creating or modifying frontend code, verify the result with verify_ui before claiming the task is done",
+      "Static HTML: pass the file path (index.html). Do not start a web server just to verify",
+      "State one concrete, visible claim per call (e.g. 'the submit button is visible and enabled'), not vague ones like 'the page looks good'",
+      "On FAIL: read the evidence, fix the cause, then re-verify — do not retry the same claim unchanged",
+      "On UNCLEAR: make the claim more specific or interact first (login, navigate) with the actions option",
+      "Use screenshot_url instead when you want to see the image yourself rather than get a verdict"
+    ]
+  },
+  {
+    "name": "preview",
+    "label": "Project preview",
+    "description": "Manage the AG1-owned web preview. status discovers eligible targets and returns the exact ready URL; start launches the installed root Vite dev script for at most five minutes; stop requires the returned operation ID. Startup is asynchronous. No arbitrary commands, websites, package installation or desktop capture.",
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "status",
+            "start",
+            "stop"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Optional target ID from status; start defaults to the root web target."
+        },
+        "operation": {
+          "type": "string",
+          "maxLength": 2048,
+          "description": "Exact running operation ID from status/start; required for stop."
+        }
+      }
+    }
+  }
+]

@@ -1,4 +1,5 @@
-//! Preview matching follows the SDK. Hunk locations use actual source offsets (P09 preview correction).
+//! Exact preview matching rejects ambiguous locations, including overlaps.
+//! Hunk locations use actual source offsets (P09 preview correction).
 use crate::DomainError;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -160,7 +161,7 @@ pub fn preview<'a>(
         result.error = Some(format!("file not found: {path}"));
         return Ok(result);
     };
-    let count = content.matches(old).count();
+    let count = super::edit::occurrences(content, old);
     if count == 0 {
         result.error = Some("oldText not found in file".into());
         return Ok(result);

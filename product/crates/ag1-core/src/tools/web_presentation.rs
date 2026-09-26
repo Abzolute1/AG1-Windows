@@ -64,6 +64,26 @@ pub fn render(
     super::schema::bounded(args, 64 * 1024, 16)?;
     super::schema::bounded(result, 128 * 1024, 32)?;
     let details = &result["details"];
+    if matches!(tool, "webSearch" | "webFetch")
+        && (result["isError"] == true || details["error"].is_string())
+    {
+        let reason = details["error"]
+            .as_str()
+            .unwrap_or("The web request failed.");
+        return Ok(Presentation {
+            heading: tool.to_ascii_uppercase(),
+            input: super::shell::sanitize(
+                string(args, if tool == "webSearch" { "query" } else { "url" }).as_bytes(),
+            )?,
+            summary: if details["status"] == "blocked" {
+                "Search blocked".into()
+            } else {
+                "Web request failed".into()
+            },
+            body: super::shell::sanitize(reason.as_bytes())?,
+        });
+    }
+
     let (input, summary, body) = match tool {
         "webSearch" => {
             let input = string(args, "query").to_owned();

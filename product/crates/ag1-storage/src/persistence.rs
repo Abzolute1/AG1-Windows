@@ -108,6 +108,7 @@ pub struct Store {
     pub(crate) db: Mutex<Connection>,
     pub(crate) clock: Arc<dyn Clock>,
     pub(crate) faults: Arc<dyn FaultInjector>,
+    pub(crate) catalog_cache: Mutex<Option<crate::artifact_catalog::CatalogCache>>,
     // Keep last: the database connection must close before another writer enters.
     _writer: WriterLease,
 }
@@ -297,7 +298,7 @@ impl Store {
         )?;
         let app: i64 = db.query_row("PRAGMA application_id", [], |r| r.get(0))?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if app != 1095184723 || version != 1 {
+        if app != 1095184723 || !matches!(version, 1 | 2) {
             return Err(StorageError::Unsupported(
                 "Unrecognized inspection database".into(),
             ));
@@ -315,6 +316,7 @@ impl Store {
         let store = Self {
             root,
             db: Mutex::new(db),
+            catalog_cache: Mutex::new(None),
             clock: Arc::new(SystemClock),
             faults: Arc::new(NoFault),
             _writer: writer,
@@ -352,7 +354,7 @@ impl Store {
                 )?;
                 let app: i64 = probe.query_row("PRAGMA application_id", [], |r| r.get(0))?;
                 let version: u32 = probe.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-                if app != 1095184723 || version != 1 {
+                if app != 1095184723 || !matches!(version, 1 | 2) {
                     return Err(StorageError::Unsupported(
                         "Unrecognized database identity/version; left unchanged".into(),
                     ));
@@ -401,7 +403,7 @@ impl Store {
         }
         let mut db = Connection::open(&db_path)?;
         let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(StorageError::Unsupported(format!(
                 "Storage schema {version}"
             )));
@@ -443,6 +445,7 @@ impl Store {
         let store = Self {
             root,
             db: Mutex::new(db),
+            catalog_cache: Mutex::new(None),
             clock,
             faults,
             _writer: writer,
@@ -501,15 +504,23 @@ impl Store {
         if !valid_digest(hash) {
             return Err(StorageError::Invalid("Blob digest".into()));
         }
-        Ok(self.root.join("blobs").join(hash))
+        let raw = self.root.join("blobs").join(hash);
+        if !raw.try_exists()? && raw.with_extension("z1").try_exists()? {
+            return Err(StorageError::Unsupported("Compressed blob has no raw path; use authenticated artifact pages or a lossless export".into()));
+        }
+        Ok(raw)
     }
     pub(crate) fn publish(&self, bytes: &[u8]) -> StorageResult<String> {
         let hash = digest(bytes);
-        let path = self.blob_path(&hash)?;
+        let path = self.root.join("blobs").join(&hash);
         if path.exists() {
             self.verify_blob(&hash)?;
             return Ok(hash);
         }
+        self.publish_physical(&path, bytes)?;
+        Ok(hash)
+    }
+    pub(crate) fn publish_physical(&self, path: &Path, bytes: &[u8]) -> StorageResult<()> {
         let mut tmp = tempfile::NamedTempFile::new_in(self.root.join("staging"))?;
         tmp.write_all(bytes)?;
         self.hit(Boundary::BeforeBlobSync)?;
@@ -520,28 +531,11 @@ impl Store {
             .map_err(|e| StorageError::Io(e.error))?;
         self.hit(Boundary::AfterRename)?;
         sync_dir(&self.root.join("blobs"))?;
-        Ok(hash)
+        Ok(())
     }
-    pub(crate) fn verify_blob(&self, hash: &str) -> StorageResult<File> {
-        let p = self.blob_path(hash)?;
-        no_symlink(&p)?;
-        let mut file = File::open(p)?;
-        if !file.metadata()?.is_file() {
-            return Err(StorageError::Corrupt("Non-file blob".into()));
-        }
-        let mut hasher = Sha256::new();
-        let mut buf = [0u8; 65536];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        if format!("{:x}", hasher.finalize()) != hash {
-            return Err(StorageError::Corrupt(format!("Blob hash mismatch: {hash}")));
-        }
-        Ok(file)
+    pub(crate) fn verify_blob(&self, hash: &str) -> StorageResult<()> {
+        self.blob_window(hash, 0, 0)?;
+        Ok(())
     }
     pub(crate) fn blob_bytes(&self, hash: &str) -> StorageResult<Vec<u8>> {
         let (size, bytes) = self.blob_window(hash, 0, 256 * 1024 * 1024)?;
@@ -559,12 +553,7 @@ impl Store {
         offset: u64,
         max: usize,
     ) -> StorageResult<(u64, Vec<u8>)> {
-        let path = self.blob_path(hash)?;
-        no_symlink(&path)?;
-        let mut file = File::open(path)?;
-        if !file.metadata()?.is_file() {
-            return Err(StorageError::Corrupt("Non-file blob".into()));
-        }
+        let mut file = self.blob_reader(hash)?;
         let end = offset
             .checked_add(max as u64)
             .ok_or_else(|| StorageError::Limit("Blob window overflow".into()))?;
@@ -605,13 +594,17 @@ impl Store {
         if integrity != "ok" {
             return Err(StorageError::Corrupt(integrity));
         }
+        let schema: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let referenced = Self::referenced_blobs(&db)?;
         for hash in &referenced {
+            if schema < 2 && self.physical_blob(hash)?.1 {
+                return Err(StorageError::Corrupt("Compressed reference requires storage schema 2".into()));
+            }
             self.verify_blob(hash)?;
         }
         let orphan_blobs = fs::read_dir(self.root.join("blobs"))?
             .filter_map(Result::ok)
-            .filter(|e| !referenced.contains(&e.file_name().to_string_lossy().into_owned()))
+            .filter(|e| crate::blob_codec::physical_hash(&e.file_name().to_string_lossy()).is_none_or(|hash| !referenced.contains(hash)))
             .count();
         let staged_files = fs::read_dir(self.root.join("staging"))?.count();
         let sequence = db.query_row(
@@ -625,7 +618,7 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(Health {
-            schema: 1,
+            schema,
             sequence,
             integrity,
             orphan_blobs,

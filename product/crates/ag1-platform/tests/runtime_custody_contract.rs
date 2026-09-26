@@ -193,3 +193,149 @@ fn resource_observations_only_allow_the_authenticated_owned_pid() {
     assert!(validate(Some(11), &[11], &[11, 22]).is_err());
     assert!(validate(Some(11), &[22], &[]).is_err());
 }
+
+#[tokio::test]
+async fn stopping_a_generation_proves_owned_exit_without_closing_the_bundle() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::at(&dir.path().join("authority")).unwrap();
+    let audit = Arc::new(Mutex::new(Audit::default()));
+    let bundle = RuntimeBundle::new(
+        FakeHost::new(audit.clone()),
+        plans(dir.path(), 18087, &["one"], 32768),
+        registry.runtime_lease().unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    bundle.prepare(&request("one")).await.unwrap();
+    assert!(
+        bundle
+            .cancel_generation("http://127.0.0.1:9999/v1/chat/completions")
+            .await
+            .is_err()
+    );
+    assert!(audit.lock().unwrap().active.is_some());
+    bundle.cancel_generation(&request("one").url).await.unwrap();
+    assert!(audit.lock().unwrap().active.is_none());
+    bundle.prepare(&request("one")).await.unwrap();
+    assert_eq!(
+        audit
+            .lock()
+            .unwrap()
+            .actions
+            .iter()
+            .map(|a| a.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["start", "stop", "start"]
+    );
+    bundle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn only_requested_model_is_verified_and_missing_or_unknown_selection_never_falls_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::at(&dir.path().join("authority")).unwrap();
+    let plans = plans(dir.path(), 18087, &["one", "two", "three"], 32768);
+    std::fs::remove_file(&plans[1].model_path).unwrap();
+    std::fs::write(&plans[2].model_path, b"changed model bytes").unwrap();
+    let audit = Arc::new(Mutex::new(Audit::default()));
+    let bundle = RuntimeBundle::new(
+        FakeHost::new(audit.clone()),
+        plans,
+        registry.runtime_lease().unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(audit.lock().unwrap().actions.is_empty());
+    bundle.prepare(&request("one")).await.unwrap();
+    bundle.prepare(&request("one")).await.unwrap();
+    assert_eq!(audit.lock().unwrap().launches.len(), 1);
+    assert_eq!(
+        bundle.prepare(&request("missing")).await,
+        Err(DomainError::PermissionDenied)
+    );
+    assert_eq!(
+        bundle.prepare(&request("two")).await,
+        Err(DomainError::NotFound)
+    );
+    assert_eq!(
+        bundle.prepare(&request("three")).await,
+        Err(DomainError::Conflict)
+    );
+    assert_eq!(audit.lock().unwrap().launches.len(), 1);
+    bundle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn catalog_wide_capture_verifies_only_selected_runtime_without_model_fallback() {
+    use ag1_platform::llama::{ResolveInput, resolve_launch_plan};
+    let d = tempfile::tempdir().unwrap();
+    let registry = Registry::at(&d.path().join("authority")).unwrap();
+    let original = plans(d.path(), 18087, &["35b", "27b", "flash"], 32768);
+    let inventory = original
+        .iter()
+        .flat_map(|p| p.materials.clone())
+        .collect::<Vec<_>>();
+    let plans = original.into_iter().map(|p| resolve_launch_plan(ResolveInput {
+        model_id: p.model_id, model_path: p.model_path,
+        profile_bytes: serde_json::to_vec(&serde_json::json!({"serverPath":p.command,"contextWindow":32768,"maxTokens":4096,"nCpuMoe":0,"priority":false})).unwrap(),
+        environment: [("AG1_LLAMA_CPP_PORT".into(), "18087".into())].into(),
+        context_override: None, forced_moe: None, cached_moe: None, vram_mib: Some(16376),
+        physical_cores: 12, logical_cores: 24, discovered_projector: None,
+        materials: inventory.clone(),
+    }).unwrap()).collect();
+    // Mirrors the real capture: every plan contains every model's weights.
+    // Unrelated model files must not even be opened while preparing 35b.
+    std::fs::remove_file(d.path().join("27b.gguf")).unwrap();
+    std::fs::remove_file(d.path().join("flash.gguf")).unwrap();
+    let audit = Arc::new(Mutex::new(Audit::default()));
+    let bundle = RuntimeBundle::new(
+        FakeHost::new(audit.clone()),
+        plans,
+        registry.runtime_lease().unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    bundle.prepare(&request("35b")).await.unwrap();
+    bundle.prepare(&request("35b")).await.unwrap();
+    assert_eq!(audit.lock().unwrap().launches.len(), 1); // stays warm
+    assert_eq!(bundle.progress().unwrap()["phase"], "ready");
+    assert_eq!(bundle.progress().unwrap()["model"], "35b");
+    assert!(bundle.prepare(&request("flash")).await.is_err());
+    assert_eq!(bundle.progress().unwrap()["phase"], "failed");
+    assert_eq!(bundle.progress().unwrap()["model"], "flash");
+    assert_eq!(audit.lock().unwrap().launches.len(), 1); // no fallback launch
+    bundle.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn manual_preparation_reuses_resident_model_and_clears_status_on_unload() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = Registry::at(&dir.path().join("authority")).unwrap();
+    let audit = Arc::new(Mutex::new(Audit::default()));
+    let bundle = RuntimeBundle::new(FakeHost::new(audit.clone()), plans(dir.path(),18087,&["one","two"],32768),registry.runtime_lease().unwrap(),Duration::from_secs(2)).unwrap();
+    bundle.load_model("one").await.unwrap();
+    assert_eq!(bundle.progress().unwrap()["phase"], "ready");
+    bundle.load_model("one").await.unwrap();
+    assert_eq!(audit.lock().unwrap().launches.len(), 1);
+    bundle.load_model("two").await.unwrap();
+    assert_eq!(bundle.progress().unwrap()["model"], "two");
+    assert_eq!(audit.lock().unwrap().maximum_active, 1);
+    assert!(bundle.load_model("unknown").await.is_err());
+    bundle.unload_owned().await.unwrap();
+    assert!(bundle.progress().is_none());
+    bundle.stop().await.unwrap();
+}
+
+#[test]
+fn verification_percentage_counts_bytes_and_never_completes_failed_verification() {
+    use ag1_platform::llama::{native::MaterialVerifier, Material};
+    let dir = tempfile::tempdir().unwrap(); let path=dir.path().join("weight");
+    let bytes=vec![42u8;1024*1024]; std::fs::write(&path,&bytes).unwrap();
+    let material=Material {path:path.to_string_lossy().into_owned(),sha256:ag1_storage::digest(&bytes),kind:"weight".into()};
+    let mut verifier=MaterialVerifier::default(); let mut values=vec![];
+    verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();
+    assert_eq!(values.first(),Some(&0));assert_eq!(values.last(),Some(&100));assert!(values.len()>5);assert!(values.windows(2).all(|w|w[0]<=w[1]));
+    values.clear();verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();assert_eq!(values.last(),Some(&100));
+    std::fs::write(&path,vec![41u8;1024*1024]).unwrap();values.clear();
+    assert!(verifier.verify_progress(&[material],&mut |p|values.push(p)).is_err());assert!(!values.contains(&100));
+}

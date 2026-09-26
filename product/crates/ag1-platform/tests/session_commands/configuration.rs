@@ -192,3 +192,52 @@ async fn wire_configuration_interrupts_approval_through_the_existing_tool_journa
     assert_eq!(f.host.configuration().unwrap().tools.len(), 1);
     assert_eq!(server.join().unwrap().len(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discovered_effort_is_durable_and_reaches_the_template_without_downgrading() {
+    let f = attach(
+        fixture("http://127.0.0.1:1", "disabled"),
+        Arc::new(Resolver::new(false)),
+    );
+    let mut original = f.host.configuration().unwrap();
+    original.model["reasoning"] = json!(true);
+    original.model["compat"] = json!({"thinkingFormat":"qwen-chat-template"});
+    let command = control(
+        &f.commands,
+        "native-effort",
+        w::Command::Model {
+            action: "thinking".into(),
+            args: json!({"level":"xhigh","native_profile":{"apply":"reasoning_effort","modes":["low","medium","high","xhigh"]}}),
+        },
+    );
+    accepted(f.commands.dispatch(command).await.result);
+    let scope = f.commands.snapshot().unwrap().scope;
+    let snapshot = f
+        .store
+        .journal_snapshot(&SessionId::new(scope.session.as_str()).unwrap())
+        .unwrap();
+    let restored = SessionRuntime::resume(
+        SessionId::new(scope.session.as_str()).unwrap(),
+        1,
+        &snapshot,
+        original,
+    )
+    .unwrap();
+    assert_eq!(restored.configuration().thinking, "xhigh");
+    let model = &restored.configuration().model;
+    assert_eq!(model["thinking"]["apply"], "reasoning_effort");
+    let options = ag1_platform::provider::requests::session_options(model, "xhigh", None).unwrap();
+    assert_eq!(options["reasoningEffort"], "xhigh");
+    let payload = ag1_platform::provider::requests::build_payload(
+        &ag1_platform::provider::requests::RequestContext {
+            model,
+            context: &json!({"systemPrompt":"Fixture","messages":[]}),
+            options: &options,
+            anthropic_oauth: false,
+            google_project: None,
+            request_id: "fixture",
+        },
+    )
+    .unwrap();
+    assert_eq!(payload["chat_template_kwargs"]["reasoning_effort"], "xhigh");
+}

@@ -1,5 +1,8 @@
 //! Explicit platform capabilities. Linux is implemented; other OS capabilities remain unavailable.
 pub mod diagnostics;
+pub mod mcp;
+#[cfg(target_os = "linux")]
+pub mod github;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod git;
@@ -13,6 +16,9 @@ pub mod session;
 pub mod web_http;
 #[cfg(target_os = "linux")]
 pub mod workspace;
+#[cfg(target_os = "linux")]
+pub mod change_receipts;
+pub mod change_undo;
 #[cfg(target_os = "linux")]
 pub mod workspace_lifecycle;
 
@@ -38,6 +44,8 @@ pub mod retrieval;
 
 #[cfg(target_os = "linux")]
 pub mod file_tools;
+#[cfg(target_os = "linux")]
+pub mod folder_access;
 pub mod image_tools;
 
 #[cfg(target_os = "linux")]

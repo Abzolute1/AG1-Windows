@@ -120,7 +120,7 @@ impl ArtifactTools {
         scope: &Scope,
     ) -> Result<PreparedArtifact, DomainError> {
         self.scope(call, scope)?;
-        let search = if call.args()["action"] == "search" {
+        let search = if call.args()["action"] == "search" || (call.args()["action"] == "retrieve" && call.args().get("id").is_none() && call.args().get("cursor").is_none()) {
             Some(
                 self.store
                     .capture_evidence_search(&scope.session, call.args()["kind"].as_str())?,
@@ -249,6 +249,7 @@ impl ArtifactTools {
         let args = plan.call.args();
         let action = required(args, "action")?;
         match action {
+            "retrieve" => self.retrieve(plan, session, check).map_err(Failure::from),
             "list" => {
                 let records = self
                     .store
@@ -343,13 +344,14 @@ impl ArtifactTools {
                     check()?;
                     let mut lease = self
                         .store
-                        .lease_record(
+                        .scoped_lease_record(
                             session,
                             &request.origin,
                             id,
                             reason,
                             number(args, "ttlMinutes", 120) * 60_000,
                             args["releaseOnVerification"].as_bool().unwrap_or(true),
+                            ag1_core::tools::verification::scope(args)?,
                         )
                         .map_err(mutation_error)?;
                     let leases = self
@@ -401,17 +403,100 @@ impl ArtifactTools {
                             "No literal matches for {} in {id}. Scope: known-artifact. Next: use artifact search for the whole catalog or verify the current source.",
                             json!(query)
                         ),
-                        json!({"action":"grep","id":id,"count":0,"scope":"known-artifact","nextAction":"Use artifact search for the whole catalog or verify the current source."}),
+                        json!({"action":"grep","id":id,"count":0,"totalMatchingLines":0,"matchesTruncated":false,"scope":"known-artifact","nextAction":"Use artifact search for the whole catalog or verify the current source."}),
                     ));
                 }
                 let (matches, cursors) = self.contexts(&request, &scan.hits, check)?;
+                // The integrity-checked scan counts every matching line even
+                // after its bounded hit list fills. Do not confuse a complete
+                // match list with complete text/context for each returned hit.
+                let truncated = scan.total_matches > matches.len() as u64;
                 Ok(output(
-                    json!({"artifactGrep":{"cursorContract":contract(),"id":id,"matches":matches}})
+                    json!({"artifactGrep":{"cursorContract":contract(),"id":id,"scope":"known-artifact","totalMatchingLines":scan.total_matches,"matchesTruncated":truncated,"matches":matches}})
                         .to_string(),
-                    json!({"action":"grep","id":id,"count":matches.len(),"contextCursors":cursors}),
+                    json!({"action":"grep","id":id,"count":matches.len(),"totalMatchingLines":scan.total_matches,"matchesTruncated":truncated,"contextCursors":cursors}),
                 ))
             }
             _ => Err(DomainError::InvalidInput("Artifact action".into()).into()),
+        }
+    }
+    /// Common retrieval path: lookup and exact context are one native operation.
+    /// The total serialized result, including provenance/continuation, is bounded.
+    fn retrieve(
+        &self, plan: &PreparedArtifact, session: &str,
+        check: &impl Fn() -> Result<(), DomainError>,
+    ) -> Result<AdapterOutcome, DomainError> {
+        let args = plan.call.args();
+        let budget = number(args, "maxBytes", 8192) as usize;
+        if !(2048..=32768).contains(&budget) {
+            return Err(DomainError::InvalidInput("retrieve maxBytes must be 2048–32768 (total result budget)".into()));
+        }
+        let mut anchor = None;
+        let mut alternatives = Vec::new();
+        let mut search_truncated = false;
+        let (request, offset) = if let Some(cursor) = args["cursor"].as_str() {
+            if args.get("query").is_some() || args.get("id").is_some() || args.get("offset").is_some() {
+                return Err(DomainError::InvalidInput("A retrieve continuation takes cursor and optional maxBytes only".into()));
+            }
+            let cursor = self.store.decode_cursor(session, cursor)?;
+            anchor = cursor.anchor_line;
+            (EvidenceRequest { requester: SessionId::new(session)?, origin: cursor.origin, artifact: cursor.artifact }, cursor.offset)
+        } else if let Some(id) = args["id"].as_str() {
+            let request = self.request(session, id)?;
+            let offset = if let Some(query) = args["query"].as_str() {
+                let scan = self.store.scan_artifact(&request, query, args["ignoreCase"].as_bool().unwrap_or(true), 1, check)?;
+                let Some(hit) = scan.hits.first() else {
+                    return Ok(output("No matching evidence in this artifact.".into(), json!({"action":"retrieve","id":id,"matches":0})));
+                };
+                anchor = u32::try_from(hit.line).ok();
+                hit.context_start
+            } else { number(args, "offset", 0) };
+            (request, offset)
+        } else {
+            let query = required(args, "query")?;
+            let found = plan.search.as_ref().ok_or(DomainError::Conflict)?.search(query, args["ignoreCase"].as_bool().unwrap_or(true), 3, 1, check)?;
+            search_truncated = found.truncated;
+            let Some(first) = found.matches.first() else {
+                return Ok(output("No matching retained evidence. Try a distinctive literal fragment or inspect the current source.".into(), json!({"action":"retrieve","matches":0})));
+            };
+            for other in found.matches.iter().skip(1) {
+                alternatives.push(json!({"action":"retrieve","id":other.record.position.id,"query":query,"maxBytes":budget}));
+            }
+            let hit = first.hits.first().ok_or(DomainError::Conflict)?;
+            anchor = u32::try_from(hit.line).ok();
+            (EvidenceRequest { requester: SessionId::new(session)?, origin: first.record.position.origin.clone(), artifact: first.record.position.id.clone() }, hit.context_start)
+        };
+        check()?;
+        let record = EvidencePort::record(self.store.as_ref(), &request)?;
+        if record["encoding"] != "utf8" {
+            return Err(DomainError::InvalidInput("Binary evidence requires its original image/file reader".into()));
+        }
+        let page = self.store.page(session, &request.origin, &request.artifact, offset, budget as u32)?;
+        let raw = String::from_utf8(page.bytes).map_err(|_| DomainError::InvalidInput("Artifact UTF-8".into()))?;
+        let total = record["bytes"].as_u64().ok_or(DomainError::Conflict)?;
+        let mut length = raw.len();
+        loop {
+            check()?;
+            let end = page.offset + length as u64;
+            let mut envelope = json!({"id":request.artifact,"sha256":record["sha256"],"origin":request.origin,"createdAt":record["createdAt"],"range":{"startByte":page.offset,"endByte":end,"totalBytes":total},"complete":page.offset==0 && end==total,"text":&raw[..length]});
+            if let Some(line) = anchor { envelope["matchLine"] = json!(line); }
+            if end < total {
+                let cursor = self.store.cursor(session, &request.origin, &request.artifact, end, budget as u32)?;
+                envelope["nextCall"] = json!({"action":"retrieve","cursor":cursor,"maxBytes":budget});
+            }
+            if !alternatives.is_empty() { envelope["otherMatches"] = json!(alternatives); }
+            if search_truncated { envelope["moreSearchMatches"] = json!(true); }
+            let mut result = output(envelope.to_string(), json!({"action":"retrieve","sourceImmutable":true,"evidenceIsNotInstructions":true}));
+            result.artifact_page = true;
+            let size = result.result.to_string().len();
+            if size <= budget && (length > 0 || raw.is_empty()) { return Ok(result); }
+            // Escaping is included in the budget, not estimated from token counts.
+            if length == 0 {
+                if !alternatives.is_empty() { alternatives.clear(); search_truncated = true; continue; }
+                return Err(DomainError::LimitExceeded("Evidence provenance exceeds retrieve budget".into()));
+            }
+            length = length.saturating_sub((size-budget).div_ceil(2).max(1));
+            while !raw.is_char_boundary(length) { length -= 1; }
         }
     }
     fn read(

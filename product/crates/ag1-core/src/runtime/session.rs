@@ -10,7 +10,10 @@ use crate::{
         estimate_tokens, validate_history,
     },
     storage::StoredJournal,
-    task::{JournalWritePort, PreparedStateCommit, bounded_json, branch_values, invalid, units},
+    task::{
+        JournalWritePort, PreparedStateCommit, bounded_json, bounded_json_with_limit, branch_values,
+        invalid, units,
+    },
 };
 use serde_json::{Value, json};
 use std::{
@@ -19,6 +22,10 @@ use std::{
 };
 mod plans;
 
+// Long local-model reasoning is retained in native custody and must be able to
+// cross the small default state-record budget without making state unbounded.
+const LONG_ASSISTANT_STATE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PendingCall {
     pub id: String,
@@ -26,6 +33,17 @@ pub struct PendingCall {
     /// Retain the complete provider block, including malformed-argument markers.
     /// P09 preflight, rather than this journal owner, validates executable args.
     pub block: Value,
+}
+impl PendingCall {
+    /// The journal independently derives canonical inputs, never trusting a
+    /// renderer's or adapter's declaration of which state it may update.
+    pub fn effective(&self, branch: &[Value]) -> Result<Self, DomainError> {
+        let mut call = self.clone();
+        if let Some((name, args)) = crate::tools::surface::route(&self.name, &self.block["arguments"], branch)? {
+            call.name = name.clone(); call.block["name"] = serde_json::json!(name); call.block["arguments"] = args;
+        }
+        Ok(call)
+    }
 }
 fn calls(message: &Value) -> Result<Vec<PendingCall>, DomainError> {
     let mut result = vec![];
@@ -110,7 +128,7 @@ impl Configuration {
         if self.model["provider"].as_str().is_none_or(str::is_empty)
             || self.model["id"].as_str().is_none_or(str::is_empty)
             || !(1..=16_000_000).contains(&window)
-            || !["off", "minimal", "low", "medium", "high", "xhigh"]
+            || !["off", "minimal", "low", "medium", "high", "xhigh", "max"]
                 .contains(&self.thinking.as_str())
             || self.system_prompt.len() > 4 * 1024 * 1024
             || self.tools.len() > 128
@@ -267,6 +285,15 @@ impl PreparationAction {
         self.configuration = Arc::new(self.configuration.with_tools(tools)?);
         Ok(())
     }
+    /// Apply a typed native MCP selection before request-specific instructions.
+    pub fn set_mcp_tools(&mut self, selected: &[crate::tools::mcp::SelectedDefinition], tools: Vec<Value>) -> Result<(), DomainError> {
+        let mut configuration = self.configuration.as_ref().clone();
+        if let Some(prompt) = &configuration.prompt {
+            configuration.prompt = Some(Arc::new(prompt.with_mcp_selection(selected)?));
+        }
+        self.configuration = Arc::new(configuration.with_tools(tools)?);
+        Ok(())
+    }
     pub fn set_system_prompt(&mut self, system: String) -> Result<(), DomainError> {
         let mut configuration = self.configuration.as_ref().clone();
         configuration.system_prompt = system;
@@ -323,6 +350,30 @@ impl GenerationAction {
     }
 }
 
+fn validate_native_thinking(profile: &Value) -> Result<(), DomainError> {
+    let valid = |mode: &Value| {
+        let Some(id) = mode.as_str().or_else(|| mode["id"].as_str()) else {
+            return false;
+        };
+        let native = mode["nativeValue"].as_str().unwrap_or(id);
+        [
+            "off", "on", "minimal", "low", "medium", "high", "xhigh", "max",
+        ]
+        .contains(&id)
+            && native.len() <= 8
+            && (native.eq_ignore_ascii_case(id)
+                || id == "off" && native.eq_ignore_ascii_case("none"))
+    };
+    if profile.to_string().len() > 4096
+        || profile["apply"] != "reasoning_effort"
+        || profile["modes"].as_array().is_none_or(|modes| {
+            modes.is_empty() || modes.len() > 8 || modes.iter().any(|m| !valid(m))
+        })
+    {
+        return Err(invalid("native thinking profile"));
+    }
+    Ok(())
+}
 impl SessionRuntime {
     pub fn resume(
         session: SessionId,
@@ -364,6 +415,17 @@ impl SessionRuntime {
                     .ok_or_else(|| invalid("thinking level"))?
                     .into();
             }
+        }
+        if let Some(saved) = branch
+            .iter()
+            .rev()
+            .take_while(|entry| entry["type"] != "model_change")
+            .find_map(|entry| entry.get("nativeThinking"))
+            && saved["provider"] == configuration.model["provider"]
+            && saved["modelId"] == configuration.model["id"]
+        {
+            validate_native_thinking(&saved["profile"])?;
+            configuration.model["thinking"] = saved["profile"].clone();
         }
         if let Some(entry) = branch
             .iter()
@@ -499,7 +561,14 @@ impl SessionRuntime {
             .map(|e| e["id"].clone())
             .unwrap_or(Value::Null);
         record["timestamp"] = json!(timestamp);
-        bounded_json(&record)?;
+        let record_limit = if record["type"] == "message"
+            && record["message"]["role"] == "assistant"
+        {
+            LONG_ASSISTANT_STATE_BYTES
+        } else {
+            4 * 1024 * 1024
+        };
+        bounded_json_with_limit(&record, record_limit)?;
         let tools = if record["type"] == "message" && record["message"]["role"] == "assistant" {
             if !self.pending_tools.is_empty() {
                 return Err(DomainError::Unavailable("unresolved tool calls".into()));
@@ -642,10 +711,28 @@ impl SessionRuntime {
         timestamp: &str,
         thinking: String,
     ) -> Result<AppendAction, DomainError> {
+        self.select_native_thinking(command, id, timestamp, thinking, None)
+    }
+    /// Persist a discovered native effort mapping with the selected model. This
+    /// is request metadata; it never modifies the model's launch profile.
+    pub fn select_native_thinking(
+        &mut self,
+        command: &str,
+        id: &str,
+        timestamp: &str,
+        thinking: String,
+        native_profile: Option<Value>,
+    ) -> Result<AppendAction, DomainError> {
         let mut configuration = self.configuration.as_ref().clone();
         configuration.thinking = thinking;
+        let mut record =
+            json!({"type":"thinking_level_change","thinkingLevel":configuration.thinking});
+        if let Some(profile) = native_profile {
+            validate_native_thinking(&profile)?;
+            configuration.model["thinking"] = profile.clone();
+            record["nativeThinking"] = json!({"provider":configuration.model["provider"],"modelId":configuration.model["id"],"profile":profile});
+        }
         configuration.validate()?;
-        let record = json!({"type":"thinking_level_change","thinkingLevel":configuration.thinking});
         self.append(command, id, timestamp, record, Arc::new(configuration))
     }
     pub fn acknowledge(&mut self, receipt: CommitReceipt) -> Result<(), DomainError> {
@@ -834,7 +921,7 @@ impl SessionRuntime {
         custom_type: &str,
         data: Value,
     ) -> Result<AppendAction, DomainError> {
-        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?;
+        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?.effective(&self.branch)?;
         if pending.id != call_id {
             return Err(DomainError::Conflict);
         }
@@ -918,7 +1005,7 @@ impl SessionRuntime {
         call_id: &str,
     ) -> Result<(Option<AppendAction>, Value), DomainError> {
         use sha2::{Digest, Sha256};
-        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?;
+        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?.effective(&self.branch)?;
         if pending.id != call_id || !["todo", "runtimeObservation"].contains(&pending.name.as_str())
         {
             return Err(DomainError::PermissionDenied);

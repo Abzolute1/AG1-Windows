@@ -42,6 +42,7 @@ pub struct RuntimeBundle<H: RuntimeHost> {
     origin: String,
     pool: Arc<BlockingPool>,
     load_timeout: Duration,
+    progress: Arc<Mutex<Option<serde_json::Value>>>,
 }
 struct CancelOnDrop(Arc<AtomicBool>);
 impl Drop for CancelOnDrop {
@@ -89,6 +90,7 @@ where
             origin,
             pool: Arc::new(BlockingPool::new(1, 32)?),
             load_timeout,
+            progress: Arc::new(Mutex::new(None)),
         })
     }
     pub fn origin(&self) -> &str {
@@ -125,6 +127,7 @@ where
     async fn stop_current(&self, close: bool) -> Result<()> {
         let state = self.state.clone();
         let plans = self.plans.clone();
+        let progress = self.progress.clone();
         self.pool
             .submit(move || {
                 let mut s = state.lock().map_err(|_| DomainError::DurabilityUnknown)?;
@@ -144,6 +147,9 @@ where
                         s.events.remove(0);
                     }
                 }
+                if let Ok(mut value) = progress.lock() {
+                    *value = None;
+                }
                 Ok(())
             })
             .await
@@ -155,6 +161,7 @@ where
         let state = self.state.clone();
         let plans = self.plans.clone();
         let timeout = self.load_timeout;
+        let progress = self.progress.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel = CancelOnDrop(cancelled.clone());
         self.pool
@@ -164,6 +171,12 @@ where
                     return Err(DomainError::PermissionDenied);
                 }
                 let plan = &plans[&model];
+                let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let phase = |name: &str| {
+                    if let Ok(mut value) = progress.lock() {
+                        *value = Some(serde_json::json!({"model":model,"phase":name,"started_at":started_at}));
+                    }
+                };
                 let started = Instant::now();
                 let result = (|| {
                     if cancelled.load(Ordering::Acquire) {
@@ -171,7 +184,14 @@ where
                     }
                     // Rehash/material identity checks run for every admission, even
                     // when an already owned model reports healthy on the endpoint.
-                    s.controller.host_mut().verify_materials(&plan.materials)?;
+                    phase("verifying");
+                    s.controller
+                        .host_mut()
+                        .verify_progress(&plan.runtime_materials()?, &mut |percent| {
+                            if let Ok(mut value) = progress.lock() {
+                                *value = Some(serde_json::json!({"model":model,"phase":"verifying","percent":percent,"started_at":started_at}));
+                            }
+                        })?;
                     if let Some(previous) = s.active.clone()
                         && s.controller.reap_exited_owned_runtime()?
                     {
@@ -185,6 +205,7 @@ where
                     }
                     if s.active.as_deref() != Some(&model) {
                         if let Some(previous) = s.active.clone() {
+                            phase("releasing");
                             s.controller.stop_owned_runtime()?;
                             s.events.push(Event {
                                 model: previous.clone(),
@@ -197,6 +218,7 @@ where
                         if cancelled.load(Ordering::Acquire) {
                             return Err(DomainError::Cancelled);
                         }
+                        phase("loading");
                         s.controller.start_owned_runtime(plan)?;
                         s.active = Some(model.clone());
                         s.events.push(Event {
@@ -216,6 +238,7 @@ where
                         if s.controller.poll_ready(plan)? {
                             break;
                         }
+                        if let Some(name) = s.controller.loading_phase() { phase(name); }
                         std::thread::sleep(Duration::from_millis(25));
                     }
                     s.events.push(Event {
@@ -224,9 +247,15 @@ where
                         action: "owned_ready".into(),
                         elapsed_ms: started.elapsed().as_millis() as u64,
                     });
+                    phase("ready");
                     Ok(())
                 })();
-                if result.is_err() {
+                if let Err(error) = &result {
+                    phase("failed");
+                    if let Ok(mut value) = progress.lock()
+                        && let Some(value) = value.as_mut() {
+                        value["error"] = serde_json::json!(format!("{error:?}"));
+                    }
                     // Only the controller's authenticated handle can be stopped.
                     s.controller.stop_owned_runtime()?;
                     if let Some(model) = s.active.take() {
@@ -251,6 +280,26 @@ impl<H: RuntimeHost + Send + 'static> GenerationRuntime for RuntimeBundle<H>
 where
     H::Handle: Send,
 {
+    fn progress(&self) -> Option<serde_json::Value> {
+        // Never wait behind weight verification/loading on a UI polling thread.
+        if let Ok(mut state) = self.state.try_lock()
+            && state.active.is_some() && !state.controller.owned_alive().unwrap_or(false)
+            && let Ok(mut value) = self.progress.lock() {
+            *value = None;
+        }
+        self.progress.lock().ok().and_then(|value| value.clone())
+    }
+    fn load_model<'a>(&'a self, model: &'a str) -> PortFuture<'a, ()> {
+        Box::pin(self.ensure(model.to_owned()))
+    }
+    fn cancel_generation<'a>(&'a self, url: &'a str) -> PortFuture<'a, ()> {
+        Box::pin(async move {
+            if endpoint_origin(url)? != self.origin {
+                return Err(DomainError::PermissionDenied);
+            }
+            self.unload_owned().await
+        })
+    }
     fn shutdown(&self) -> PortFuture<'_, ()> {
         Box::pin(self.stop())
     }

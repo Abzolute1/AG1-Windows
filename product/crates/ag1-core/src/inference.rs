@@ -1,4 +1,5 @@
-//! Endpoint admission. A dropped or aborted transport is not evidence of completion.
+//! Endpoint admission. A dropped transport is not evidence of provider completion.
+//! Remote slots bound client requests; local slots also protect owned model processes.
 //! The composition host shares one Scheduler between root and isolated calls.
 use crate::{DomainError, OperationId};
 use std::collections::{BTreeMap, VecDeque};
@@ -91,6 +92,13 @@ impl Pool {
     }
 }
 impl Scheduler {
+    pub fn capacity(&self, endpoint: &str) -> Result<usize, DomainError> {
+        let inner = self.inner.lock().map_err(|_| DomainError::Conflict)?;
+        Ok(match inner.pools.get(endpoint).ok_or(DomainError::NotFound)?.kind {
+            EndpointKind::Local => 1,
+            EndpointKind::Remote => 3,
+        })
+    }
     /// Endpoint identity is resolved by the host, independently of model/provider aliases.
     /// Registration is bounded and cannot reconfigure an occupied pool.
     pub fn register(&self, endpoint: &str, kind: EndpointKind) -> Result<(), DomainError> {
@@ -208,6 +216,15 @@ impl Scheduler {
         }
         Ok(())
     }
+    // Called only when the owning generation future has dropped its transport.
+    // Releasing remote client capacity does not claim upstream completion, and
+    // must not release local runtime custody without positive stop evidence.
+    fn abandoned(&self, ticket: &Ticket) -> Result<(), DomainError> {
+        self.check_owner(ticket)?;
+        let remote = self.inner.lock().map_err(|_| DomainError::Conflict)?
+            .pools.get(&ticket.endpoint).ok_or(DomainError::NotFound)?.kind == EndpointKind::Remote;
+        if remote { self.finish(ticket) } else { self.cancel(ticket) }
+    }
     fn finish(&self, ticket: &Ticket) -> Result<(), DomainError> {
         self.check_owner(ticket)?;
         let mut inner = self
@@ -287,8 +304,8 @@ impl Scheduler {
             .any(|entry| entry.generation == ticket.generation))
     }
 }
-/// A host-held capability, deliberately not Clone/Serialize. Drop quarantines instead of
-/// releasing a possibly still-running generation. Terminal acknowledgement consumes it.
+/// A host-held capability, deliberately not Clone/Serialize. Drop quarantines local
+/// runtimes but releases abandoned remote client capacity. Neither means success.
 pub struct GenerationPermit {
     scheduler: Scheduler,
     ticket: Ticket,
@@ -304,7 +321,7 @@ impl GenerationPermit {
 impl Drop for GenerationPermit {
     fn drop(&mut self) {
         if !self.settled {
-            let _ = self.scheduler.cancel(&self.ticket);
+            let _ = self.scheduler.abandoned(&self.ticket);
         }
     }
 }

@@ -193,10 +193,20 @@ async fn generation_with_admission(
             .min()
     };
     let redactor = ErrorRedactor::new(&generation.request);
-    let mut response = http
+    let request_url = generation.request.url.clone();
+    let response_result = http
         .send_until(generation.request, deadline(&reducer), cancel)
-        .await
-        .map_err(|e| failure(e, Some(&reducer)))?;
+        .await;
+    let mut response = match response_result {
+        Ok(response) => response,
+        Err(error) => {
+            if error == DomainError::Cancelled && http.cancel_generation(&request_url).await.is_ok()
+            {
+                permit.terminal().map_err(|e| failure(e, Some(&reducer)))?;
+            }
+            return Err(failure(error, Some(&reducer)));
+        }
+    };
     if !(200..300).contains(&response.status()) {
         let status = response.status();
         let mut body = vec![];
@@ -235,10 +245,14 @@ async fn generation_with_admission(
         }
         Frames::Aws(AwsEventDecoder::new(2 * 1024 * 1024).map_err(|e| failure(e, Some(&reducer)))?)
     } else {
-        if response
-            .content_type()
-            .is_none_or(|v| !v.starts_with("text/event-stream"))
-        {
+        // The subscription endpoint can omit Content-Type while sending valid
+        // SSE. Keep explicit wrong types rejected and still require the normal
+        // bounded Responses decoder, terminal event and transport EOF.
+        let valid_sse = match response.content_type() {
+            Some(value) => value.starts_with("text/event-stream"),
+            None => generation.family == ApiFamily::CodexResponses,
+        };
+        if !valid_sse {
             return Err(failure(
                 DomainError::InvalidInput("provider SSE content type".into()),
                 Some(&reducer),
@@ -246,11 +260,20 @@ async fn generation_with_admission(
         }
         Frames::Sse(SseDecoder::new(2 * 1024 * 1024).map_err(|e| failure(e, Some(&reducer)))?)
     };
-    while let Some(bytes) = response
-        .chunk_until(deadline(&reducer), cancel)
-        .await
-        .map_err(|e| failure(e, Some(&reducer)))?
-    {
+    loop {
+        let bytes = match response.chunk_until(deadline(&reducer), cancel).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => break,
+            Err(error) => {
+                drop(response);
+                if error == DomainError::Cancelled
+                    && http.cancel_generation(&request_url).await.is_ok()
+                {
+                    permit.terminal().map_err(|e| failure(e, Some(&reducer)))?;
+                }
+                return Err(failure(error, Some(&reducer)));
+            }
+        };
         for chunk in bytes.chunks(65536) {
             let mut events = vec![];
             match &mut frames {

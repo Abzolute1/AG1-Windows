@@ -6,9 +6,10 @@ use crate::{
 impl Host {
     pub(super) fn resources(&self) -> Result<crate::resources::Snapshot> {
         load(
-            &self.workspace,
+            &self.working_workspace()?,
             &self.state,
             &self.config.system_prompt,
+            self.config.prompt_append.as_deref(),
             self.config.packages.as_ref(),
         )
     }
@@ -17,21 +18,13 @@ impl Host {
             Ok(command) => Ok(command),
             Err(DomainError::Unavailable(_)) => {
                 let resources = self.resources()?;
-                if let Some(name) = text.strip_prefix("/skill:") {
-                    let (name, args) = name.split_once(' ').unwrap_or((name, ""));
-                    let skill = resources
-                        .catalog
-                        .skills
-                        .iter()
-                        .find(|s| s.name == name)
-                        .ok_or(DomainError::NotFound)?;
+                if text.starts_with("/skill:") {
+                    let prompt = crate::session::NativeSession::client_prompt(
+                        self.working_workspace()?.as_ref(), &timestamp(), &resources,
+                        ag1_core::tools::registry::Registry::builtins()?,
+                    )?;
                     return Ok(w::Command::Prompt {
-                        input: w::PromptInput::Inline {
-                            text: format!(
-                                "Use the skill at {} for this instruction:\n{}",
-                                skill.file_path, args
-                            ),
-                        },
+                        input: w::PromptInput::Inline { text: prompt.expand_skill(text)? },
                     });
                 }
                 let (name, arguments) = text
@@ -75,6 +68,7 @@ pub(super) fn load(
     workspace: &Arc<Workspace>,
     state: &Path,
     system: &str,
+    append: Option<&str>,
     packages: Option<&resource_actions::Packages>,
 ) -> Result<crate::resources::Snapshot> {
     let home = state.join("home");
@@ -143,12 +137,25 @@ pub(super) fn load(
             additional: Paths::default(),
             disabled: vec![],
             installed,
-            system: Some(system.to_owned()),
+            system: (!system.is_empty()).then(|| system.to_owned()),
             append_system: None,
         },
     )?;
-    loader.build(&ScanControl {
+    let mut snapshot = loader.build(&ScanControl {
         cancel: &AtomicBool::new(false),
         deadline: std::time::Instant::now() + Duration::from_secs(10),
-    })
+    })?;
+    // Host conversation context augments discovered APPEND_SYSTEM.md files;
+    // passing it as the loader override would silently hide those instructions.
+    if let Some(append) = append.filter(|s| !s.is_empty()) {
+        if append.len() > 1024 * 1024 {
+            return Err(DomainError::LimitExceeded("host prompt appendix".into()));
+        }
+        snapshot.fingerprint = ag1_storage::digest(
+            &serde_json::to_vec(&("host-prompt-append-v1", &snapshot.fingerprint, append))
+                .map_err(json_error)?,
+        );
+        snapshot.append_system.push(append.to_owned());
+    }
+    Ok(snapshot)
 }

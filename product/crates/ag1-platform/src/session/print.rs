@@ -198,7 +198,10 @@ async fn assess(
                     .iter()
                     .filter_map(|entry| entry.get("message").cloned())
                     .collect();
-                completion::assess(&messages, &[], &[], VerificationAuthority::MessageHistory)
+                // Native receipts below are the verification authority, including
+                // exact host-selected commands outside the conventional test names.
+                // History still supplies mutation and continuation assessment.
+                completion::assess(&messages, &[], &[], VerificationAuthority::TypedLedger)
             })
             .await?;
         let (current, _) = settled_snapshot(host, cancelled).await?;
@@ -362,8 +365,21 @@ pub(super) async fn run_selected(
         {
             let evidence = lease.completion.lock().map_err(|_| DomainError::Conflict)?;
             mutation |= evidence.mutation_seen;
+            let (passed, failed, empty) = evidence.counts();
+            gate.passing_verification_count = passed;
+            gate.failing_verification_count = failed;
+            gate.no_tests_collected_count = empty;
             if mutation && !evidence.verified() {
-                if gate.passed {
+                if passed == 0 {
+                    gate.reasons.push("no successful test command was recorded after the latest mutation".into());
+                }
+                if failed > 0 {
+                    gate.reasons.push(format!("{failed} test command(s) still fail after the latest mutation"));
+                }
+                if empty > 0 {
+                    gate.reasons.push(format!("{empty} command(s) collected no tests after the latest mutation"));
+                }
+                if gate.reasons.is_empty() {
                     gate.reasons.push("no successful native verifier receipt remains after the latest mutation or uncertain effect".into());
                 }
                 gate.passed = false;

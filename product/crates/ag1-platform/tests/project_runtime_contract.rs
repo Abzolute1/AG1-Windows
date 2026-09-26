@@ -784,7 +784,10 @@ fn real_tauri_webkit_render_interaction_and_native_crash() {
             &long_control(&c),
         )
         .unwrap();
-    let executable = repo().join("product/target/debug/examples/project-native-fixture");
+    let executable = std::env::current_exe()
+        .unwrap()
+        .parent().unwrap().parent().unwrap()
+        .join("examples/project-native-fixture");
     assert!(
         executable.is_file(),
         "Build project-native-fixture with --features visual-test first"
@@ -1147,4 +1150,45 @@ fn structured_and_text_diagnostics_do_not_misclassify_cargo_artifacts() {
     assert_eq!(values[0].column, Some(3));
     assert_eq!(values[0].code.as_deref(), Some("TS2322"));
     assert_eq!(values[1].line, Some(4));
+}
+
+#[test]
+fn model_preview_lifecycle_binds_source_and_operation_and_returns_only_owned_ready_urls() {
+    use serde_json::json;
+    let mut f = Fixture::new();
+    let cancel = AtomicBool::new(false);
+    let ctl = long_control(&cancel);
+    let status = f.runtime.prepare_model_preview(&json!({"action":"status"}), &ctl).unwrap();
+    assert_eq!(f.runtime.execute_model_preview(status, &ctl).unwrap().result["details"]["preview"]["ready"], false);
+    assert!(f.runtime.prepare_model_preview(&json!({"action":"start"}), &ctl).is_err());
+    let other = f.run("sleep 1");
+    assert!(f.runtime.prepare_model_preview(&json!({"action":"stop","operation":other}), &ctl).is_err(), "preview cannot stop a different kind of owned target");
+    f.runtime.stop().unwrap();
+    fixture_files(&f.runtime, "web", &["package.json", "package-lock.json", "index.html", "main.js"]);
+    node_tools(&mut f.runtime);
+    f.runtime.discover().unwrap();
+    let target = f.runtime.project.targets.iter().find(|t| t.kind == Kind::Web).unwrap().id.clone();
+    f.runtime.start(&target, "install", Launch { commands: f.runtime.command(Kind::Web,"install").unwrap(), readiness:None,timeout_ms:120000 }, &ctl).unwrap();
+    assert_eq!(f.runtime.finish(&ctl).unwrap().lifecycle, Lifecycle::Exited);
+    let stale = f.runtime.prepare_model_preview(&json!({"action":"start"}), &ctl).unwrap();
+    f.runtime.workspace.create_checked("new-source.txt", b"changed", false, || Ok(())).unwrap();
+    assert!(f.runtime.execute_model_preview(stale, &ctl).is_err());
+    let start = f.runtime.prepare_model_preview(&json!({"action":"start"}), &ctl).unwrap();
+    let started = f.runtime.execute_model_preview(start, &ctl).unwrap();
+    let operation = started.result["details"]["preview"]["operation"].as_str().unwrap().to_owned();
+    assert!(f.runtime.prepare_model_preview(&json!({"action":"stop","operation":"foreign"}), &ctl).is_err());
+    assert!(f.runtime.prepare_model_preview(&json!({"action":"start"}), &ctl).is_err());
+    let ready = loop {
+        let status = f.runtime.prepare_model_preview(&json!({"action":"status"}), &ctl).unwrap();
+        let result = f.runtime.execute_model_preview(status, &ctl).unwrap();
+        if result.result["details"]["preview"]["ready"] == true { break result; }
+        assert!(Instant::now() < ctl.deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let url = ready.result["details"]["preview"]["url"].as_str().unwrap();
+    assert!(f.runtime.preview_grant().unwrap().allows(&operation, url));
+    let stop = f.runtime.prepare_model_preview(&json!({"action":"stop","operation":operation}), &ctl).unwrap();
+    f.runtime.execute_model_preview(stop, &ctl).unwrap();
+    assert!(f.runtime.preview_grant().is_err());
+    assert!(f.runtime.prepare_model_preview(&json!({"action":"stop","operation":operation}), &ctl).is_err());
 }

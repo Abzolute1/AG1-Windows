@@ -5,7 +5,7 @@ from pathlib import Path
 from release_gate import artifact
 
 
-def reject_failed_reviews(output: Path, tasks):
+def reject_failed_reviews(output: Path, tasks, *, allow_semantic_continuation=False):
     for task in tasks:
         path = output / 'claim-reviews' / f'{task["index"]:06}.json'
         if path.is_symlink():
@@ -30,4 +30,13 @@ def reject_failed_reviews(output: Path, tasks):
             raise RuntimeError('Failed review does not bind the completed task: ' + str(path))
         artifact(task['records'])
         artifact(task['verification'])
+        # A user-directed investigation can retain a reviewed semantic failure
+        # and continue measuring endurance. Formal release runs stay fail-fast;
+        # unexpected effects or unresolved commands always stop either mode.
+        if (allow_semantic_continuation
+                and review.get('investigation_continuation') == 'semantic-only'
+                and review.get('unexpected_effects') == []
+                and review.get('unresolved_commands') == []
+                and review.get('forbidden_avoidance') is True):
+            continue
         raise RuntimeError('Quality review failed; no further duration activity: ' + str(path))

@@ -2,6 +2,118 @@
 //! Real native loop, SQL/context custody, HTTP codec and file effects. The only
 //! simulated component is the owned loopback model endpoint.
 include!("support/session_fixture.rs");
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_native_runner_dates_tool_artifacts_by_their_actual_turn() {
+    let (origin, server) = server(vec![
+        calls(vec![(
+            "first-clock-call",
+            "bash",
+            json!({"command":"printf first-turn-output"}),
+        )]),
+        stop(),
+        calls(vec![(
+            "second-clock-call",
+            "bash",
+            json!({"command":"printf second-turn-output"}),
+        )]),
+        stop(),
+    ]);
+    let fixture = fixture(&origin, "disabled");
+    let runner = native_adapters_configured(&fixture, &["bash"], None, None).await;
+    let first_time = "2026-09-13T12:00:00Z";
+    let second_time = "2026-09-13T13:00:00Z";
+    let mut first = input();
+    first.command = "first-clock-turn".into();
+    first.timestamp = first_time.into();
+    fixture
+        .host
+        .run(first, &Resolver::new(false), runner.clone(), &ignore)
+        .await
+        .unwrap();
+    let first_catalog = fixture
+        .store
+        .artifact_catalog("session", None, 128, Some("terminal-raw-output"))
+        .unwrap();
+    assert_eq!(first_catalog.len(), 1);
+    let original = first_catalog[0].record.clone();
+    let mut second = input();
+    second.command = "second-clock-turn".into();
+    second.timestamp = second_time.into();
+    fixture
+        .host
+        .run(second, &Resolver::new(false), runner, &ignore)
+        .await
+        .unwrap();
+    assert_eq!(server.join().unwrap().len(), 4);
+    let catalog = fixture
+        .store
+        .artifact_catalog("session", None, 128, Some("terminal-raw-output"))
+        .unwrap();
+    assert_eq!(catalog.len(), 2);
+    let older = catalog
+        .iter()
+        .find(|r| r.record["producer"]["callId"] == "first-clock-call")
+        .unwrap();
+    let newer = catalog
+        .iter()
+        .find(|r| r.record["producer"]["callId"] == "second-clock-call")
+        .unwrap();
+    assert_eq!(
+        older.record, original,
+        "later turns must not rewrite immutable metadata"
+    );
+    assert_eq!(older.record["createdAt"], first_time);
+    assert_eq!(newer.record["createdAt"], second_time);
+    assert_eq!(
+        catalog[0].record, newer.record,
+        "catalog remains newest first"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn composite_provider_call_ids_execute_and_reject_with_durable_results() {
+    let (origin, server) = server(vec![
+        calls(vec![
+            ("call_missing|fc_missing", "not_registered", json!({})),
+            ("call_read|fc_read", "read", json!({"path":"input.txt"})),
+        ]),
+        stop(),
+    ]);
+    let fixture = fixture(&origin, "disabled");
+    std::fs::write(fixture.root.join("input.txt"), "composite identity works").unwrap();
+    let result = fixture
+        .host
+        .run(
+            input(),
+            &Resolver::new(false),
+            fixture.files.clone(),
+            &|_: &SessionEvent| {},
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.generations, 2);
+    assert!(fixture.host.settled().unwrap());
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    let state = fixture
+        .store
+        .journal_snapshot(&SessionId::new("session").unwrap())
+        .unwrap();
+    let branch = ag1_core::task::branch_values(&state).unwrap();
+    let results: Vec<_> = branch
+        .iter()
+        .filter(|e| e["message"]["role"] == "toolResult")
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]["message"]["toolCallId"],
+        "call_missing|fc_missing"
+    );
+    assert_eq!(results[0]["message"]["isError"], true);
+    assert_eq!(results[1]["message"]["toolCallId"], "call_read|fc_read");
+    assert_eq!(results[1]["message"]["isError"], false);
+    assert!(results[1].to_string().contains("composite identity works"));
+}
 #[path = "session_commands/mod.rs"]
 mod commands;
 #[path = "session_completion_receipts/mod.rs"]
@@ -118,17 +230,44 @@ async fn native_turn_writes_reads_and_continues_with_durable_tool_history() {
             .count(),
         2
     );
-    let final_user = requests[2]["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|message| message["role"] == "user")
-        .unwrap()["content"]
-        .as_str()
-        .unwrap();
+    let final_messages = requests[2]["messages"].as_array().unwrap();
+    let final_context = final_messages.last().unwrap();
+    assert_eq!(final_context["role"], "tool");
+    assert_eq!(final_context["tool_call_id"], "read-two");
+    assert_eq!(
+        final_messages
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .count(),
+        1
+    );
+    let final_user = ag1_core::context::hygiene::content(final_context, "\n");
     assert!(final_user.contains("Inspection evidence indexes"));
     assert!(final_user.contains("result=tool-call:read-two"));
     assert!(final_user.contains("status=current"));
+    let original_user = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    for request in &requests {
+        let user = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap();
+        assert_eq!(
+            user, original_user,
+            "Changing inspection state must not rewrite earlier user input"
+        );
+    }
+    assert!(!branch.iter().any(|entry| {
+        entry
+            .to_string()
+            .contains(ag1_core::runtime::context::WORKING_STATE)
+    }));
     assert!(
         !requests[0]
             .to_string()
@@ -230,7 +369,8 @@ async fn listener_exception_cannot_break_transport_or_internal_journal_acknowled
         .await
         .unwrap();
     assert_eq!(result.journal_revision, 3);
-    assert_eq!(seen.load(Ordering::SeqCst), 3);
+    // Request-phase notifications also exercise the Recovery listener path.
+    assert_eq!(seen.load(Ordering::SeqCst), 7);
     assert!(fixture.host.settled().unwrap());
     server.join().unwrap();
     assert_eq!(fixture.scheduler.status(&origin).unwrap().quarantined, 0);
@@ -566,6 +706,12 @@ async fn retry_excludes_failed_attempt_from_next_request_but_keeps_its_durable_r
             .any(|entry| entry["message"]["stopReason"] == "error")
     );
     let events = events.lock().unwrap();
+    // Phase telemetry surrounds retry recovery; it is not a retry transition.
+    assert!(events.iter().any(|event| event["type"] == "request_phase"));
+    let events: Vec<_> = events
+        .iter()
+        .filter(|event| event["type"] != "request_phase")
+        .collect();
     assert_eq!(
         events
             .iter()
@@ -1336,7 +1482,7 @@ async fn task_objective_survives_new_and_repeated_instructions_without_persistin
             .iter()
             .filter(|m| m["role"] == "user")
             .collect::<Vec<_>>();
-        let latest = users.last().unwrap()["content"].as_str().unwrap();
+        let latest = ag1_core::context::hygiene::content(users.last().unwrap(), "\n");
         assert!(latest.contains(&format!("objective: {first}")));
         assert_eq!(
             latest
@@ -1968,12 +2114,16 @@ async fn loaded_resources_and_active_tool_routing_rebuild_during_request_prepara
         .unwrap()["content"]
         .as_str()
         .unwrap();
+    // The workspace was empty when the session was constructed. Resource
+    // refresh must not silently replace that historical observation.
+    assert!(!system.contains("Top-level workspace entries (snapshot at session start):"));
     assert!(system.contains("Reloaded project instructions."));
     assert!(!system.contains("Original project instructions."));
     assert!(system.contains("Host resource addendum."));
     assert!(system.contains("owned-skill"));
-    assert!(system.contains("- inspect files: read"));
-    assert!(!system.contains("- change files:"));
+    assert!(system.contains("Available tools: read\n"));
+    assert!(!system.contains("- edit:"));
+    assert!(!system.contains("- write:"));
     assert!(system.contains(fixture.root.to_str().unwrap()));
     assert_eq!(requests[0]["tools"].as_array().unwrap().len(), 1);
     let branch = ag1_core::task::branch_values(
@@ -2525,6 +2675,7 @@ async fn native_web_runner(
                 mode: "duckduckgo".into(),
                 brave: None,
                 endpoints: SearchEndpoints {
+                    web: None,
                     html: format!("{origin}/html"),
                     lite: format!("{origin}/lite"),
                     brave: format!("{origin}/brave"),
@@ -2581,6 +2732,19 @@ fn read_web_request(socket: &mut TcpStream) -> String {
         socket.read_exact(&mut byte).unwrap();
         bytes.push(byte[0]);
         if bytes.ends_with(b"\r\n\r\n") {
+            let headers = String::from_utf8(bytes.clone()).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(length <= 16384);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            bytes.extend_from_slice(&body);
             return String::from_utf8(bytes).unwrap();
         }
         assert!(bytes.len() < 16384);
@@ -2666,7 +2830,7 @@ async fn native_web_search_and_fetch_retain_evidence_and_use_current_context_pre
         .await
         .unwrap();
     let requests = web.join().unwrap();
-    assert!(requests[0].starts_with("GET /html?"));
+    assert!(requests[0].starts_with("POST /html "));
     assert!(requests[1].starts_with("GET /article "));
     let model_requests = model.join().unwrap();
     assert!(
@@ -2918,10 +3082,21 @@ async fn native_memory_actions_feed_the_next_request_and_report_actual_injected_
             .join("\n")
     };
     assert!(!system(0).contains("Preserve tuned native runtimes"));
-    assert!(system(1).contains("Preserve tuned native runtimes"));
-    assert!(system(3).contains("Preserve native model settings"));
-    assert!(!system(3).contains("Preserve tuned native runtimes"));
-    assert!(!system(5).contains("Preserve native model settings"));
+    for index in 1..requests.len() {
+        assert_eq!(system(index), system(0));
+    }
+    let tail = |index: usize| {
+        requests[index]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .to_string()
+    };
+    assert!(tail(1).contains("Preserve tuned native runtimes"));
+    assert!(tail(3).contains("Preserve native model settings"));
+    assert!(!tail(3).contains("Preserve tuned native runtimes"));
+    assert!(!tail(5).contains("Preserve native model settings"));
     let results = session_tool_results(&fixture);
     assert_eq!(results.len(), 7);
     assert!(results.iter().all(|result| result["isError"] != true));
@@ -3498,7 +3673,10 @@ async fn native_artifact_actions_recover_evidence_without_catalog_self_matches()
             .unwrap()
             .contains(&ag1_storage::digest(text.as_bytes()))
     );
-    let context = artifact_envelope(&results[4])["artifactGrep"]["matches"][0].clone();
+    let grep = artifact_envelope(&results[4])["artifactGrep"].clone();
+    assert_eq!(grep["totalMatchingLines"], 1);
+    assert_eq!(grep["matchesTruncated"], false);
+    let context = grep["matches"][0].clone();
     assert_eq!(context["matchedText"], "decisive evidence β 🦙");
     let cursor = context["readCall"]["cursor"].as_str().unwrap();
     let decoded = fixture.store.decode_cursor("session", cursor).unwrap();
@@ -3532,6 +3710,21 @@ async fn native_artifact_actions_recover_evidence_without_catalog_self_matches()
             .to_string()
             .contains("decisive evidence")
     );
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .is_some_and(|value| {
+                        value["artifactGrep"]["totalMatchingLines"] == 1
+                            && value["artifactGrep"]["matchesTruncated"] == false
+                    })
+            })
+    );
     assert!(fixture.host.settled().unwrap());
     let Fixture {
         _directory: directory,
@@ -3560,6 +3753,62 @@ async fn native_artifact_actions_recover_evidence_without_catalog_self_matches()
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_artifact_grep_reports_complete_line_counts_beyond_its_hit_limit() {
+    let fixture = fixture("http://127.0.0.1:1", "disabled");
+    // Two occurrences on the first line count as one matching line. The final
+    // match has no newline and must still count after the returned-hit cap.
+    let id = retained_artifact(&fixture, 1, "needle needle\nNEEDLE\nother\nneedle", "text");
+    let runner = native_artifact_runner(&fixture).await;
+    for (name, limit, count, truncated) in [
+        ("capped", 1, 1, true),
+        ("exact-limit", 3, 3, false),
+        ("below-limit", 4, 3, false),
+    ] {
+        let result = execute_artifact(
+            &fixture,
+            &runner,
+            name,
+            json!({"action":"grep","id":id,"query":"needle","limit":limit}),
+        );
+        assert!(result.execution_settled);
+        let result = &result.outcome.result;
+        assert_ne!(result["isError"], true);
+        let envelope = artifact_envelope(result)["artifactGrep"].clone();
+        assert_eq!(envelope["scope"], "known-artifact");
+        assert_eq!(envelope["totalMatchingLines"], 3);
+        assert_eq!(envelope["matchesTruncated"], truncated);
+        assert_eq!(envelope["matches"].as_array().unwrap().len(), count);
+        assert_eq!(result["details"]["count"], count);
+        assert_eq!(result["details"]["totalMatchingLines"], 3);
+        assert_eq!(result["details"]["matchesTruncated"], truncated);
+        let cursor = envelope["matches"][0]["readCall"]["cursor"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .decode_cursor("session", cursor)
+                .unwrap()
+                .anchor_line,
+            Some(1)
+        );
+    }
+    let missing = execute_artifact(
+        &fixture,
+        &runner,
+        "missing",
+        json!({"action":"grep","id":id,"query":"absent","limit":1}),
+    );
+    assert_eq!(missing.outcome.result["details"]["totalMatchingLines"], 0);
+    assert_eq!(missing.outcome.result["details"]["matchesTruncated"], false);
+    assert!(
+        missing.outcome.result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("No literal matches")
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_artifact_cursor_pages_are_exact_and_incomplete_context_stays_navigable() {
     let fixture = fixture("http://127.0.0.1:1", "disabled");
     let text = format!("{}needle\nlast\n", "x".repeat(40000));
@@ -3572,7 +3821,10 @@ async fn native_artifact_cursor_pages_are_exact_and_incomplete_context_stays_nav
         json!({"action":"grep","id":id,"query":"needle"}),
     );
     assert!(search.execution_settled);
-    let context = artifact_envelope(&search.outcome.result)["artifactGrep"]["matches"][0].clone();
+    let grep = artifact_envelope(&search.outcome.result)["artifactGrep"].clone();
+    assert_eq!(grep["totalMatchingLines"], 1);
+    assert_eq!(grep["matchesTruncated"], false);
+    let context = grep["matches"][0].clone();
     assert_eq!(context["readCallPurpose"], "boundedContextPage");
     assert_eq!(context["contextComplete"], false);
     assert_eq!(context["matchedTextTruncated"], true);
@@ -3947,6 +4199,26 @@ async fn native_artifact_tool_presentation_matches_thirteen_unchanged_sdk_action
                 result["details"].as_object_mut().unwrap().remove(key);
             }
         }
+        if row["args"]["action"] == "grep" {
+            // Preserve every legacy field against the unchanged oracle while
+            // separately requiring the additional completeness information.
+            // These fixture queries return all matching lines; capped and long
+            // line results have their own real-store regressions above.
+            let total = result["details"]["count"].clone();
+            let details = result["details"].as_object_mut().unwrap();
+            assert_eq!(details.remove("totalMatchingLines"), Some(total.clone()));
+            assert_eq!(details.remove("matchesTruncated"), Some(json!(false)));
+            for part in result["content"].as_array_mut().unwrap() {
+                if let Some(grep) = part["text"]
+                    .get_mut("artifactGrep")
+                    .and_then(Value::as_object_mut)
+                {
+                    assert_eq!(grep.remove("scope"), Some(json!("known-artifact")));
+                    assert_eq!(grep.remove("totalMatchingLines"), Some(total.clone()));
+                    assert_eq!(grep.remove("matchesTruncated"), Some(json!(false)));
+                }
+            }
+        }
         assert_eq!(
             normalized_artifact_value(result, &fixture.store),
             row["expected"],
@@ -3982,18 +4254,29 @@ async fn native_repo_runner(
     fixture: &Fixture,
     git: &std::path::Path,
 ) -> Arc<ag1_platform::session::files::NativeToolRunner> {
+    native_repo_runner_with_bubblewrap(fixture, git, None).await
+}
+async fn native_repo_runner_with_bubblewrap(
+    fixture: &Fixture,
+    git: &std::path::Path,
+    bubblewrap: Option<&std::path::Path>,
+) -> Arc<ag1_platform::session::files::NativeToolRunner> {
     use ag1_platform::{git::GitService, repo_tools::RepoTools, session::adapters::NativeAdapters};
     let spools = fixture._directory.path().join("repo-spools");
     std::fs::create_dir(&spools).unwrap();
+    let mut git_service = GitService::new(
+        env!("CARGO_BIN_EXE_ag1-process-host").as_ref(),
+        git,
+        &spools,
+    )
+    .unwrap();
+    if let Some(path) = bubblewrap {
+        git_service = git_service.with_bubblewrap(path);
+    }
     let adapters = NativeAdapters {
         repo: Some(Arc::new(RepoTools::new(
             fixture.workspace.clone(),
-            GitService::new(
-                env!("CARGO_BIN_EXE_ag1-process-host").as_ref(),
-                git,
-                &spools,
-            )
-            .unwrap(),
+            git_service,
             fixture.store.clone(),
         ))),
         ..Default::default()
@@ -4267,27 +4550,39 @@ async fn native_repo_cancellation_drains_owned_git_before_session_settlement() {
         json!({"view":"all"}),
     )])]);
     let fixture = fixture(&origin, "disabled");
-    let executable = fixture._directory.path().join("owned-slow-git");
+    owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+    let executable = fixture._directory.path().join("owned-slow-git-container");
     std::fs::write(
         &executable,
-        "#!/bin/sh\nprintf '%s' \"$$\" > git-started\nsleep 30\n",
+        // Git must remain the configured system executable. Delay its owned
+        // container launcher, and signal through stderr (the retained spool).
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" >&2\nexec sleep 30\n",
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let runner = native_repo_runner(&fixture, &executable).await;
+    let runner =
+        native_repo_runner_with_bubblewrap(&fixture, "/usr/bin/git".as_ref(), Some(&executable))
+            .await;
     let host = fixture.host.clone();
     let running = tokio::spawn(async move {
         host.run(input(), &Resolver::new(false), runner, &ignore)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !fixture.root.join("git-started").exists() {
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            for entry in std::fs::read_dir(fixture._directory.path().join("repo-spools")).unwrap() {
+                let path = entry.unwrap().path().join("stderr.log");
+                if let Ok(text) = std::fs::read_to_string(path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                {
+                    return pid;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .unwrap();
-    let pid = std::fs::read_to_string(fixture.root.join("git-started")).unwrap();
     fixture.host.cancel().unwrap();
     let result = tokio::time::timeout(Duration::from_secs(3), running)
         .await
@@ -5436,20 +5731,18 @@ async fn native_todo_lifecycle_archives_and_replaces_plans_on_one_worker() {
     .unwrap();
     let requests = model.join().unwrap();
     assert_eq!(requests.len(), 3);
-    let user = |request: &Value| {
+    let working = |request: &Value| {
         request["messages"]
             .as_array()
             .unwrap()
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "user")
+            .last()
             .unwrap()
             .to_string()
     };
-    assert!(user(&requests[1]).contains("phase=Beta"));
-    assert!(user(&requests[1]).contains("todo_focus: t1 Verify new plan"));
-    assert!(!user(&requests[1]).contains("phase=Alpha"));
-    assert!(!user(&requests[2]).contains("Checklist reconciliation"));
+    assert!(working(&requests[1]).contains("phase=Beta"));
+    assert!(working(&requests[1]).contains("todo_focus: t1 Verify new plan"));
+    assert!(!working(&requests[1]).contains("phase=Alpha"));
+    assert!(!working(&requests[2]).contains("Checklist reconciliation"));
     let results = session_tool_results(&fixture);
     assert_eq!(results.len(), 12);
     for (index, result) in results.iter().enumerate() {
@@ -5815,17 +6108,15 @@ async fn native_observation_preserves_feedback_and_updates_related_task_before_n
                 ag1_core::evidence::Freshness::Current
             })
         );
-        let user = requests[1]["messages"]
+        let working = requests[1]["messages"]
             .as_array()
             .unwrap()
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "user")
+            .last()
             .unwrap()
             .to_string();
-        assert!(user.contains("Runtime verification observations"));
-        assert!(user.contains(feature));
-        assert!(user.contains("reporter=agent"));
+        assert!(working.contains("Runtime verification observations"));
+        assert!(working.contains(feature));
+        assert!(working.contains("reporter=agent"));
     }
 }
 struct FaultedObservationJournal {
@@ -7085,4 +7376,493 @@ async fn real_project_check_uses_native_session_approval_and_durable_result() {
             .iter()
             .any(|e| String::from_utf8_lossy(&e.raw).contains("compile-project"))
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routine_changes_preview_apply_and_surgical_edit_run_without_approval_bypass() {
+    let original = "    const raycaster = new Raycaster();\n    fire(raycaster);\n";
+    let proposed = "    // Allocate once per shot.\n    const raycaster = new Raycaster();\n    fire(raycaster);\n";
+    let (origin, server) = server(vec![
+        calls(vec![(
+            "inspect",
+            "read",
+            json!({"path":"weapon.ts","offset":1,"limit":8}),
+        )]),
+        calls(vec![(
+            "preview",
+            "editPreview",
+            json!({"path":"weapon.ts","oldText":original,"newText":proposed}),
+        )]),
+        calls(vec![(
+            "apply",
+            "editApply",
+            json!({"path":"weapon.ts","edits":[{"oldText":original,"newText":proposed}]}),
+        )]),
+        calls(vec![(
+            "edit",
+            "edit",
+            json!({"path":"weapon.ts","edits":[{"oldText":"    fire(raycaster);","newText":"    // Dispatch the shot.\n    fire(raycaster);"}]}),
+        )]),
+        stop(),
+    ]);
+    let fixture = fixture_configured_tools(
+        &origin,
+        "autonomous",
+        vec![],
+        None,
+        None,
+        2,
+        &["read", "editPreview", "editApply", "edit"],
+    );
+    std::fs::write(fixture.root.join("weapon.ts"), original).unwrap();
+    let result = fixture
+        .host
+        .run(
+            input(),
+            &Resolver::new(false),
+            fixture.files.clone(),
+            &ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.generations, 5);
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 5);
+    let branch = ag1_core::task::branch_values(
+        &fixture
+            .store
+            .journal_snapshot(&SessionId::new("session").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let tools: Vec<_> = branch
+        .iter()
+        .filter(|e| e["message"]["role"] == "toolResult")
+        .collect();
+    assert_eq!(tools.len(), 4);
+    for result in tools {
+        assert_ne!(result["message"]["isError"], true, "{result}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("weapon.ts")).unwrap(),
+        proposed.replace(
+            "    fire(raycaster);",
+            "    // Dispatch the shot.\n    fire(raycaster);"
+        )
+    );
+    assert!(fixture.host.settled().unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_surgical_edit_returns_precise_recovery_and_preserves_source() {
+    let original = "    if (ready) {\n      fire();\n    }\n";
+    let (origin, server) = server(vec![
+        calls(vec![(
+            "wrong-indent",
+            "edit",
+            json!({"path":"weapon.ts","edits":[{"oldText":"      if (ready) {\n        fire();","newText":"destroy"}]}),
+        )]),
+        stop(),
+    ]);
+    let fixture = fixture_configured_tools(
+        &origin,
+        "autonomous",
+        vec![],
+        None,
+        None,
+        1,
+        &["read", "edit"],
+    );
+    std::fs::write(fixture.root.join("weapon.ts"), original).unwrap();
+    fixture
+        .host
+        .run(
+            input(),
+            &Resolver::new(false),
+            fixture.files.clone(),
+            &ignore,
+        )
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("weapon.ts")).unwrap(),
+        original
+    );
+    let branch = ag1_core::task::branch_values(
+        &fixture
+            .store
+            .journal_snapshot(&SessionId::new("session").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let result = branch
+        .iter()
+        .find(|e| e["message"]["role"] == "toolResult")
+        .unwrap();
+    assert_eq!(result["message"]["isError"], true);
+    let text = result["message"]["content"].to_string();
+    assert!(text.contains("Candidate at line 1"), "{text}");
+    assert!(text.contains("No changes from this call were written"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unsuccessful_edit_family_results_are_errors_and_never_publish_partial_changes() {
+    let (origin, server) = server(vec![
+        calls(vec![(
+            "failed-apply",
+            "editApply",
+            json!({"path":"file.ts","edits":[{"oldText":"one","newText":"ONE"},{"oldText":"missing","newText":"BAD"}]}),
+        )]),
+        calls(vec![(
+            "failed-preview",
+            "editPreview",
+            json!({"path":"file.ts","oldText":"missing","newText":"BAD"}),
+        )]),
+        calls(vec![(
+            "failed-append",
+            "append",
+            json!({"path":"missing/file.ts","content":"BAD"}),
+        )]),
+        stop(),
+    ]);
+    let fixture = fixture_configured_tools(
+        &origin,
+        "autonomous",
+        vec![],
+        None,
+        None,
+        1,
+        &["editPreview", "editApply", "append"],
+    );
+    std::fs::write(fixture.root.join("file.ts"), "one\ntwo\n").unwrap();
+    fixture
+        .host
+        .run(
+            input(),
+            &Resolver::new(false),
+            fixture.files.clone(),
+            &ignore,
+        )
+        .await
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("file.ts")).unwrap(),
+        "one\ntwo\n"
+    );
+    assert!(!fixture.root.join("missing").exists());
+    let branch = ag1_core::task::branch_values(
+        &fixture
+            .store
+            .journal_snapshot(&SessionId::new("session").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let results: Vec<_> = branch
+        .iter()
+        .filter(|e| e["message"]["role"] == "toolResult")
+        .collect();
+    assert_eq!(results.len(), 3);
+    for result in &results {
+        assert_eq!(result["message"]["isError"], true, "{result}");
+    }
+    assert_eq!(results[0]["message"]["details"]["applied"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retrieve_returns_exact_context_and_bounded_authenticated_continuations() {
+    let fixture = fixture("http://127.0.0.1:1", "disabled");
+    let runner = native_artifact_runner(&fixture).await;
+    let source = format!(
+        "{}before\nUNIQUE_EVIDENCE_123\nafter\n{}",
+        "old line\n".repeat(80),
+        "🧪\\\"evidence\n".repeat(900)
+    );
+    let id = retained_artifact(&fixture, 9123, &source, "tool-output");
+    let result = execute_artifact(
+        &fixture,
+        &runner,
+        "retrieve-search",
+        json!({"action":"retrieve","query":"UNIQUE_EVIDENCE_123","maxBytes":2048}),
+    );
+    assert!(!result.outcome.result["isError"].as_bool().unwrap_or(false));
+    assert!(result.outcome.result.to_string().len() <= 2048);
+    let mut page: Value = serde_json::from_str(
+        result.outcome.result["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(page["id"], id);
+    assert_eq!(page["sha256"], ag1_storage::digest(source.as_bytes()));
+    assert!(
+        page["text"]
+            .as_str()
+            .unwrap()
+            .contains("before\nUNIQUE_EVIDENCE_123\nafter")
+    );
+    let start = page["range"]["startByte"].as_u64().unwrap() as usize;
+    let mut exact = page["text"].as_str().unwrap().to_owned();
+    let mut count = 0;
+    while page.get("nextCall").is_some() {
+        let result = execute_artifact(
+            &fixture,
+            &runner,
+            &format!("retrieve-next-{count}"),
+            page["nextCall"].clone(),
+        );
+        assert!(result.outcome.result.to_string().len() <= 2048);
+        page = serde_json::from_str(
+            result.outcome.result["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            page["range"]["startByte"].as_u64().unwrap() as usize,
+            start + exact.len()
+        );
+        exact.push_str(page["text"].as_str().unwrap());
+        count += 1;
+        assert!(count < 100);
+    }
+    assert_eq!(exact, source[start..]);
+    let bad = execute_artifact(
+        &fixture,
+        &runner,
+        "retrieve-bad-cursor",
+        json!({"action":"retrieve","cursor":"ac2.forged","maxBytes":2048}),
+    );
+    assert_eq!(bad.outcome.result["isError"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_edit_preview_is_readonly_and_stale_apply_preserves_intervening_work() {
+    let original = "before\n";
+    let edits = json!([{"oldText":"before","newText":"after"}]);
+    let (endpoint, server) = server(vec![
+        calls(vec![(
+            "preview-call",
+            "edit",
+            json!({"path":"input.txt","mode":"preview","edits":edits}),
+        )]),
+        calls(vec![("read-before", "read", json!({"path":"input.txt"}))]),
+        calls(vec![(
+            "concurrent-write",
+            "write",
+            json!({"path":"input.txt","content":"before\nintervening work\n"}),
+        )]),
+        calls(vec![(
+            "stale-apply",
+            "edit",
+            json!({"path":"input.txt","mode":"apply","edits":edits,"expectedSha256":ag1_storage::digest(original.as_bytes())}),
+        )]),
+        stop(),
+    ]);
+    let fixture = fixture_configured_tools(
+        &endpoint,
+        "disabled",
+        vec![],
+        None,
+        None,
+        1,
+        &["read", "write", "edit"],
+    );
+    std::fs::write(fixture.root.join("input.txt"), original).unwrap();
+    fixture
+        .host
+        .run(
+            input(),
+            &Resolver::new(false),
+            fixture.files.clone(),
+            &ignore,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fixture.root.join("input.txt")).unwrap(),
+        "before\nintervening work\n"
+    );
+    let branch = ag1_core::task::branch_values(
+        &fixture
+            .store
+            .journal_snapshot(&SessionId::new("session").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let results: Vec<_> = branch
+        .iter()
+        .filter(|e| e["message"]["role"] == "toolResult")
+        .map(|e| &e["message"])
+        .collect();
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0]["details"]["mode"], "preview");
+    assert!(
+        results[1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("before")
+    );
+    assert_eq!(results[3]["isError"], true);
+    assert!(
+        results[3]
+            .to_string()
+            .contains("changed since this preview")
+            || results[3].to_string().contains("Conflict")
+    );
+    server.join().unwrap();
+}
+
+#[path = "session_surface/mod.rs"]
+mod surface;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_inspection_accepts_missing_optional_info_without_host_changes() {
+    for linked in [false, true] {
+        for missing in [
+            vec!["info"],
+            vec!["objects/info"],
+            vec!["info", "objects/info"],
+        ] {
+            let fixture = fixture("http://127.0.0.1:1", "disabled");
+            let common_root = if linked {
+                let main = fixture._directory.path().join("main-repo");
+                std::fs::create_dir(&main).unwrap();
+                owned_repo_git(&main, &["init", "-b", "main"]);
+                owned_repo_git(&main, &["commit", "--allow-empty", "-m", "baseline"]);
+                owned_repo_git(
+                    &main,
+                    &[
+                        "worktree",
+                        "add",
+                        "-b",
+                        "linked",
+                        fixture.root.to_str().unwrap(),
+                    ],
+                );
+                main.join(".git")
+            } else {
+                owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+                fixture.root.join(".git")
+            };
+            for name in &missing {
+                std::fs::remove_dir_all(common_root.join(name)).unwrap();
+            }
+            owned_repo_git(&fixture.root, &["status", "--porcelain"]);
+            fn tree(
+                root: &std::path::Path,
+            ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+                let mut result = std::collections::BTreeMap::new();
+                for entry in std::fs::read_dir(root).unwrap() {
+                    let path = entry.unwrap().path();
+                    result.insert(
+                        path.clone(),
+                        if path.is_dir() {
+                            vec![]
+                        } else {
+                            std::fs::read(&path).unwrap()
+                        },
+                    );
+                    if path.is_dir() {
+                        result.extend(tree(&path));
+                    }
+                }
+                result
+            }
+            let before = tree(&common_root);
+            let runner = native_repo_runner(&fixture, "/usr/bin/git".as_ref()).await;
+            let result = execute_repo(&fixture, &runner, "optional-info", "status");
+            assert_ne!(
+                result["isError"], true,
+                "linked={linked}, missing={missing:?}: {result}"
+            );
+            assert_eq!(
+                result["details"]["branch"],
+                if linked { "linked" } else { "main" }
+            );
+            assert_eq!(tree(&common_root), before);
+            for name in &missing {
+                assert!(!common_root.join(name).exists());
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_inspection_does_not_treat_symlinked_info_as_missing() {
+    for name in ["info", "objects/info", "objects"] {
+        let fixture = fixture("http://127.0.0.1:1", "disabled");
+        owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+        let outside = fixture._directory.path().join("outside-info");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("marker"), "private").unwrap();
+        let target = fixture.root.join(".git").join(name);
+        std::fs::remove_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        let runner = native_repo_runner(&fixture, "/usr/bin/git".as_ref()).await;
+        let result = execute_repo(&fixture, &runner, "symlink-info", "status");
+        assert_eq!(result["isError"], true, "{name}: {result}");
+        assert!(
+            std::fs::symlink_metadata(target)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("marker")).unwrap(),
+            "private"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_inspection_rejects_info_identity_changes_during_contained_execution() {
+    use std::os::unix::fs::PermissionsExt;
+    for initially_missing in [false, true] {
+        let fixture = fixture("http://127.0.0.1:1", "disabled");
+        owned_repo_git(&fixture.root, &["init", "-b", "main"]);
+        let info = fixture.root.join(".git/info");
+        if initially_missing {
+            std::fs::remove_dir_all(&info).unwrap();
+        }
+        let gate = fixture._directory.path().join("release-git");
+        let launcher = fixture._directory.path().join("gated-bwrap");
+        std::fs::write(&launcher, format!("#!/bin/sh\nprintf ready >&2\nwhile test ! -e '{}'; do sleep 0.01; done\nexec /usr/bin/bwrap \"$@\"\n", gate.display())).unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runner =
+            native_repo_runner_with_bubblewrap(&fixture, "/usr/bin/git".as_ref(), Some(&launcher))
+                .await;
+        std::thread::scope(|scope| {
+            let running = scope.spawn(|| execute_repo(&fixture, &runner, "changed-info", "status"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let ready = std::fs::read_dir(fixture._directory.path().join("repo-spools"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| {
+                        std::fs::read_to_string(entry.path().join("stderr.log"))
+                            .is_ok_and(|text| text == "ready")
+                    });
+                if ready {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "launcher did not reach execution"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if !initially_missing {
+                std::fs::rename(&info, info.with_file_name("info-before")).unwrap();
+            }
+            std::fs::create_dir(&info).unwrap();
+            std::fs::write(&gate, "release").unwrap();
+            let result = running.join().unwrap();
+            assert_eq!(
+                result["isError"], true,
+                "missing={initially_missing}: {result}"
+            );
+        });
+    }
 }

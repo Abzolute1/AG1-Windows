@@ -1,0 +1,16 @@
+{
+  "elapsed": 86239,
+  "status": "streaming",
+  "tools": 9,
+  "icons": [
+    {
+      "host": "docs.python.org",
+      "loaded": true
+    },
+    {
+      "host": "docs.python.org",
+      "loaded": true
+    }
+  ],
+  "tail": "ock for Elapsed-Time Budget\nA 12-second elapsed-time deadline requires a monotonic clock (e.g., time.monotonic()), not wall-clock time (time.time()). Wall-clock can jump backward (NTP correction, DST), potentially extending or invalidating the budget; a monotonic clock is guaranteed non-decreasing [docs.python.org/3/library/time.html].\n\nurllib3 Retry: Default allowed_methods & POST\nThe claim \"urllib3 retries POST by default\" is false. urllib3's Retry default allowed_methods is {\"GET\", \"HEAD\", \"PUT\", \"DELETE\", \"OPTIONS\", \"TRACE\"} — POST is explicitly excluded [urllib3.readthedocs.io]. POST must be opted-in via allowed_methods={\"POST\"}.\n\nProposed Policy (Distinguished from Defaults)\nAspect\turllib3 Default\tProposed Policy\nmax_retries\t3\t2 (within 12s budget)\nallowed_methods\tGET/HEAD/PUT/DELETE/OPTIONS/TRACE\tPOST only (with idempotency key)\nBackoff\tbase=1 exponential\tbase=1, capped per deadline\nDeadline\tnone\t12s monotonic\n429 handling\tnone\thonor Retry-After\nPseudocode: Bounded Retry Decision\nCode\n\nCopy\ndeadline = time.monotonic() + 12\nfor attempt in 1..3:\n    if time.monotonic() > deadline: break\n\n    resp = client.post(url, body,\n                       headers={\"Idempotency-Key\": uuid4()})\n\n    if resp.status < 500:\n        if resp.status == 429:\n            wait = parse_retry_after(resp.headers[\"Retry-After\"])\n            remaining = deadline - time.monotonic()\n            sleep(min(wait, remaining))\n            continue\n        return resp\n    # 5xx: retry with exponential backoff\n    sleep(min(2**(attempt-1), deadline - time.monotonic()))\n\nreturn resp  # final failure\nSources:\n\nhttp.client docs: https://docs.python.org/3/library/http.client.html\nRetry-After spec: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Retry-After\nurllib3 Retry: https://urllib3.readthedocs.io/en/stable/reference/urllib3.util.html#urllib3.util.Retry\n\n\nTokens · 2365 in · 745 out · 5375 cached\n\n\n\nAsk before changes\n\nQwen3.6-35B-A3B-UD-Q4_K_XL\n\nEnter to send · Shift Enter for a new line"
+}

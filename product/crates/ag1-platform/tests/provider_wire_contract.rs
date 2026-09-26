@@ -286,3 +286,35 @@ fn response_service_tier_pricing_tracks_server_override() {
     let result = reducer.finish(false).unwrap();
     assert_eq!(result.cost([1.0, 2.0, 0.1, 1.25]).unwrap()[0], 0.5);
 }
+
+#[test]
+fn responses_additive_events_and_reasoning_text_preserve_tool_execution() {
+    use serde_json::json;
+    for family in [ApiFamily::Responses, ApiFamily::CodexResponses] {
+        let mut decoder = WireDecoder::new(family);
+        let mut reducer = StreamReducer::new(family, 0, 4096).unwrap();
+        for v in [
+            json!({"type":"response.created","response":{"id":"resp-test"}}),
+            json!({"type":"ping"}),
+            json!({"type":"rate_limits.updated","rate_limits":[]}),
+            json!({"type":"response.future_metadata","untrusted":"ignored"}),
+            json!({"type":"response.output_item.added","output_index":0,"item":{"id":"r","type":"reasoning"}}),
+            json!({"type":"response.reasoning_text.delta","item_id":"r","delta":"Checking GitHub"}),
+            json!({"type":"response.reasoning_text.done","item_id":"r"}),
+            json!({"type":"response.output_item.done","item":{"id":"r","type":"reasoning","summary":[]}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{"id":"f","call_id":"c","type":"function_call","name":"github","arguments":""}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{"id":"f","type":"function_call","arguments":"{\"operation\":\"repos.list\"}"}}),
+            json!({"type":"response.completed","response":{"status":"completed"}}),
+        ] { apply(&mut decoder, &mut reducer, &v); }
+        let result = reducer.finish(false).unwrap();
+        assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(result.content[0].text, "Checking GitHub");
+        assert_eq!(result.content[1].name, "github");
+        assert_eq!(result.content[1].arguments, Some(json!({"operation":"repos.list"})));
+        assert!(decoder.decode(&json!({"type":"response.output_item.added","item":{"type":"unknown_executable"}})).is_err());
+        assert!(decoder.decode(&json!({})).is_err());
+        for kind in ["response.failed", "response.cancelled", "error"] {
+            assert!(matches!(decoder.decode(&json!({"type":kind})).unwrap().as_slice(), [ProviderEvent::Fail(_)]));
+        }
+    }
+}

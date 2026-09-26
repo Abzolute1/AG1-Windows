@@ -48,6 +48,61 @@ fn read(store: &Store, session: &str, origin: &str, id: &str) -> Vec<u8> {
     bytes
 }
 #[test]
+fn small_history_archives_reopen_without_becoming_fresh_search_evidence() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("store");
+    let store = Store::open(&path).unwrap();
+    create(&store, "session");
+    let mut messages = vec![];
+    for index in 0..100 {
+        messages.push(json!({"role":"user","content":format!("request-custody-marker {index}: {}", "historical instruction ".repeat(20))}));
+        messages.push(json!({"role":"assistant","content":[{"type":"text","text":"historical result ".repeat(20)}]}));
+    }
+    let result = adapter(&store, "session", "history-pressure")
+        .compile(
+            &messages,
+            &CompileOptions {
+                context_window: 32_768,
+                max_working_tokens: Some(8192),
+                ..Default::default()
+            },
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.projection.stats["overTargetTokens"], 0);
+    let archive = store
+        .artifact_catalog("session", None, 10, Some("context-history-segment"))
+        .unwrap();
+    assert_eq!(archive.len(), 1);
+    let id = archive[0].record["id"].as_str().unwrap().to_owned();
+    let bytes = read(&store, "session", "session", &id);
+    assert!(String::from_utf8_lossy(&bytes).contains("request-custody-marker 0:"));
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    assert_eq!(read(&store, "session", "session", &id), bytes);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&read(
+            &store,
+            "session",
+            "session",
+            &result.original_request.id
+        ))
+        .unwrap(),
+        json!(messages)
+    );
+    assert!(store.evidence_catalog("session", 100).unwrap().is_empty());
+    assert!(store.page("foreign", "session", &id, 0, 32768).is_err());
+    assert!(
+        std::sync::Arc::new(store)
+            .capture_evidence_search("session", None)
+            .unwrap()
+            .search("request-custody-marker", true, 12, 3, || Ok(()))
+            .unwrap()
+            .matches
+            .is_empty()
+    );
+}
+#[test]
 fn shadow_compilation_retains_request_and_exact_original_journal_across_restart() {
     let d = tempfile::tempdir().unwrap();
     let path = d.path().join("s");
@@ -427,4 +482,31 @@ fn shadow_transaction_rejects_orphans_and_revision_changes_during_reduction() {
         Ok(Compilation { messages:messages.to_vec(),stats:json!({}) })
     });
     assert!(matches!(changed, Err(DomainError::Conflict)));
+}
+
+
+#[test]
+fn shadow_revision_guard_retains_archived_session_and_import_fences() {
+    use ag1_core::context::compiler::Compilation;
+    for archive in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("store");
+        let store = Store::open(&path).unwrap();
+        create(&store, "session");
+        let messages = vec![json!({"role":"user","content":"exact original"})];
+        let result = adapter(&store, "session", "guard").project(&messages, 0, |messages, _| {
+            if archive {
+                store.archive_session("session").unwrap();
+            } else {
+                let external = rusqlite::Connection::open(path.join("storage.sqlite")).unwrap();
+                external.execute("INSERT INTO imports(id,manifest,state) VALUES('fixture',X'7b7d','staging')", []).unwrap();
+            }
+            Ok(Compilation { messages: messages.to_vec(), stats: json!({}) })
+        });
+        if archive {
+            assert!(matches!(result, Err(DomainError::NotFound)));
+        } else {
+            assert!(matches!(result, Err(DomainError::Io(message)) if message == "ImportIncomplete"));
+        }
+    }
 }

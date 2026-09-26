@@ -62,6 +62,20 @@ pub fn prior(value: &Value) -> Result<String, DomainError> {
         .collect::<Vec<_>>()
         .join("\n"))
 }
+/// Native board presentation carries age and checked source revisions. A matching
+/// file hash says nothing about the correctness or completeness of the summary.
+pub fn prior_with_freshness(value: &Value, now: u64, mut inspect: impl FnMut(&str) -> String) -> Result<String, DomainError> {
+    let value = board(value)?;
+    let rows = value["findings"].as_array().unwrap();
+    if rows.is_empty() { return Ok("(empty)".into()); }
+    let mut lines = Vec::new();
+    for row in rows.iter().skip(rows.len().saturating_sub(8)) {
+        let age = row["at"].as_u64().filter(|at| *at <= now).map(|at| (now-at).to_string()).unwrap_or_else(|| "unknown".into());
+        let sources: Vec<_> = row["sourceReferences"].as_array().into_iter().flatten().filter_map(Value::as_str).take(8).map(|reference| json!({"reference":reference,"status":inspect(reference)})).collect();
+        lines.push(json!({"question":row["question"],"summary":row["summary"],"ageMs":age,"childSession":row["childSession"],"resultArtifact":row["resultArtifact"],"sources":sources,"claimStatus":"historical summary; not independently verified","sourceCoverage":if sources.is_empty(){"unknown; inspect current source"}else{"recorded reads only; inspect decisive evidence before acting"}}).to_string());
+    }
+    Ok(lines.join("\n"))
+}
 pub fn merge(questions: &[String], results: &[Value], now: u64) -> Result<Vec<Value>, DomainError> {
     if questions.is_empty() || questions.len() > 4 || questions.len() != results.len() {
         return Err(DomainError::InvalidInput("Exploration result count".into()));
@@ -82,7 +96,11 @@ pub fn merge(questions: &[String], results: &[Value], now: u64) -> Result<Vec<Va
             }
         }).collect();
         let summary = r["summary"].as_str().unwrap().trim();
-        Ok(json!({"question":q,"summary":if summary.is_empty(){"(no output)"}else{summary},"evidence":evidence,"at":now,"state":r["state"]}))
+        let mut finding = json!({"question":q,"summary":if summary.is_empty(){"(no output)"}else{summary},"evidence":evidence,"at":now,"state":r["state"]});
+        for key in ["childSession", "checkpointId", "sourceReferences"] {
+            if let Some(value) = r.get(key) { finding[key] = value.clone(); }
+        }
+        Ok(finding)
     }).collect()
 }
 pub fn append(value: &Value, findings: &[Value], now: u64) -> Result<Value, DomainError> {

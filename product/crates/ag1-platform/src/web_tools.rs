@@ -367,7 +367,7 @@ impl<R: WebResolver> WebService<R> {
 }
 fn error(url: &str, message: &str) -> AdapterOutcome {
     AdapterOutcome {
-        result: json!({"details":{"url":url,"error":message},"content":[{"type":"text","text":format!("Fetch Error: {message}")}]}),
+        result: json!({"isError":true,"details":{"url":url,"error":message,"status":"error"},"content":[{"type":"text","text":format!("Fetch Error: {message}")}]}),
         effect: Effect::None,
         artifact_page: false,
     }

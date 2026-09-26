@@ -1,0 +1,146 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <array>
++#include <memory>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -773,6 +775,80 @@
+ #endif
+ 
+ // persistent expert weight pool for MoE CPU offloading (see ggml_backend_sched_register_expert_pool)
++// Bounded pinned staging preserves mapped model bytes and overlaps a host copy
++// with earlier H2D transfers. Events prevent reuse until the GPU has read a slot.
++struct ggml_sched_host_stage {
++    struct slot {
++        ggml_backend_buffer_t buffer = nullptr;
++        ggml_backend_event_t event = nullptr;
++        bool pending = false;
++    };
++    std::array<slot, 3> slots;
++    size_t chunk = 8 * 1024 * 1024;
++    size_t next = 0;
++    bool ready = false, disabled = false;
++    uint64_t calls = 0, bytes = 0;
++
++    ~ggml_sched_host_stage() {
++        for (auto & s : slots) {
++            if (s.pending) ggml_backend_event_synchronize(s.event);
++            if (s.event) ggml_backend_event_free(s.event);
++            if (s.buffer) ggml_backend_buffer_free(s.buffer);
++        }
++        if (const char * path = getenv("AG1_FLASH_STAGE_TRACE")) {
++            if (FILE * out = fopen(path, "a")) {
++                fprintf(out, "{\"calls\":%llu,\"bytes\":%llu,\"chunk\":%zu,\"ready\":%s}\n",
++                        (unsigned long long) calls, (unsigned long long) bytes, chunk, ready ? "true" : "false");
++                fclose(out);
++            }
++        }
++    }
++
++    bool initialize(ggml_backend_t backend) {
++        if (ready) return true;
++        if (disabled) return false;
++        disabled = true;
++        auto dev = ggml_backend_get_device(backend);
++        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) return false;
++        auto host_type = ggml_backend_dev_host_buffer_type(dev);
++        if (!host_type || strcmp(ggml_backend_buft_name(host_type), "CUDA_Host")) return false;
++        if (const char * value = getenv("AG1_FLASH_STAGE_MIB")) {
++            const int mib = atoi(value);
++            if (mib < 1 || mib > 64) return false;
++            chunk = size_t(mib) * 1024 * 1024;
++        }
++        for (auto & s : slots) {
++            s.buffer = ggml_backend_buft_alloc_buffer(host_type, chunk);
++            if (!s.buffer || ggml_backend_buffer_get_type(s.buffer) != host_type) return false;
++            s.event = ggml_backend_event_new(dev);
++            if (!s.event) return false;
++        }
++        ready = true;
++        GGML_LOG_INFO("bounded host staging: 3 x %zu bytes pinned\n", chunk);
++        return true;
++    }
++
++    bool copy(ggml_backend_t backend, const void * src, ggml_tensor * dst, size_t offset, size_t size) {
++        if (!initialize(backend)) return false;
++        GGML_ASSERT(offset <= ggml_nbytes(dst) && size <= ggml_nbytes(dst) - offset);
++        for (size_t done = 0; done < size;) {
++            auto & s = slots[next];
++            if (s.pending) ggml_backend_event_synchronize(s.event);
++            const size_t count = std::min(chunk, size - done);
++            void * host = ggml_backend_buffer_get_base(s.buffer);
++            memcpy(host, (const char *) src + done, count);
++            ggml_backend_tensor_set_async(backend, dst, host, offset + done, count);
++            ggml_backend_event_record(s.event, backend);
++            s.pending = true;
++            next = (next + 1) % slots.size();
++            done += count;
++        }
++        ++calls;
++        bytes += size;
++        return true;
++    }
++};
++
+ struct ggml_backend_sched_expert_pool {
+     ggml_tensor * w;         // original weight tensor in a host buffer (ne[2] == n_expert)
+     ggml_tensor * pool;      // pool tensor on the compute backend (ne[2] == n_slots)
+@@ -811,6 +887,9 @@
+ };
+ 
+ struct ggml_backend_sched {
++    std::unordered_map<ggml_backend_t, std::unique_ptr<ggml_sched_host_stage>> host_stages;
++    bool host_stage_enabled = getenv("AG1_FLASH_STAGE") != nullptr;
++
+     bool is_reset; // true if the scheduler has been reset since the last graph split
+     bool is_alloc;
+ 
+@@ -913,6 +992,14 @@
+ }
+ 
+ // returns the priority of the backend, lower id is higher priority
++static bool ggml_backend_sched_stage_copy(ggml_backend_sched_t sched, ggml_backend_t backend,
++        const void * src, ggml_tensor * dst, size_t offset, size_t size) {
++    if (!sched->host_stage_enabled) return false;
++    auto & stage = sched->host_stages[backend];
++    if (!stage) stage = std::make_unique<ggml_sched_host_stage>();
++    return stage->copy(backend, src, dst, offset, size);
++}
++
+ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
+     for (int i = 0; i < sched->n_backends; i++) {
+         if (sched->backends[i] == backend) {
+@@ -1854,6 +1941,11 @@
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+ 
++                        if (ggml_backend_sched_stage_copy(sched, split_backend,
++                                (const uint8_t *) input->data + expert_offset, input_cpy,
++                                expert_offset, expert_size_copy + padding_end)) {
++                            return;
++                        }
+                         ggml_backend_tensor_set_async(split_backend,
+                             input_cpy,
+                             (const uint8_t *)input->data + expert_offset, expert_offset,
+@@ -2061,10 +2153,12 @@
+         table[e] = slot;
+ 
+         // copy the expert from the host weights into its slot
+-        ggml_backend_tensor_set_async(split_backend, ep.pool,
+-            (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size,
+-            (size_t) slot * ep.expert_size,
+-            ep.expert_size);
++        const void * source = (const uint8_t *) ep.w->data + (size_t) e * ep.expert_size;
++        if (!ggml_backend_sched_stage_copy(sched, split_backend, source, ep.pool,
++                (size_t) slot * ep.expert_size, ep.expert_size)) {
++            ggml_backend_tensor_set_async(split_backend, ep.pool, source,
++                    (size_t) slot * ep.expert_size, ep.expert_size);
++        }
+     }
+ 
+     if (ep.report_stats && ep.n_hits + ep.n_misses > 0 && (ep.n_hits + ep.n_misses) / 512 >= ep.n_reports) {

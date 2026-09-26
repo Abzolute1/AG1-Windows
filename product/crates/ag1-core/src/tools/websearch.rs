@@ -1,4 +1,6 @@
 //! Search planning, ranking and provider response parsing. No network or secrets.
+pub mod duckduckgo_web;
+mod selection;
 use super::research::{self, compact, compile, has, replace, rx, trim};
 use crate::DomainError;
 use serde::{Deserialize, Serialize};
@@ -216,6 +218,15 @@ pub fn plan(query: &str, year: u32) -> Result<Plan, DomainError> {
         avoided_domains: None,
         freshness: "any".into(),
     };
+    // Explicit search syntax belongs to the caller. Rewriting it can discard
+    // domain restrictions, quoted phrases, exclusions, or exact punctuation.
+    if has(
+        r#"(?i)(?:\b(?:site|filetype|intitle|inurl):|"[^"]+"|(?:^|\s)-\S+)"#,
+        original,
+    ) {
+        plan.strategy = "explicit search syntax preserved".into();
+        return Ok(plan);
+    }
     if let Some(error) = error_query(original) {
         plan.effective_query = append(&error, &["fix"]);
         plan.strategy =
@@ -815,7 +826,7 @@ fn canonical(url: &str) -> String {
             .to_string()
             .strip_suffix('/')
             .unwrap_or(parsed.as_str())
-            .to_lowercase()
+            .to_string()
     } else {
         trim(url)
             .strip_suffix('/')
@@ -907,93 +918,126 @@ pub fn decode_html(value: &str) -> String {
     trim(&replace(&compact(&value), r"\s+([.,;:!?])", "$1")).into()
 }
 fn usable(url: &str) -> bool {
-    Url::parse(url).is_ok_and(|u| {
-        matches!(u.scheme(), "http" | "https")
-            && !host_is(u.host_str().unwrap_or_default(), "duckduckgo.com")
-    })
-}
-fn decode_uri(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
-            }
-            let hi = (bytes[i + 1] as char).to_digit(16)?;
-            let lo = (bytes[i + 2] as char).to_digit(16)?;
-            output.push((hi * 16 + lo) as u8);
-            i += 3
-        } else {
-            output.push(bytes[i]);
-            i += 1
-        }
-    }
-    String::from_utf8(output).ok()
+    url.len() <= 8192
+        && Url::parse(url).is_ok_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.username().is_empty()
+                && u.password().is_none()
+                && !host_is(u.host_str().unwrap_or_default(), "duckduckgo.com")
+        })
 }
 fn normalize_result_url(value: &str) -> String {
-    let absolute = if value.starts_with("//") {
-        format!("https:{value}")
-    } else {
-        value.into()
-    };
-    let Ok(url) = Url::parse(&absolute) else {
+    let Ok(base) = Url::parse("https://duckduckgo.com/") else {
         return value.into();
     };
-    if url.host_str() != Some("duckduckgo.com") || !url.path().starts_with("/l/") {
-        return absolute;
-    }
-    if let Some((_, uddg)) = url.query_pairs().find(|(k, _)| k == "uddg")
-        && !uddg.is_empty()
+    let Ok(url) = base.join(value) else {
+        return value.into();
+    };
+    if host_is(url.host_str().unwrap_or_default(), "duckduckgo.com")
+        && url.path().starts_with("/l/")
     {
-        return decode_uri(&uddg).unwrap_or_else(|| value.into());
+        // query_pairs already percent-decodes once. A second decode corrupts
+        // percent-escaped paths and literal percent signs in destination URLs.
+        if let Some((_, target)) = url.query_pairs().find(|(k, _)| k == "uddg") {
+            return target.into_owned();
+        }
     }
-    absolute
+    url.to_string()
 }
+
+/// Classify transport-success pages before interpreting an empty parse as no hits.
+/// CAPTCHA pages are evidence of blocked access, never prompts to solve/bypass it.
+pub fn duckduckgo_page_status(html: &str) -> &'static str {
+    let doc = dom_query::Document::from(html);
+    if !doc
+        .select("form#challenge-form, .anomaly-modal, form[action*='anomaly.js']")
+        .is_empty()
+    {
+        "blocked"
+    } else if !doc.select("a.result__a, a.result-link").is_empty() {
+        "results"
+    } else if !doc.select(".no-results, .no-results__message").is_empty()
+        || compact(&doc.select("body").text())
+            .to_lowercase()
+            .starts_with("no results")
+        || doc.select("body").text().contains("No more results.")
+        || doc
+            .select("title")
+            .text()
+            .to_lowercase()
+            .contains("no results")
+    {
+        "empty"
+    } else {
+        "parse_error"
+    }
+}
+
 pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, DomainError> {
     if html.len() > 1_000_000 || max > 256 {
         return Err(DomainError::LimitExceeded("web search HTML".into()));
     }
-    let anchors = rx(
-        r#"(?i)<a[^>]*class=["'][^"']*\bresult__a\b[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)</a>"#,
-    );
-    let matches: Vec<_> = anchors.captures_iter(html).collect();
+    if max == 0 {
+        return Ok(vec![]);
+    }
+    let doc = dom_query::Document::from(html);
+    doc.select("script, style, template").remove();
     let mut rows = vec![];
-    for (index, matched) in matches.iter().enumerate() {
-        let url = normalize_result_url(&matched[1]);
-        let title = decode_html(&matched[2]);
-        if title.is_empty() || !usable(&url) {
+    let mut seen = BTreeSet::new();
+    for anchor in doc.select("a.result__a, a.result-link").iter() {
+        let Some(href) = anchor.attr("href") else {
+            continue;
+        };
+        let url = normalize_result_url(&href);
+        let title = compact(&anchor.text());
+        if title.is_empty() || !usable(&url) || !seen.insert(canonical(&url)) {
             continue;
         }
-        let end = matched.get(0).unwrap().end();
-        let next = matches
-            .get(index + 1)
-            .map(|m| m.get(0).unwrap().start())
-            .unwrap_or(html.len());
-        let segment = &html[end..next];
         let mut snippet = String::new();
-        for pattern in [
-            r#"(?i)<a[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</a>"#,
-            r#"(?i)<div[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</div>"#,
-            r#"(?i)<span[^>]*class=["'][^"']*\bresult__snippet\b[^"']*["'][^>]*>([\s\S]*?)</span>"#,
-        ] {
-            if let Some(c) = rx(pattern).captures(segment) {
-                snippet = decode_html(&c[1]);
+        // HTML results have a common .result ancestor. Lite puts the snippet
+        // in the next table row. Bound sibling scans to this result only.
+        for parent in anchor.ancestors(Some(6)).iter() {
+            if parent.is(".result, .web-result") {
+                snippet = compact(&parent.select(".result__snippet").text());
+                break;
+            }
+            if parent.is("tr") {
+                let mut next = parent.next_sibling();
+                for _ in 0..3 {
+                    if next.is_empty() || !next.select("a.result-link").is_empty() {
+                        break;
+                    }
+                    snippet = compact(&next.select(".result-snippet").text());
+                    if !snippet.is_empty() {
+                        break;
+                    }
+                    next = next.next_sibling();
+                }
                 break;
             }
         }
+        if snippet.is_empty() {
+            let mut next = anchor.next_sibling();
+            for _ in 0..4 {
+                if next.is_empty() || next.is("a.result__a, a.result-link") {
+                    break;
+                }
+                if next.is(".result__snippet, .result-snippet") {
+                    snippet = compact(&next.text());
+                    break;
+                }
+                next = next.next_sibling();
+            }
+        }
         rows.push(ResultRow {
-            title,
+            title: title.chars().take(4096).collect(),
             url,
-            snippet,
+            snippet: snippet.chars().take(4096).collect(),
         });
         if rows.len() >= max {
             break;
         }
     }
-    let mut rows = dedupe_raw(rows);
-    rows.truncate(max);
     Ok(rows)
 }
 pub fn parse_brave(data: &Value, max: usize) -> Result<(Vec<ResultRow>, usize), DomainError> {
@@ -1081,24 +1125,37 @@ pub fn project(
     };
     fallback.truncate(max);
     let used_fallback = !fallback.is_empty();
+    let blocked = response.attempts.iter().any(|a| a.status == "blocked");
+    let failed = response.results.is_empty()
+        && (blocked || !response.attempts.iter().any(|a| a.status == "ok"));
     let raw = if used_fallback {
         &fallback
     } else {
         &response.results
     };
-    let ranked = diversify(
-        rank(&plan.effective_query, raw, outcomes)?,
-        &plan.effective_query,
-        intent,
-    );
+    let candidate_count = raw.len();
+    let ranked = selection::select(query, raw, outcomes, max)?;
     let mut details = json!({"query":query,"effectiveQuery":plan.effective_query,"intent":intent,"searchStrategy":plan.strategy,"followUpQueries":plan.follow_up_queries,"freshness":plan.freshness,"preferCorroboration":strongest(query),"resultCount":ranked.len(),"compressionMode":profile.mode,"cacheHit":response.cache_hit,"searchProvider":if used_fallback{"official-fallback"}else{&response.provider},"searchProviderMode":response.provider_mode,"searchProviderOrder":response.provider_order,"searchAttempts":response.attempts,"fallbackUsed":used_fallback,"sourceUrls":ranked.iter().map(|r|&r.result.url).collect::<Vec<_>>(),"preferredSourceUrls":ranked.iter().filter(|r|r.authoritative||r.score>=4).map(|r|&r.result.url).collect::<Vec<_>>(),"results":ranked});
+    details["candidateCount"] = json!(candidate_count);
+    details["selectionPolicy"] = json!("relevance-source-version-v1");
     if let Some(domains) = plan.preferred_domains {
         details["preferredDomains"] = json!(domains);
     }
     if let Some(domains) = plan.avoided_domains {
         details["avoidedDomains"] = json!(domains);
     }
-    let text = research::search_transcript(
+    let mut transcript_profile = profile.clone();
+    transcript_profile.search_transcript_results = match profile.mode.as_str() {
+        "ultra" => 2,
+        "tight" => 3,
+        _ => 4,
+    };
+    transcript_profile.search_snippet_chars = match profile.mode.as_str() {
+        "ultra" => 140,
+        "tight" => 220,
+        _ => 320,
+    };
+    let mut text = research::search_transcript(
         &plan.effective_query,
         &ranked
             .iter()
@@ -1109,7 +1166,7 @@ pub fn project(
                 authoritative: r.authoritative,
             })
             .collect::<Vec<_>>(),
-        &profile,
+        &transcript_profile,
         &research::SearchOptions {
             intent: Some(intent.into()),
             prefer_corroboration: strongest(query),
@@ -1118,6 +1175,44 @@ pub fn project(
             follow_up_queries: plan.follow_up_queries,
         },
     );
+    if failed || used_fallback {
+        let reason = if blocked {
+            "DuckDuckGo blocked or rate-limited automated access (it may require human verification). Search results are unavailable. Do not repeat or rephrase searches while it is blocked."
+        } else if failed {
+            "Search providers failed; this is not evidence that no matching pages exist."
+        } else {
+            "No matching search results were returned."
+        };
+        text = format!(
+            "{}{}",
+            reason,
+            if used_fallback {
+                format!(
+                    "\nKnown documentation suggestions (not search results; not fetched or verified):\n{}",
+                    ranked
+                        .iter()
+                        .map(|r| format!("- {}: {}", r.result.title, r.result.url))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            } else {
+                "\nUse webFetch for known URLs, or try another available search provider.".into()
+            }
+        );
+        details["resultCount"] = json!(response.results.len());
+        details["sourceUrls"] = json!([]);
+        details["preferredSourceUrls"] = json!([]);
+        details["suggestions"] = json!(ranked);
+        details["results"] = json!([]);
+        details["status"] = json!(if failed {
+            if blocked { "blocked" } else { "error" }
+        } else {
+            "empty"
+        });
+        if failed {
+            details["error"] = json!(reason);
+        }
+    }
     let hints = ranked
         .iter()
         .map(|r| {
@@ -1127,18 +1222,18 @@ pub fn project(
                     intent: intent.into(),
                     rich_fetch: research::rich_fetch(query, intent),
                     authoritative: Some(r.authoritative),
-                    focus_terms: if intent == "docs_reference" {
-                        docs_terms(query).into_iter().take(6).collect()
-                    } else {
-                        vec![]
-                    },
+                    focus_terms: selection::focus_terms(query),
                     coverage_kind: coverage_kind(query, intent).map(str::to_string),
                 },
             )
         })
         .collect();
     Ok(SearchProjection {
-        result: json!({"details":details,"content":[{"type":"text","text":text}]}),
+        result: if failed {
+            json!({"isError":true,"details":details,"content":[{"type":"text","text":text}]})
+        } else {
+            json!({"details":details,"content":[{"type":"text","text":text}]})
+        },
         hints,
     })
 }

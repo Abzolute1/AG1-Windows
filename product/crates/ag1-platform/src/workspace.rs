@@ -10,7 +10,7 @@ use std::{
     io::{Read, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
-        unix::fs::MetadataExt,
+        unix::{fs::MetadataExt,ffi::OsStrExt},
     },
     path::{Component, Path, PathBuf},
     sync::{
@@ -24,6 +24,12 @@ pub const MAX_STREAM_READ: u64 = 64 * 1024 * 1024;
 pub const MAX_FILES: usize = 1000;
 pub const MAX_INDEX_BYTES: usize = 16 * 1024 * 1024;
 static TEMP_SERIAL: AtomicU64 = AtomicU64::new(1);
+#[path = "workspace_undo.rs"]
+mod undo;
+pub use undo::{UndoOutcome, UndoStage};
+#[path = "workspace_git.rs"]
+mod git_publication;
+pub(crate) use git_publication::{GitEntry, GitSnapshot};
 
 fn errno(error: rustix::io::Errno) -> DomainError {
     if error == rustix::io::Errno::LOOP || error == rustix::io::Errno::XDEV {
@@ -83,6 +89,7 @@ pub struct PinnedDirectory {
     inode: u64,
 }
 impl PinnedDirectory {
+    pub(crate) fn relative_path(&self)->&Path {&self.relative}
     pub fn process_cwd(&self) -> PathBuf {
         PathBuf::from(format!(
             "/proc/{}/fd/{}",
@@ -123,8 +130,25 @@ pub struct Workspace {
     claim: Mutex<()>,
 }
 impl Workspace {
+    /// Host-only directory capability under a stable conversation storage identity.
+    /// This copies the pinned directory, not another workspace's journal or authority.
+    pub(crate) fn for_conversation(&self, id: &WorkspaceId) -> Result<Arc<Self>, DomainError> {
+        self.verify_root()?;
+        Ok(Arc::new(Self { id: id.clone(), root: self.root.clone(),
+            directory: self.directory.try_clone().map_err(io_error)?,
+            device: self.device, inode: self.inode, claim: Mutex::new(()) }))
+    }
+    pub(crate) fn directory_identity(&self) -> (u64, u64) { (self.device, self.inode) }
     pub fn id(&self) -> &WorkspaceId {
         &self.id
+    }
+    /// Directory identity is distinct from the conversation journal owner after
+    /// a user changes the working folder. Only a verified native root supplies it.
+    pub(crate) fn canonical_id(&self) -> Result<WorkspaceId, DomainError> {
+        self.verify_root()?;
+        WorkspaceId::new(format!("ws-{:x}", Sha256::digest(
+            format!("{}:{}:{}", self.root.display(), self.device, self.inode).as_bytes()
+        )))
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -1118,6 +1142,45 @@ impl Workspace {
             .and_then(|_| target_parent.sync_all())
             .map_err(|_| DomainError::DurabilityUnknown)?;
         Ok(())
+    }
+    /// Publish a native-owned completed clone beside its staging name. No
+    /// replacement, cross-parent move or implicit directory merge is allowed.
+    pub(crate) fn publish_owned_directory_checked(&self,source:&Workspace,target:&str,parent:&PinnedDirectory,check:impl Fn()->Result<(),DomainError>)->Result<(),DomainError> {
+        let target=relative(target)?;
+        if target.parent().unwrap_or(Path::new(""))!=parent.relative_path()||source.root().parent()!=Some(self.root().join(parent.relative_path()).as_path()){return Err(DomainError::PermissionDenied);}
+        let _claim=self.claim()?;check()?;self.verify_root()?;parent.verify_identity()?;source.verify_root()?;
+        let name=source.root().file_name().ok_or(DomainError::PermissionDenied)?;
+        let current=beneath(&parent.directory,Path::new(name),OFlags::RDONLY|OFlags::DIRECTORY,Mode::empty())?.metadata().map_err(io_error)?;
+        if (current.dev(),current.ino())!=source.directory_identity(){return Err(DomainError::Conflict);}
+        rfs::renameat_with(&parent.directory,name,&parent.directory,target.file_name().unwrap(),rfs::RenameFlags::NOREPLACE).map_err(|e|if e==rustix::io::Errno::EXIST{DomainError::Conflict}else{errno(e)})?;
+        parent.directory.sync_all().map_err(|_|DomainError::DurabilityUnknown)?;
+        let published=beneath(&parent.directory,Path::new(target.file_name().unwrap()),OFlags::RDONLY|OFlags::DIRECTORY,Mode::empty()).map_err(|_|DomainError::DurabilityUnknown)?.metadata().map_err(|_|DomainError::DurabilityUnknown)?;
+        if (published.dev(),published.ino())!=source.directory_identity(){return Err(DomainError::DurabilityUnknown);}
+        check().map_err(|_|DomainError::DurabilityUnknown)?;parent.verify_identity().map_err(|_|DomainError::DurabilityUnknown)?;Ok(())
+    }
+    /// Flush a bounded, native-owned clone tree before publishing its name.
+    /// Symlink targets and special files are never opened or followed.
+    pub(crate) fn sync_owned_tree_checked(&self,check:impl Fn()->Result<(),DomainError>)->Result<(),DomainError> {
+        let mut pending=vec![PathBuf::new()];let mut directories=Vec::new();let mut count=0;
+        while let Some(path)=pending.pop(){
+            check()?;self.verify_root()?;
+            if path.components().count()>64{return Err(DomainError::LimitExceeded("clone tree depth".into()));}
+            let directory=if path.as_os_str().is_empty(){self.directory.try_clone().map_err(io_error)?}else{beneath(&self.directory,&path,OFlags::RDONLY|OFlags::DIRECTORY,Mode::empty())?};
+            for entry in rfs::Dir::read_from(&directory).map_err(errno)? {
+                check()?;let entry=entry.map_err(errno)?;let name=entry.file_name();if name.to_bytes()==b"."||name.to_bytes()==b".."{continue;}
+                count+=1;if count>20000{return Err(DomainError::LimitExceeded("clone tree entries".into()));}
+                let name=std::ffi::OsStr::from_bytes(name.to_bytes());
+                let stat=rfs::statat(&directory,name,rfs::AtFlags::SYMLINK_NOFOLLOW).map_err(errno)?;
+                match rfs::FileType::from_raw_mode(stat.st_mode){
+                    rfs::FileType::Directory=>pending.push(path.join(name)),
+                    rfs::FileType::RegularFile=>{beneath(&directory,Path::new(name),OFlags::RDONLY,Mode::empty())?.sync_all().map_err(io_error)?;},
+                    rfs::FileType::Symlink=>{},_=>return Err(DomainError::PermissionDenied),
+                }
+            }
+            directories.push(directory);
+        }
+        for directory in directories.into_iter().rev(){check()?;directory.sync_all().map_err(io_error)?;}
+        self.verify_root()
     }
     /// Non-Git fallback scan. Git repositories should pass GitService::files() to index_paths().
     pub fn scan(&self, cap: usize) -> Result<Vec<String>, DomainError> {

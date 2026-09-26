@@ -1,0 +1,325 @@
+{
+  "name": "ngram-control-0",
+  "config": {
+    "name": "ngram-control-0",
+    "flags": {
+      "--batch-size": 1024,
+      "--ubatch-size": 1024
+    },
+    "workloads": [
+      "ag1_code",
+      "ag1_edit"
+    ],
+    "repetitions": 1,
+    "n_predict": 512
+  },
+  "requests": [
+    {
+      "workload": "ag1_code",
+      "repeat": 0,
+      "ttft_seconds": 3.5751401130000886,
+      "wall_seconds": 11.42132159600078,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 6274,
+        "prompt_ms": 3572.885,
+        "prompt_per_token_ms": 0.5694748167038572,
+        "prompt_per_second": 1756.0039016089238,
+        "predicted_n": 512,
+        "predicted_ms": 7845.714,
+        "predicted_per_token_ms": 15.32366015625,
+        "predicted_per_second": 65.25856027889877
+      },
+      "output": "### Review of AG1 Local-Model Loading Implementation\n\nThe provided source files (`lifecycle.rs`, `model_loading.rs`, and `ModelLoadControl.tsx`) implement a robust, state-machine-driven approach to loading local LLM models. The architecture separates the low-level process lifecycle management from the high-level command admission logic, ensuring that model loading is atomic, observable, and safe for concurrent access.\n\n#### Cancellation and Admission Behavior\n\n**Admission Control (`model_loading.rs`):**\nThe system employs a strict admission gate to prevent race conditions during model loading. The `load_local_model` function uses `self.store.admit_client_command` to create a durable, idempotent entry for the load operation. This ensures that if a client retries a load request (e.g., due to a network glitch), the system recognizes the existing pending operation and returns the current status rather than initiating a second, conflicting load. This is critical for maintaining a single active model instance.\n\nFurthermore, the system respects a shared generation scheduler. The `load_local_model` function explicitly waits for any active generation permits to be released (`scheduler.start` loop). This prevents a model load from interrupting an ongoing inference, which could lead to memory corruption or undefined behavior in the underlying `llama.cpp` process. The 900-second (15-minute) deadline for acquiring a scheduler slot provides a generous window for long-running generations to complete before the load attempt is aborted.\n\n**Cancellation (`lifecycle.rs`):**\nCancellation is handled via the `RuntimeController`. If a load times out (`timeout_loading`) or fails verification, the controller calls `stop_owned_runtime`. This method transitions the state to `Stopping`, invokes the host's `stop` method (which waits for verified exit), and then resets the state to `Inspect`. The `reap_exited_owned_runtime` function ensures that if a process dies unexpectedly, the controller cleans up the handle before allowing new operations, preventing \"zombie\" handles from blocking future loads.\n\n#### Readiness Checks and Progress Reporting\n\n**Readiness (`lifecycle.rs`):**\nReadiness is determined by the `poll_ready` method, which relies on the `RuntimeHost::observe` trait method. The `ModelIdentity` struct plays a key role here: it verifies that the loaded model's path, alias, context window, and vision capabilities match the `LaunchPlan`. This prevents a scenario where a different model is loaded than requested. The system distinguishes between \"alive\" (process exists)",
+      "prompt_tokens": 6274,
+      "prompt_sha256": "b2b9b8e1e4214adba3c2bf69ecb12db43ce4b7cbabc884a17dd645a46bb4837b",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 98.0,
+          "max": 100.0
+        },
+        "gpu_memory_pct": {
+          "median": 30.5,
+          "max": 43.0
+        },
+        "vram_mib": {
+          "median": 15680.0,
+          "max": 15684.0
+        },
+        "rss_mib": {
+          "median": 10877.265625,
+          "max": 10940.609375
+        },
+        "cpu_pct": {
+          "median": 98.95840962721346,
+          "max": 101.84994067641095
+        },
+        "gpu_temp": {
+          "median": 52.5,
+          "max": 60.0
+        },
+        "gpu_watts": {
+          "median": 143.52499999999998,
+          "max": 161.57
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 20709643.0,
+          "max": 25090478
+        },
+        "pcie_tx_kibs": {
+          "median": 2097631.5,
+          "max": 2760107
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 43.5,
+          "max": 46.0
+        },
+        "gpu_memory_pct": {
+          "median": 32.0,
+          "max": 34.0
+        },
+        "vram_mib": {
+          "median": 15692.0,
+          "max": 15692.0
+        },
+        "rss_mib": {
+          "median": 11048.8984375,
+          "max": 11048.8984375
+        },
+        "cpu_pct": {
+          "median": 1184.1111329647943,
+          "max": 1200.6727882136497
+        },
+        "gpu_temp": {
+          "median": 51.0,
+          "max": 52.0
+        },
+        "gpu_watts": {
+          "median": 123.81,
+          "max": 135.81
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 103125.0,
+          "max": 106640
+        },
+        "pcie_tx_kibs": {
+          "median": 88549.5,
+          "max": 143115
+        }
+      },
+      "stop_type": "limit",
+      "memory_snapshot_kib": {
+        "Rss": 11315996,
+        "Pss": 11269368,
+        "Pss_Dirty": 11066596,
+        "Pss_Anon": 664424,
+        "Pss_File": 265256,
+        "Pss_Shmem": 10339688,
+        "Shared_Clean": 82544,
+        "Shared_Dirty": 0,
+        "Private_Clean": 166856,
+        "Private_Dirty": 11066596,
+        "Referenced": 11315996,
+        "Anonymous": 664424,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 401408,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    },
+    {
+      "workload": "ag1_edit",
+      "repeat": 0,
+      "ttft_seconds": 0.5957510840016766,
+      "wall_seconds": 14.836866439000005,
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 1015,
+        "prompt_ms": 557.86,
+        "prompt_per_token_ms": 0.5496157635467981,
+        "prompt_per_second": 1819.4529093320905,
+        "predicted_n": 938,
+        "predicted_ms": 14240.992,
+        "predicted_per_token_ms": 15.182294243070363,
+        "predicted_per_second": 65.86619808507722
+      },
+      "output": "import { useEffect, useState } from \"react\";\nimport { Check, Download, LoaderCircle } from \"lucide-react\";\nimport type { Model } from \"./bridge\";\nimport \"./modelLoading.css\";\nexport type ModelPreparation = { model: string; phase: string; percent?: number; started_at?: number; error?: string };\nexport type PendingModelLoad = { model: string; started_at: number };\nconst labels: Record<string, string> = { verifying: \"Checking model files\", releasing: \"Releasing previous model\", loading: \"Loading model\", initializing: \"Initializing model\", warming: \"Warming up\", queued: \"Waiting for GPU availability\" };\nexport function modelPreparing(value?: ModelPreparation | null) { return !!value && value.phase in labels; }\nexport function ModelLoadControl({ model, progress, pending, disabled, load }: { model?: Model; progress?: ModelPreparation | null; pending: PendingModelLoad | null; disabled: boolean; load: () => void }) {\n  const [now, setNow] = useState(Date.now);\n  const active = modelPreparing(progress);\n  const waiting = !!pending && (!progress || progress.model !== pending.model || (progress.started_at ?? 0) < pending.started_at);\n  const phase = waiting ? \"queued\" : active ? progress!.phase : undefined;\n  const started = waiting ? pending!.started_at : progress?.started_at;\n  useEffect(() => { if (!phase) return; setNow(Date.now()); const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, [phase, started]);\n  if (model?.provider !== \"llamacpp\" && !phase) return null;\n  const selectedReady = progress?.phase === \"ready\" && progress.model === model?.id && !pending;\n  const percent = !waiting && phase && typeof progress?.percent === \"number\" && Number.isFinite(progress.percent) ? Math.max(0, Math.min(100, Math.floor(progress.percent))) : undefined;\n  const label = phase ? labels[phase] : selectedReady ? \"Loaded\" : progress?.phase === \"failed\" && progress.model === model?.id ? \"Load failed\" : \"\";\n  const seconds = started ? Math.max(0, Math.floor((now - started) / 1000)) : 0;\n  const elapsed = seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;\n  const switchModel = progress?.phase === \"ready\" && progress.model !== model?.id;\n  return <div className=\"model-load-control\">\n    {(phase || label) && <span className=\"model-load-state\" title={phase ? (waiting ? pending!.model : progress?.model) : progress?.error || model?.id}>\n      {phase ? percent !== undefined ? <svg className=\"model-load-ring\" viewBox=\"0 0 24 24\" role=\"progressbar\" aria-label={label} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><circle className=\"model-load-track\" cx=\"12\" cy=\"12\" r=\"9\" /><circle cx=\"12\" cy=\"12\" r=\"9\" pathLength=\"100\" strokeDasharray={`${percent} 100`} transform=\"rotate(-90 12 12)\" /></svg> : <LoaderCircle size={16} className=\"model-load-spinner\" aria-hidden=\"true\" /> : selectedReady ? <Check size={14} aria-hidden=\"true\" /> : null}\n      <span role=\"status\">{label}{percent !== undefined ? ` \u00b7 ${percent}%` : \"\"}</span>\n      {phase && started && <span className=\"model-load-elapsed\" aria-hidden=\"true\">{elapsed}</span>}\n    </span>}\n    {!phase && !selectedReady && model?.provider === \"llamacpp\" && <button type=\"button\" className=\"model-load-button\" disabled={disabled || !!pending || !!model.conflict} onClick={load} title=\"Load the selected model without sending a message\"><Download size={14} aria-hidden=\"true\" />{switchModel ? \"Switch & load\" : \"Load\"}</button>}\n  </div>;\n}",
+      "prompt_tokens": 1015,
+      "prompt_sha256": "63a3f54b1da65e3ddf8cae31a5be4e900ad63d373dfb56ff2b9a0ab38fdd1392",
+      "prefill_resources": {
+        "gpu_pct": {
+          "median": 55.0,
+          "max": 55.0
+        },
+        "gpu_memory_pct": {
+          "median": 7.0,
+          "max": 7.0
+        },
+        "vram_mib": {
+          "median": 15692.0,
+          "max": 15692.0
+        },
+        "rss_mib": {
+          "median": 11182.3046875,
+          "max": 11182.3046875
+        },
+        "cpu_pct": {
+          "median": 425.9795037941208,
+          "max": 425.9795037941208
+        },
+        "gpu_temp": {
+          "median": 50.0,
+          "max": 50.0
+        },
+        "gpu_watts": {
+          "median": 114.58,
+          "max": 114.58
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 20692187,
+          "max": 20692187
+        },
+        "pcie_tx_kibs": {
+          "median": 2422167,
+          "max": 2422167
+        }
+      },
+      "decode_resources": {
+        "gpu_pct": {
+          "median": 42.0,
+          "max": 77.0
+        },
+        "gpu_memory_pct": {
+          "median": 32.0,
+          "max": 38.0
+        },
+        "vram_mib": {
+          "median": 15692.0,
+          "max": 15692.0
+        },
+        "rss_mib": {
+          "median": 11245.1328125,
+          "max": 11245.1328125
+        },
+        "cpu_pct": {
+          "median": 1189.716985040636,
+          "max": 1199.3331402573838
+        },
+        "gpu_temp": {
+          "median": 50.0,
+          "max": 52.0
+        },
+        "gpu_watts": {
+          "median": 118.72,
+          "max": 132.66
+        },
+        "sm_mhz": {
+          "median": 2895.0,
+          "max": 2895.0
+        },
+        "pcie_rx_kibs": {
+          "median": 110058,
+          "max": 141406
+        },
+        "pcie_tx_kibs": {
+          "median": 128369,
+          "max": 147021
+        }
+      },
+      "stop_type": "eos",
+      "quality_pass": true,
+      "memory_snapshot_kib": {
+        "Rss": 11517148,
+        "Pss": 11470520,
+        "Pss_Dirty": 11267748,
+        "Pss_Anon": 865576,
+        "Pss_File": 265256,
+        "Pss_Shmem": 10339688,
+        "Shared_Clean": 82544,
+        "Shared_Dirty": 0,
+        "Private_Clean": 166856,
+        "Private_Dirty": 11267748,
+        "Referenced": 11517148,
+        "Anonymous": 865576,
+        "KSM": 0,
+        "LazyFree": 0,
+        "AnonHugePages": 600064,
+        "ShmemPmdMapped": 0,
+        "FilePmdMapped": 86016,
+        "Shared_Hugetlb": 0,
+        "Private_Hugetlb": 0,
+        "Swap": 0,
+        "SwapPss": 0,
+        "Locked": 0
+      }
+    }
+  ],
+  "started_at": "2026-09-14T02:13:39Z",
+  "load_seconds": 6.915130797999154,
+  "status": "passed",
+  "load_resources": {
+    "gpu_pct": {
+      "median": 1.0,
+      "max": 71.0
+    },
+    "gpu_memory_pct": {
+      "median": 1.0,
+      "max": 3.0
+    },
+    "vram_mib": {
+      "median": 12864.0,
+      "max": 15618.0
+    },
+    "rss_mib": {
+      "median": 7699.69921875,
+      "max": 10737.21875
+    },
+    "cpu_pct": {
+      "median": 100.09137563467786,
+      "max": 186.38689277236605
+    },
+    "gpu_temp": {
+      "median": 47.0,
+      "max": 48.0
+    },
+    "gpu_watts": {
+      "median": 48.15,
+      "max": 59.1
+    },
+    "sm_mhz": {
+      "median": 2640.0,
+      "max": 2895.0
+    },
+    "pcie_rx_kibs": {
+      "median": 24169,
+      "max": 16271582
+    },
+    "pcie_tx_kibs": {
+      "median": 6689,
+      "max": 1814013
+    }
+  },
+  "peak_vram_mib": 15692.0,
+  "peak_rss_mib": 11245.1328125,
+  "exit_code": 0
+}

@@ -28,6 +28,22 @@ fn request(stream: &mut TcpStream) -> String {
         bytes.extend_from_slice(&buffer[..count]);
         assert!(bytes.len() < 32768);
     }
+    let header_end = bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+    let headers = String::from_utf8_lossy(&bytes[..header_end]);
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        })
+        .unwrap_or(0);
+    assert!(length <= 32768);
+    while bytes.len() < header_end + length {
+        let count = stream.read(&mut buffer).unwrap();
+        assert!(count > 0);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
     String::from_utf8(bytes).unwrap()
 }
 fn server(
@@ -753,7 +769,7 @@ fn approved_fetch_persists_full_untrusted_evidence_and_replays_without_network()
 }
 
 #[tokio::test]
-async fn compressed_entities_are_bounded_after_decoding_and_match_reference_projections() {
+async fn compressed_entities_preserve_reference_bytes_and_expose_bounded_source_excerpts() {
     let _case = WEB_CASE.lock().await;
     use ag1_core::tools::research;
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -813,10 +829,42 @@ async fn compressed_entities_are_bounded_after_decoding_and_match_reference_proj
                 None,
             )
             .unwrap();
+            // Frozen transport oracle remains intact. Extraction intentionally
+            // adds source passages and measures truncation against their budget.
+            let actual = &projected.result;
+            for field in [
+                "url",
+                "finalUrl",
+                "statusCode",
+                "contentType",
+                "cacheHit",
+                "facts",
+                "preview",
+                "authoritative",
+                "status",
+            ] {
+                assert_eq!(
+                    actual["details"][field], row["output"]["details"][field],
+                    "decoded field {field}, case {index}"
+                );
+            }
+            let text = actual["content"][0]["text"].as_str().unwrap();
+            let excerpt = text
+                .split_once("Source excerpt (untrusted page content):\n")
+                .unwrap()
+                .1;
+            assert!(excerpt.chars().count() <= 12000);
             assert_eq!(
-                projected.result, row["output"],
-                "decoded projection {index}"
+                actual["details"]["extractedChars"],
+                serde_json::json!(String::from_utf8_lossy(&response.bytes).chars().count())
             );
+            if String::from_utf8_lossy(&response.bytes).chars().count() <= 12000 {
+                assert_eq!(excerpt, String::from_utf8_lossy(&response.bytes));
+                assert_eq!(actual["details"]["truncated"], false);
+            } else {
+                assert_eq!(actual["details"]["truncated"], true);
+                assert!(excerpt.contains("Excerpt incomplete"));
+            }
         }
         task.join().unwrap();
     }
@@ -1173,7 +1221,7 @@ async fn selected_fetch_content_types_docs_hints_and_complete_event_coverage_rea
                     json!(["date", "actor", "mechanism", "impact", "response"])
                 );
                 assert_eq!(result["details"]["coverage"]["missing"], json!([]));
-                assert!(text.contains("Coverage complete for a brief current-events answer."));
+                assert!(text.contains("Coverage describes this extract only; it does not establish completion of the active task or independently verify the source's claims."));
                 assert!(!text.contains("Reuse this URL as the source reference"));
             }
             _ => unreachable!(),
@@ -1195,9 +1243,9 @@ async fn selected_search_default_missing_brave_key_and_positive_lite_fallback_ex
         let fixture = ToolFixture::new();
         let (port, task) = server(if fallback { 2 } else { 1 }, move |index, request| {
             assert!(request.starts_with(if index == 0 {
-                "GET /html?"
+                "POST /html "
             } else {
-                "GET /lite?"
+                "POST /lite "
             }));
             if fallback && index == 0 {
                 return ok(b"No results");
@@ -1222,6 +1270,7 @@ async fn selected_search_default_missing_brave_key_and_positive_lite_fallback_ex
                 mode: mode.into(),
                 brave: None,
                 endpoints: SearchEndpoints {
+                    web: None,
                     html: format!("{origin}/html"),
                     lite: format!("{origin}/lite"),
                     ..SearchEndpoints::default()
@@ -1302,7 +1351,7 @@ async fn native_brave_search_sends_only_host_supplied_https_key_and_retains_prov
         let request = input.to_lowercase();
         assert!(request.contains("x-subscription-token: fixture-key"));
         assert!(request.contains("accept: application/json"));
-        assert!(input.starts_with("GET /search?q=React%20parameter%20official%20docs&count=3 "));
+        assert!(input.starts_with("GET /search?q=React%20parameter%20official%20docs&count=20 "));
         let body=json!({"web":{"results":[{"title":"React parameter reference","url":"https://react.dev/reference/react/useEffect","description":"The setup parameter returns a cleanup function."}]}}).to_string();
         let mut response = ok(body.as_bytes());
         let text = String::from_utf8(response)
@@ -1326,6 +1375,7 @@ async fn native_brave_search_sends_only_host_supplied_https_key_and_retains_prov
         SearchConfig {
             mode: "auto".into(),
             endpoints: SearchEndpoints {
+                web: None,
                 brave: format!("{origin}/search"),
                 ..SearchEndpoints::default()
             },
@@ -1391,18 +1441,18 @@ async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executa
     };
     use serde_json::json;
     let fixture = ToolFixture::new();
-    let (port, task) = server(6, |index, input| {
+    let (port, task) = server(5, |index, input| {
         assert!(input.to_lowercase().contains("user-agent: mozilla/5.0"));
         assert!(
             input
                 .to_lowercase()
                 .contains("accept: text/html,application/xhtml+xml")
         );
-        if index < 2 {
-            assert!(input.starts_with("GET /html?"));
+        if index == 0 {
+            assert!(input.starts_with("POST /html "));
             ok(b"<a class=\"result__a\" href=\"https://react.dev/reference/item\">React API</a><a class=\"result__snippet\">The parameter returns a useful value.</a><a class=\"result__a\" href=\"https://react.dev/learn/other\">Other API</a><a class=\"result__snippet\">Another useful source.</a>")
         } else {
-            ok(b"No fixture results")
+            ok(b"<div class=no-results>No results found</div>")
         }
     });
     let origin = format!("http://127.0.0.1:{port}");
@@ -1420,6 +1470,7 @@ async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executa
         SearchConfig {
             mode: "serpapi".into(),
             endpoints: SearchEndpoints {
+                web: None,
                 html: format!("{origin}/html"),
                 lite: format!("{origin}/lite"),
                 ..SearchEndpoints::default()
@@ -1431,7 +1482,7 @@ async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executa
     .unwrap();
     for (operation, query, max, now, cache, count) in [
         ("one", "React parameter", 1, 12, false, 1),
-        ("more", "React parameter", 3, 13, false, 2),
+        ("more", "React parameter", 3, 13, true, 2),
         ("cached", "React parameter", 3, 14, true, 2),
         ("empty", "Unknown search fixture", 3, 15, false, 0),
         ("empty-cached", "Unknown search fixture", 3, 59999, true, 0),
@@ -1486,9 +1537,9 @@ async fn native_search_fallback_order_cache_dimensions_and_empty_ttl_are_executa
         );
     }
     let requests = task.join().unwrap();
-    assert_eq!(requests.len(), 6);
-    assert!(requests[3].starts_with("GET /lite?"));
-    assert!(requests[5].starts_with("GET /lite?"));
+    assert_eq!(requests.len(), 5);
+    assert!(requests[2].starts_with("POST /lite "));
+    assert!(requests[4].starts_with("POST /lite "));
 }
 
 #[tokio::test]
@@ -1608,6 +1659,7 @@ fn active_search_cancellation_commits_one_no_effect_outcome_without_late_hints_o
         SearchConfig {
             mode: "duckduckgo".into(),
             endpoints: SearchEndpoints {
+                web: None,
                 html: format!("{origin}/html"),
                 lite: format!("{origin}/lite"),
                 ..SearchEndpoints::default()
@@ -1768,4 +1820,753 @@ async fn named_web_credentials_reject_unknown_and_foreign_hosts_before_dns_witho
         assert_eq!(result["details"].get("error").is_some(), id != "allowed");
     }
     assert_eq!(task.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn duckduckgo_challenge_stops_network_retries_and_preserves_raw_evidence() {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::tools::research;
+    use ag1_platform::web_tools::{
+        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
+    };
+    use serde_json::json;
+    let fixture = ToolFixture::new();
+    let (port, task) = server(1, |_, _| {
+        let body = include_bytes!("../../ag1-core/tests/fixtures/duckduckgo-challenge.html");
+        let mut out=format!("HTTP/1.1 202 Accepted\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).into_bytes();
+        out.extend(body);
+        out
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let web = Arc::new(
+        WebService::new(
+            WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap()),
+            fixture.scope.clone(),
+            "challenge-web",
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let search = SearchService::new(
+        web,
+        SearchConfig {
+            mode: "duckduckgo".into(),
+            brave: None,
+            endpoints: SearchEndpoints {
+                web: None,
+                html: format!("{origin}/html"),
+                lite: format!("{origin}/lite"),
+                ..Default::default()
+            },
+        },
+        "challenge-search",
+    )
+    .unwrap();
+    for (index, query) in [
+        "Python documentation",
+        "A different query",
+        "Python documentation",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = format!("challenge-{index}");
+        let ticket = fixture.ticket(
+            &id,
+            "webSearch",
+            json!({"query":query}),
+            search.target_revision(),
+            12,
+        );
+        let mut artifacts = fixture.artifacts(&id);
+        let (_source, mut cancel) = cancellation();
+        let result = search
+            .execute(
+                ticket,
+                WebExecution {
+                    registry: &fixture.registry,
+                    scope: &fixture.scope,
+                    policy_revision: 1,
+                    now: || 12,
+                    deadline: Instant::now() + Duration::from_secs(3),
+                    cancel: &mut cancel,
+                    profile: research::profile(50000., 4.),
+                },
+                2026,
+                &mut artifacts,
+            )
+            .await
+            .unwrap()
+            .result;
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["details"]["status"], "blocked");
+        assert_eq!(result["details"]["resultCount"], 0);
+        assert_eq!(
+            result["details"]["searchAttempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        if index == 0 {
+            assert_eq!(
+                result["details"]["networkEvidence"]["artifactIds"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        if index == 2 {
+            // Failed searches are not cached as successful retrievals. Cooldown still prevents requests.
+            assert_eq!(result["details"]["cacheHit"], false);
+        }
+    }
+    assert_eq!(task.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn duckduckgo_unknown_html_uses_actual_lite_markup_and_preserves_query() {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::tools::research;
+    use ag1_platform::web_tools::{
+        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
+    };
+    use serde_json::json;
+    assert_eq!(
+        SearchEndpoints::default().lite,
+        "https://lite.duckduckgo.com/lite/"
+    );
+    let fixture = ToolFixture::new();
+    let (port, task) = server(2, |i, request| {
+        assert!(request.contains("q=site%3Aexample.org+Retry"));
+        assert!(!request.contains("official"));
+        if i == 0 {
+            assert!(request.starts_with("POST /html "));
+            return ok(b"<html><body>Unexpected service page</body></html>");
+        }
+        assert!(request.starts_with("POST /lite "));
+        ok(br#"<table><tr><td><a href="https://example.org/retry" class="result-link">Retry documentation</a></td></tr><tr><td class="result-snippet">Retry parameters and allowed methods.</td></tr></table>"#)
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let web = Arc::new(
+        WebService::new(
+            WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap()),
+            fixture.scope.clone(),
+            "lite-web",
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let search = SearchService::new(
+        web,
+        SearchConfig {
+            mode: "duckduckgo".into(),
+            brave: None,
+            endpoints: SearchEndpoints {
+                web: None,
+                html: format!("{origin}/html"),
+                lite: format!("{origin}/lite"),
+                ..Default::default()
+            },
+        },
+        "lite-search",
+    )
+    .unwrap();
+    let ticket = fixture.ticket(
+        "lite",
+        "webSearch",
+        json!({"query":"site:example.org Retry"}),
+        search.target_revision(),
+        12,
+    );
+    let mut artifacts = fixture.artifacts("lite");
+    let (_source, mut cancel) = cancellation();
+    let result = search
+        .execute(
+            ticket,
+            WebExecution {
+                registry: &fixture.registry,
+                scope: &fixture.scope,
+                policy_revision: 1,
+                now: || 12,
+                deadline: Instant::now() + Duration::from_secs(3),
+                cancel: &mut cancel,
+                profile: research::profile(50000., 4.),
+            },
+            2026,
+            &mut artifacts,
+        )
+        .await
+        .unwrap()
+        .result;
+    assert_ne!(result["isError"], true);
+    assert_eq!(
+        result["details"]["searchAttempts"][0]["status"],
+        "parse_error"
+    );
+    assert_eq!(result["details"]["searchProvider"], "duckduckgo-lite");
+    assert_eq!(result["details"]["resultCount"], 1);
+    assert_eq!(
+        result["details"]["results"][0]["snippet"],
+        "Retry parameters and allowed methods."
+    );
+    assert_eq!(task.join().unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "Explicit bounded live DuckDuckGo probe; no model or desktop needed"]
+async fn duckduckgo_live_search_checkpoint() {
+    run_duckduckgo_live_queries(&[
+        "site:urllib3.readthedocs.io Retry allowed_methods",
+        "Rust ownership borrowing documentation",
+        "Norway public transport Oslo",
+    ])
+    .await;
+}
+#[tokio::test]
+#[ignore = "Explicit eight-query web-flow quality probe; no model or desktop needed"]
+async fn duckduckgo_web_live_quality() {
+    run_duckduckgo_live_queries(&[
+        "site:urllib3.readthedocs.io Retry allowed_methods",
+        "Rust ownership borrowing documentation",
+        "Oslo public transport tickets Ruter",
+        "site:docs.python.org free threading Python GIL",
+        "site:postgresql.org docs jsonb indexing GIN",
+        "\"sqlite3_prepare_v3\" \"SQLITE_PREPARE_PERSISTENT\"",
+        "site:esa.int news September 2026",
+        "\"ag1_nonexistent_search_control_zxqv719824610\"",
+    ])
+    .await;
+}
+#[tokio::test]
+#[ignore = "Explicit final fresh-query checkpoint; no model or desktop needed"]
+async fn duckduckgo_web_live_final() {
+    run_duckduckgo_live_queries(&[
+        "site:docs.python.org asyncio TaskGroup cancellation",
+        "site:nodejs.org fetch AbortSignal timeout",
+        "site:sqlite.org WAL checkpoint busy",
+        "site:git-scm.com git worktree add detach",
+        "Oslo airport train Vy Flytoget",
+        "site:esa.int Earth observation Sentinel 2026",
+        "\"ag1_nonexistent_search_control_zxqv719824610\"",
+    ])
+    .await;
+}
+async fn run_duckduckgo_live_queries(queries: &[&str]) {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::tools::research;
+    use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
+    use serde_json::json;
+    let fixture = ToolFixture::new();
+    let web = Arc::new(
+        WebService::new(
+            WebHttp::new(WebPolicy::default()),
+            fixture.scope.clone(),
+            "live-web",
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let search = SearchService::new(web, SearchConfig::default(), "live-search").unwrap();
+    let mut results = vec![];
+    let mut responses = vec![];
+    for (index, query) in queries.iter().copied().enumerate() {
+        let started = Instant::now();
+        let id = format!("live-{index}");
+        let ticket = fixture.ticket(
+            &id,
+            "webSearch",
+            json!({"query":query,"maxResults":4}),
+            search.target_revision(),
+            12,
+        );
+        let mut artifacts = fixture.artifacts(&id);
+        let (_source, mut cancel) = cancellation();
+        let mut result = search
+            .execute(
+                ticket,
+                WebExecution {
+                    registry: &fixture.registry,
+                    scope: &fixture.scope,
+                    policy_revision: 1,
+                    now: || 12,
+                    deadline: Instant::now() + Duration::from_secs(20),
+                    cancel: &mut cancel,
+                    profile: research::profile(90000., 0.),
+                },
+                2026,
+                &mut artifacts,
+            )
+            .await
+            .unwrap()
+            .result;
+        use ag1_core::{context::ContextArtifactPort, tools::executor::ExecutionArtifacts};
+        for id in result["details"]["networkEvidence"]["artifactIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
+        }
+        result["details"]["probeElapsedMs"] = json!(started.elapsed().as_millis());
+        let blocked = result["details"]["status"] == "blocked";
+        results.push(result);
+        if blocked {
+            break;
+        }
+    }
+    println!(
+        "LIVE_SEARCH_RESULTS={}",
+        serde_json::to_string(&results).unwrap()
+    );
+    println!(
+        "LIVE_SEARCH_RESPONSES={}",
+        serde_json::to_string(&responses).unwrap()
+    );
+    assert!(!results.is_empty());
+    for r in results {
+        if r["details"]["status"] == "blocked" {
+            assert_eq!(r["isError"], true);
+            assert_eq!(r["details"]["resultCount"], 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn duckduckgo_form_submission_encodes_terms_and_obeys_redirect_methods() {
+    let _case = WEB_CASE.lock().await;
+    for status in [303, 307] {
+        let (port, task) = server(2, move |i, req| {
+            if i == 0 {
+                assert!(req.starts_with("POST /html/ HTTP/1.1"));
+                assert!(
+                    req.to_lowercase()
+                        .contains("content-type: application/x-www-form-urlencoded")
+                );
+                assert!(req.contains("referer: http://127.0.0.1:"));
+                assert!(req.ends_with("q=site%3Aexample.org+%22a%2Bb%22+%26+c&b="));
+                return format!("HTTP/1.1 {status} Redirect\r\nLocation: /results\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
+            }
+            if status == 303 {
+                assert!(req.starts_with("GET /results HTTP/1.1"));
+                assert!(!req.contains("q="));
+            } else {
+                assert!(req.starts_with("POST /results HTTP/1.1"));
+                assert!(req.ends_with("q=site%3Aexample.org+%22a%2Bb%22+%26+c&b="));
+            }
+            ok(b"results")
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let http = WebHttp::new(WebPolicy::with_private_origins(&[origin.clone()]).unwrap());
+        let logical = format!("{origin}/html/?q=site%3Aexample.org%20%22a%2Bb%22%20%26%20c");
+        let (_source, mut cancel) = cancellation();
+        let r = http
+            .fetch_for(
+                &logical,
+                None,
+                WebPurpose::SearchHtml,
+                Instant::now() + Duration::from_secs(3),
+                &mut cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.requested_url, logical);
+        assert_eq!(r.final_url, format!("{origin}/results"));
+        assert_eq!(task.join().unwrap().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn duckduckgo_form_body_is_never_forwarded_to_a_different_origin() {
+    let _case = WEB_CASE.lock().await;
+    let (port, task) = server(1, |_, _| {
+        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9/collect\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let http = WebHttp::new(
+        WebPolicy::with_private_origins(&[origin.clone(), "http://127.0.0.1:9".into()]).unwrap(),
+    );
+    let (_source, mut cancel) = cancellation();
+    assert_eq!(
+        http.fetch_for(
+            &format!("{origin}/html/?q=private-query"),
+            None,
+            WebPurpose::SearchHtml,
+            Instant::now() + Duration::from_secs(3),
+            &mut cancel
+        )
+        .await
+        .err(),
+        Some(DomainError::PermissionDenied)
+    );
+    assert_eq!(task.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn duckduckgo_web_flow_retains_all_hops_and_bounds_verification() {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::tools::research;
+    use ag1_platform::web_tools::{
+        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
+    };
+    use serde_json::json;
+    for blocked in [false, true] {
+        let fixture = ToolFixture::new();
+        let (port, task) = server(3, move |i, request| {
+            assert!(request.starts_with("GET "));
+            assert!(
+                request
+                    .to_lowercase()
+                    .contains("referer: https://noai.duckduckgo.com/")
+            );
+            match i {
+                0 => {
+                    assert!(request.starts_with("GET /landing?q=a%2Bb "));
+                    ok(b"<script id=deep_preload_script src='/d.js?q=a%2Bb&amp;dp=token'></script>")
+                }
+                1 => {
+                    assert!(request.starts_with("GET /d.js?q=a%2Bb&dp=token "));
+                    let body = "window.execDeep = function() { let jsa = 2; try { let Calc = function(num) {return num * 3;};jsa = Calc(jsa); } catch (e) { jsa = -1; } DDG.deep.initialize('/d.js?q=a%2Bb&dp=token&jsa_hash=hash&jsa=' + jsa, false); return {isJsaChallenge: true}; };";
+                    let mut bytes = format!(
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+                    bytes.extend(body.as_bytes());
+                    bytes
+                }
+                _ => {
+                    assert!(request.starts_with("GET /d.js?q=a%2Bb&dp=token&jsa_hash=hash&jsa=6 "));
+                    if blocked {
+                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    } else {
+                        ok(b"DDG.pageLayout.load('d',[{\"t\":\"Reference\",\"u\":\"https://example.org/reference\",\"a\":\"Useful result\"}]);")
+                    }
+                }
+            }
+        });
+        let origin = format!("http://127.0.0.1:{port}");
+        let web = Arc::new(
+            WebService::new(
+                WebHttp::new(
+                    WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap(),
+                ),
+                fixture.scope.clone(),
+                "web-flow",
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let search = SearchService::new(
+            web,
+            SearchConfig {
+                endpoints: SearchEndpoints {
+                    web: Some((format!("{origin}/landing"), format!("{origin}/d.js"))),
+                    html: format!("{origin}/html"),
+                    lite: format!("{origin}/lite"),
+                    ..SearchEndpoints::default()
+                },
+                ..SearchConfig::default()
+            },
+            "flow-search",
+        )
+        .unwrap();
+        for (i, query) in ["a+b", if blocked { "another query" } else { "a+b" }]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("flow-{i}");
+            let ticket = fixture.ticket(
+                &id,
+                "webSearch",
+                json!({"query":query}),
+                search.target_revision(),
+                12,
+            );
+            let mut artifacts = fixture.artifacts(&id);
+            let (_source, mut cancel) = cancellation();
+            let result = search
+                .execute(
+                    ticket,
+                    WebExecution {
+                        registry: &fixture.registry,
+                        scope: &fixture.scope,
+                        policy_revision: 1,
+                        now: || 12,
+                        deadline: Instant::now() + Duration::from_secs(3),
+                        cancel: &mut cancel,
+                        profile: research::profile(90000., 0.),
+                    },
+                    2026,
+                    &mut artifacts,
+                )
+                .await
+                .unwrap()
+                .result;
+            assert_eq!(
+                result["details"]["resultCount"],
+                if blocked { 0 } else { 1 }
+            );
+            if i == 0 {
+                assert_eq!(
+                    result["details"]["networkEvidence"]["artifactIds"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    3
+                );
+            }
+            if blocked {
+                assert_eq!(result["isError"], true);
+                assert_eq!(result["details"]["status"], "blocked");
+            } else {
+                assert_eq!(result["details"]["searchProvider"], "duckduckgo-web");
+                assert_eq!(result["details"]["cacheHit"], i > 0);
+            }
+        }
+        assert_eq!(task.join().unwrap().len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn duckduckgo_web_transport_rejects_redirect_before_contacting_target() {
+    let _case = WEB_CASE.lock().await;
+    let (port, task) = server(1, |_, _| {
+        b"HTTP/1.1 302 Found\r\nLocation: https://example.org/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec()
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let http =
+        WebHttp::new(WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap());
+    let (_source, mut cancel) = cancellation();
+    assert!(matches!(
+        http.fetch_for(
+            &format!("{origin}/d.js?q=test"),
+            None,
+            WebPurpose::SearchWeb,
+            Instant::now() + Duration::from_secs(3),
+            &mut cancel
+        )
+        .await,
+        Err(DomainError::PermissionDenied)
+    ));
+    assert_eq!(task.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn search_candidates_are_ranked_before_trimming_and_concurrent_counts_share_cache() {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::tools::research;
+    use ag1_platform::web_tools::{
+        SearchConfig, SearchEndpoints, SearchService, WebExecution, WebService,
+    };
+    use serde_json::json;
+    let fixture = ToolFixture::new();
+    let (port, task) = server(1, |_, _| {
+        std::thread::sleep(Duration::from_millis(50));
+        let mut body=(0..8).map(|i|format!("<div class=result><a class=result__a href='https://example.org/{i}'>Python tutorials</a><div class=result__snippet>General Python examples</div></div>")).collect::<String>();
+        body.push_str("<div class=result><a class=result__a href='https://docs.python.org/3/library/asyncio-task.html'>TaskGroup cancellation</a><div class=result__snippet>Python TaskGroup cancellation raises ExceptionGroup.</div></div>");
+        ok(body.as_bytes())
+    });
+    let origin = format!("http://127.0.0.1:{port}");
+    let web = Arc::new(
+        WebService::new(
+            WebHttp::new(WebPolicy::with_private_origins(std::slice::from_ref(&origin)).unwrap()),
+            fixture.scope.clone(),
+            "quality-web",
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let search = SearchService::new(
+        web,
+        SearchConfig {
+            mode: "duckduckgo".into(),
+            endpoints: SearchEndpoints {
+                web: None,
+                html: format!("{origin}/html"),
+                lite: format!("{origin}/lite"),
+                ..Default::default()
+            },
+            brave: None,
+        },
+        "quality-search",
+    )
+    .unwrap();
+    let run = |id: &'static str, max| {
+        let fixture = &fixture;
+        let search = &search;
+        async move {
+            let ticket = fixture.ticket(
+                id,
+                "webSearch",
+                json!({"query":"Python TaskGroup cancellation documentation","maxResults":max}),
+                search.target_revision(),
+                12,
+            );
+            let mut artifacts = fixture.artifacts(id);
+            let (_source, mut cancel) = cancellation();
+            search
+                .execute(
+                    ticket,
+                    WebExecution {
+                        registry: &fixture.registry,
+                        scope: &fixture.scope,
+                        policy_revision: 1,
+                        now: || 12,
+                        deadline: Instant::now() + Duration::from_secs(3),
+                        cancel: &mut cancel,
+                        profile: research::profile(90000., 0.),
+                    },
+                    2026,
+                    &mut artifacts,
+                )
+                .await
+                .unwrap()
+                .result
+        }
+    };
+    let (first, second) = tokio::join!(run("pool-one", 1), run("pool-four", 4));
+    assert_eq!(first["details"]["cacheHit"], false);
+    assert_eq!(second["details"]["cacheHit"], true);
+    assert_eq!(first["details"]["resultCount"], 1);
+    assert_eq!(second["details"]["resultCount"], 4);
+    for r in [&first, &second] {
+        assert_eq!(r["details"]["candidateCount"], 9);
+        assert_eq!(
+            r["details"]["results"][0]["url"],
+            "https://docs.python.org/3/library/asyncio-task.html"
+        );
+        assert_eq!(r["details"]["networkEvidence"]["trust"], "untrusted");
+    }
+    assert_eq!(
+        first["details"]["networkEvidence"],
+        second["details"]["networkEvidence"]
+    );
+    assert_eq!(task.join().unwrap().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "Explicit bounded search-to-page quality probe, no model or desktop"]
+async fn search_quality_live_research() {
+    let _case = WEB_CASE.lock().await;
+    use ag1_core::{
+        context::ContextArtifactPort,
+        tools::{executor::ExecutionArtifacts, research},
+    };
+    use ag1_platform::web_tools::{SearchConfig, SearchService, WebExecution, WebService};
+    use serde_json::json;
+    let fixture = ToolFixture::new();
+    let web = Arc::new(
+        WebService::new(
+            WebHttp::new(WebPolicy::default()),
+            fixture.scope.clone(),
+            "research-web",
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    let search =
+        SearchService::new(web.clone(), SearchConfig::default(), "research-search").unwrap();
+    let mut results = vec![];
+    let mut responses = vec![];
+    for (i, query) in [
+        "urllib3 Retry backoff_factor allowed_methods documentation",
+        "SQLite WAL checkpoint SQLITE_BUSY official documentation",
+        "Rust Iterator collect documentation",
+        "site:nodejs.org api AbortSignal timeout documentation",
+        "Oslo airport train Flytoget tickets",
+        "\"ag1-no-such-phrase-8cf271e9c4\"",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let id = format!("quality-{i}");
+        let ticket = fixture.ticket(
+            &id,
+            "webSearch",
+            json!({"query":query,"maxResults":4}),
+            search.target_revision(),
+            12,
+        );
+        let mut artifacts = fixture.artifacts(&id);
+        let (_source, mut cancel) = cancellation();
+        let started = Instant::now();
+        let mut result = search
+            .execute(
+                ticket,
+                WebExecution {
+                    registry: &fixture.registry,
+                    scope: &fixture.scope,
+                    policy_revision: 1,
+                    now: || 12,
+                    deadline: Instant::now() + Duration::from_secs(20),
+                    cancel: &mut cancel,
+                    profile: research::profile(90000., 0.),
+                },
+                2026,
+                &mut artifacts,
+            )
+            .await
+            .unwrap()
+            .result;
+        result["details"]["probeElapsedMs"] = json!(started.elapsed().as_millis());
+        for id in result["details"]["networkEvidence"]["artifactIds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+        {
+            responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
+        }
+        let mut fetched = serde_json::Value::Null;
+        if i < 4
+            && let Some(url) = result["details"]["results"][0]["url"].as_str()
+        {
+            let id = format!("read-{i}");
+            let ticket = fixture.ticket(
+                &id,
+                "webFetch",
+                json!({"url":url}),
+                web.target_revision(),
+                12,
+            );
+            let mut artifacts = fixture.artifacts(&id);
+            fetched = web
+                .execute(
+                    ticket,
+                    WebExecution {
+                        registry: &fixture.registry,
+                        scope: &fixture.scope,
+                        policy_revision: 1,
+                        now: || 12,
+                        deadline: Instant::now() + Duration::from_secs(20),
+                        cancel: &mut cancel,
+                        profile: research::profile(90000., 0.),
+                    },
+                    &mut artifacts,
+                )
+                .await
+                .unwrap()
+                .result;
+            if let Some(id) = fetched["details"]["networkEvidence"]["artifactId"].as_str() {
+                responses.push(artifacts.read_json(&artifacts.get(id).unwrap()).unwrap());
+            }
+        }
+        let blocked = result["details"]["status"] == "blocked";
+        results.push(json!({"search":result,"fetch":fetched}));
+        if blocked {
+            break;
+        }
+    }
+    println!(
+        "QUALITY_RESULTS={}",
+        serde_json::to_string(&results).unwrap()
+    );
+    println!(
+        "QUALITY_RESPONSES={}",
+        serde_json::to_string(&responses).unwrap()
+    );
 }

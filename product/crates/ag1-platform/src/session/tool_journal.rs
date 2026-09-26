@@ -80,7 +80,7 @@ pub struct ToolJournal {
     serial: Mutex<()>,
     events: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
     delegation_progress_pending: AtomicBool,
-    endpoint: String,
+    pub(super) endpoint: String,
     pub(super) isolated: tokio::sync::mpsc::UnboundedSender<super::tool_inference::Request>,
     controls: Mutex<Controls>,
     cancelled: Arc<AtomicBool>,
@@ -125,7 +125,7 @@ impl ToolJournal {
             &progress.last_action,
         );
         let _ = self.events.send(SessionEvent::Recovery(json!({
-            "type":"tool_execution_update", "toolName":"task", "toolCallId":call.call_id(),
+            "type":"tool_execution_update", "toolName":call.name(), "toolCallId":call.call_id(),
             "partialResult":{"content":[{"type":"text","text":line}],
                 "details":{"description":call.args()["description"],"type":call.args()["type"],
                     "state":"running","model":progress.model,"progress":progress}}
@@ -133,7 +133,7 @@ impl ToolJournal {
     }
     pub(super) fn event_dequeued(&self, event: &SessionEvent) {
         if matches!(event, SessionEvent::Recovery(value)
-            if value["type"] == "tool_execution_update" && value["toolName"] == "task")
+            if value["type"] == "tool_execution_update" && matches!(value["toolName"].as_str(), Some("task" | "explore")))
         {
             self.delegation_progress_pending
                 .store(false, Ordering::Release);
@@ -283,6 +283,15 @@ impl ToolJournal {
         }
         Ok(())
     }
+    /// Direct send-time check for an external capability. No journal read/copy or
+    /// mutation; the exact batch cancellation and live owner/epoch are authority.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn check_mcp_scope(&self, scope:&Scope) -> Result<(),DomainError> {
+        if self.cancelled.load(Ordering::Acquire) { return Err(DomainError::Cancelled); }
+        let book=self.book.lock().map_err(|_|DomainError::Conflict)?;
+        let state=self.state.lock().map_err(|_|DomainError::Conflict)?;
+        self.validate(scope,&book,&state)
+    }
     pub fn valid(&self) -> bool {
         self.book.lock().is_ok_and(|book| book.valid)
     }
@@ -361,7 +370,7 @@ impl ToolJournal {
         let book = self.book.lock().map_err(|_| DomainError::Conflict)?;
         let state = self.state.lock().map_err(|_| DomainError::Conflict)?;
         self.validate(scope, &book, &state)?;
-        let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?;
+        let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
         if call.origin() != Origin::BuiltIn
             || call.name() != "episode"
             || call.args()["action"] != "draft"
@@ -417,7 +426,7 @@ impl ToolJournal {
         let action = {
             let mut state = self.state.lock().map_err(|_| DomainError::Conflict)?;
             self.validate(scope, &book, &state)?;
-            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?;
+            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
             if call.origin() != Origin::BuiltIn
                 || pending.id != call.call_id()
                 || pending.name != call.name()
@@ -456,7 +465,7 @@ impl ToolJournal {
         let (action, result) = {
             let mut state = self.state.lock().map_err(|_| DomainError::Conflict)?;
             self.validate(scope, &book, &state)?;
-            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?;
+            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
             if call.origin() != Origin::BuiltIn
                 || pending.id != call.call_id()
                 || call.name() != name
@@ -480,7 +489,7 @@ impl ToolJournal {
         let _serial = self.serial.lock().map_err(|_| DomainError::Conflict)?;
         let mut book = self.book.lock().map_err(|_| DomainError::Conflict)?;
         let id = format!("{}-{}", self.result_prefix, book.published.len());
-        let message = json!({"role":"toolResult","toolCallId":outcome.record.call_id,"toolName":outcome.record.tool,"content":outcome.result["content"],"details":outcome.result["details"],"isError":outcome.result["isError"].as_bool().unwrap_or(false),"timestamp":outcome.record.finished_ms.unwrap_or(self.fallback_ms)});
+        let mut message = json!({"role":"toolResult","toolCallId":outcome.record.call_id,"toolName":outcome.record.tool,"content":outcome.result["content"],"details":outcome.result["details"],"isError":outcome.result["isError"].as_bool().unwrap_or(false),"timestamp":outcome.record.finished_ms.unwrap_or(self.fallback_ms)});
         let action = {
             let mut state = self.state.lock().map_err(|_| DomainError::Conflict)?;
             if !state.stamp().same_owner_epoch(&book.stamp) {
@@ -490,6 +499,15 @@ impl ToolJournal {
             // results still drain through the same current mutation owner.
             if state.stamp() != &book.stamp {
                 book.valid = false;
+            }
+            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?;
+            if pending.id != outcome.record.call_id { return Err(DomainError::Conflict); }
+            // Canonical receipts drive verification; providers receive the
+            // original advertised name paired with their original call ID.
+            message["toolName"] = json!(pending.name);
+            if pending.name != outcome.record.tool {
+                if !message["details"].is_object() { message["details"] = json!({}); }
+                message["details"]["nativeTool"] = json!(outcome.record.tool);
             }
             state.append_message(&id, &id, &self.timestamp, message)?
         };

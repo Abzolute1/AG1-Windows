@@ -1,0 +1,1 @@
+Done. In `services.json`, svc-047's `timeout_ms` changed from `450` → `875` (single-line edit, diff confirms only that line changed; formatting and all other values untouched). `verify.py` was not modified, and running it after the edit printed: **120 service records verified** (exit 0).

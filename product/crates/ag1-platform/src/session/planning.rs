@@ -54,7 +54,15 @@ pub(super) struct Turn {
 }
 impl Turn {
     fn visible(name: &str) -> bool {
-        !["write", "edit", "notebook_edit", "submit_plan"].contains(&name)
+        ![
+            "write",
+            "edit",
+            "append",
+            "editApply",
+            "notebook_edit",
+            "submit_plan",
+        ]
+        .contains(&name)
     }
     pub(super) fn names(&self, names: &[String]) -> Vec<String> {
         names
@@ -351,5 +359,18 @@ impl NativeSession {
             .state()?
             .update_plan(command, command, timestamp, plan, selection)?;
         self.commit(action, listener).await
+    }
+}
+
+#[cfg(test)]
+mod file_family_visibility_tests {
+    #[test]
+    fn planning_hides_every_native_file_mutation_and_keeps_preview() {
+        for name in ["write", "edit", "editApply", "append", "notebook_edit"] {
+            assert!(!super::Turn::visible(name), "{name}");
+        }
+        for name in ["read", "editPreview", "diff"] {
+            assert!(super::Turn::visible(name), "{name}");
+        }
     }
 }

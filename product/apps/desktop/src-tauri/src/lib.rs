@@ -1,4 +1,5 @@
 //! Tauri composition host. Rust owns lifecycle/catalog; the SDK owns agent state.
+pub mod themes;
 use ag1_platform::{
     process::{OwnedProcess, ProcessSpec, ProcessSupervisor},
     workspace::{WorkspaceService, preserve_text},
@@ -305,6 +306,7 @@ fn actor(mut process: OwnedProcess, rx: mpsc::Receiver<Control>, view: Arc<Mutex
 }
 
 pub struct Desktop {
+    pub github: github::GitHub,
     pub transition: tokio::sync::Mutex<()>,
     pub native: native_client::NativeClient,
     pub worker: Mutex<Option<Worker>>,
@@ -328,9 +330,14 @@ impl Desktop {
             .map_err(err)?;
         rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| "Desktop state already has a writer")?;
+        #[cfg(feature = "visual-test")]
+        let github = github_fixture::install(&state)?.unwrap_or_default();
+        #[cfg(not(feature = "visual-test"))]
+        let github = github::GitHub::default();
         Ok(Self {
+            github,
             transition: tokio::sync::Mutex::new(()),
-            native: native_client::NativeClient::from_environment()?,
+            native: native_client::NativeClient::from_desktop(&state, fixture)?,
             worker: Mutex::new(None),
             root,
             state,
@@ -463,16 +470,124 @@ impl Desktop {
         if path.exists() {
             serde_json::from_slice(&fs::read(path).map_err(err)?).map_err(err)
         } else {
-            Ok(json!({"projects":[],"theme":"system"}))
+            Ok(json!({"projects":[],"theme":"dark","chats":[]}))
         }
     }
     pub fn catalog(&self) -> Result<Value> {
         let _guard = self.catalog_guard.lock().unwrap();
         self.read_catalog()
     }
+    pub fn save_chat(&self, mut chat: Value) -> Result<()> {
+        if chat.to_string().len() > 4096
+            || ["session", "workspace", "title"]
+                .iter()
+                .any(|k| chat[k].as_str().is_none())
+        {
+            return Err("Invalid chat metadata".into());
+        }
+        let discovered =
+            chat.as_object_mut().and_then(|c| c.remove("discovered")) == Some(json!(true));
+        let _guard = self.catalog_guard.lock().map_err(|_| "Catalog lock")?;
+        let mut value = self.read_catalog()?;
+        if !value["chats"].is_array() {
+            value["chats"] = json!([]);
+        }
+        let chats = value["chats"]
+            .as_array_mut()
+            .ok_or("Invalid chat catalog")?;
+        if let Some(old) = chats
+            .iter_mut()
+            .find(|c| c["session"] == chat["session"] && c["workspace"] == chat["workspace"])
+        {
+            if discovered {
+                for key in ["archived", "deleted", "renamed"] {
+                    chat[key] = old[key].clone();
+                }
+                if old["renamed"] == true {
+                    chat["title"] = old["title"].clone();
+                }
+            }
+            *old = chat;
+        } else {
+            // Empty native sessions are drafts, not saved conversations.
+            if discovered && chat["empty"] == true { return Ok(()); }
+            if chats.len() >= 2000 {
+                return Err("Chat catalog is full".into());
+            }
+            chats.push(chat);
+        }
+        self.write_preferences(value)
+    }
+    pub fn import_theme(&self, plugin: Value) -> Result<()> {
+        let plugin = serde_json::to_value(themes::validate(plugin)?).map_err(err)?;
+        let _guard = self.catalog_guard.lock().map_err(|_| "Catalog lock")?;
+        let mut value = self.read_catalog()?;
+        if !value["themes"].is_array() {
+            value["themes"] = json!([]);
+        }
+        let themes = value["themes"]
+            .as_array_mut()
+            .ok_or("Invalid theme catalog")?;
+        if themes.iter().any(|t| t["id"] == plugin["id"]) {
+            return Err("A theme with this ID is already installed. Remove it before importing a replacement.".into());
+        }
+        if themes.len() >= 64 {
+            return Err("Theme library is full".into());
+        }
+        themes.push(plugin);
+        self.write_preferences(value)
+    }
+    pub fn export_theme(&self, plugin: Value) -> Result<String> {
+        use std::io::Write;
+        let plugin = themes::validate(plugin)?;
+        let directory = self.state.join("theme-exports");
+        fs::create_dir_all(&directory).map_err(err)?;
+        for index in 0..1000 {
+            let name = if index == 0 {
+                format!("{}.ag1-theme.json", plugin.id)
+            } else {
+                format!("{}-{index}.ag1-theme.json", plugin.id)
+            };
+            let path = directory.join(name);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    file.write_all(&serde_json::to_vec_pretty(&plugin).map_err(err)?)
+                        .map_err(err)?;
+                    file.sync_all().map_err(err)?;
+                    return Ok(path.to_string_lossy().into_owned());
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(err(e)),
+            }
+        }
+        Err("Theme export folder is full".into())
+    }
+    pub fn remove_theme(&self, id: &str) -> Result<()> {
+        let _guard = self.catalog_guard.lock().map_err(|_| "Catalog lock")?;
+        let mut value = self.read_catalog()?;
+        let themes = value["themes"]
+            .as_array_mut()
+            .ok_or("No installed themes")?;
+        themes.retain(|t| t["id"] != id);
+        if value["theme"] == id {
+            value["theme"] = json!("dark");
+        }
+        self.write_preferences(value)
+    }
     pub fn set_theme(&self, theme: &str) -> Result<()> {
         let _guard = self.catalog_guard.lock().unwrap();
         let mut value = self.read_catalog()?;
+        if !themes::is_builtin(theme)
+            && !value["themes"]
+                .as_array()
+                .is_some_and(|ts| ts.iter().any(|t| t["id"] == theme))
+        {
+            return Err("Theme is not installed".into());
+        }
         value["theme"] = json!(theme);
         self.write_preferences(value)
     }
@@ -506,4 +621,9 @@ impl Desktop {
 
 pub mod project_preview;
 
+pub mod github;
+#[cfg(feature = "visual-test")]
+mod github_fixture;
 pub mod native_client;
+#[cfg(feature = "visual-test")]
+pub mod cancellation_fixture;

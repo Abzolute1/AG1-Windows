@@ -28,6 +28,7 @@ pub struct Packages {
     pub offline: bool,
 }
 pub struct Actions {
+    approval_policy: Option<Arc<approval_policy::ApprovalPolicy>>,
     registry: Registry,
     skill: SkillCreator,
     settings: crate::package_settings::PackageSettings,
@@ -68,6 +69,7 @@ impl Actions {
         let policy = serde_json::from_value(json!({"mode":mode,"cwd":workspace.root()}))
             .map_err(json_error)?;
         Ok(Self {
+            approval_policy: None,
             registry,
             skill,
             settings,
@@ -77,6 +79,10 @@ impl Actions {
             clock,
             policy,
         })
+    }
+    pub fn with_policy(mut self, policy: Arc<approval_policy::ApprovalPolicy>) -> Self {
+        self.approval_policy = Some(policy);
+        self
     }
     pub fn catalog(&self) -> Value {
         json!({"createSkill":true,"configurePackage":true,"managePackage":self.packages.is_some(),"scope":"Isolated project and private resource caches","approval":"Native policy and one-use approval binding"})
@@ -89,6 +95,14 @@ impl Actions {
         args: &Value,
         cancel: &AtomicBool,
     ) -> Result<Value> {
+        let mut policy = self.policy.clone();
+        let policy_revision = if let Some(selected) = &self.approval_policy {
+            let selected = selected.snapshot()?;
+            policy.mode = selected.mode;
+            selected.revision
+        } else {
+            1
+        };
         if !matches!(name, "createSkill" | "managePackage" | "configurePackage") {
             return Err(DomainError::PermissionDenied);
         }
@@ -140,7 +154,7 @@ impl Actions {
         let mut authorizer = Authorizer::new(operation)?;
         let fence = || ExecutionFence {
             scope,
-            policy_revision: 1,
+            policy_revision,
             target_revision: &target,
             now: self.clock.now_ms(),
         };
@@ -148,8 +162,8 @@ impl Actions {
             call,
             PreflightContext {
                 scope,
-                policy: &self.policy,
-                policy_revision: 1,
+                policy: &policy,
+                policy_revision,
                 target_revision: &target,
                 now: self.clock.now_ms(),
                 ttl: 300000,
@@ -199,7 +213,7 @@ impl Actions {
                             FileExecution {
                                 registry: &self.registry,
                                 scope,
-                                policy_revision: 1,
+                                policy_revision,
                                 now: || self.clock.now_ms(),
                                 cancel,
                                 deadline: control.deadline,
@@ -223,7 +237,7 @@ impl Actions {
                             FileExecution {
                                 registry: &self.registry,
                                 scope,
-                                policy_revision: 1,
+                                policy_revision,
                                 now: || self.clock.now_ms(),
                                 cancel,
                                 deadline: control.deadline,

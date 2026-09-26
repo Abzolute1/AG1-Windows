@@ -85,6 +85,17 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 impl Archive {
     fn verify(&self) -> Result<Vec<LaunchPlan>> {
+        self.verify_with_materials().map(|(plans, _)| plans)
+    }
+    fn verify_with_materials(
+        &self,
+    ) -> Result<(Vec<LaunchPlan>, crate::llama::native::MaterialVerifier)> {
+        self.verify_inventory(true)
+    }
+    fn verify_inventory(
+        &self,
+        check_materials: bool,
+    ) -> Result<(Vec<LaunchPlan>, crate::llama::native::MaterialVerifier)> {
         if self.version != 1
             || self.request.models.is_empty()
             || self.request.additional_inputs.len() > 128
@@ -168,13 +179,15 @@ impl Archive {
             {
                 return Err(DomainError::PermissionDenied);
             }
-            verifier.verify(&model.materials)?;
+            if check_materials {
+                verifier.verify(&model.materials)?;
+            }
             plans.push(plan);
         }
         if seen != profiles.keys().cloned().collect() {
             return Err(DomainError::Conflict);
         }
-        Ok(plans)
+        Ok((plans, verifier))
     }
 }
 
@@ -301,6 +314,7 @@ impl ConfigurationCapture {
         config.runtime = Some(crate::client::local_runtime::Runtime {
             capture,
             process_host,
+            exclusive_gpu: true,
         });
         Ok(())
     }
@@ -362,12 +376,35 @@ impl ConfigurationCapture {
     /// Recheck the private capture and all original inputs/materials. This is
     /// suitable before freeze/import/open; it does not establish control rights.
     pub fn verify(&self) -> Result<Vec<LaunchPlan>> {
+        self.verify_with_materials().map(|(plans, _)| plans)
+    }
+
+    /// Transfer a freshly verified, nonserializable cache to a host within the
+    /// same held runtime lease. Every call starts with an empty verifier.
+    pub(crate) fn verify_with_materials(
+        &self,
+    ) -> Result<(Vec<LaunchPlan>, crate::llama::native::MaterialVerifier)> {
+        self.verify_inventory(true)
+    }
+
+    /// Admit configuration without reading model weights. This verifies the
+    /// capture, original configuration inputs and every immutable launch plan.
+    /// It does not certify material bytes: the runtime controller must verify
+    /// the selected plan's materials before spawning or using its process.
+    pub(crate) fn verify_launch_plans(&self) -> Result<Vec<LaunchPlan>> {
+        self.verify_inventory(false).map(|(plans, _)| plans)
+    }
+
+    fn verify_inventory(
+        &self,
+        check_materials: bool,
+    ) -> Result<(Vec<LaunchPlan>, crate::llama::native::MaterialVerifier)> {
         let bytes = bounded(&self.path, 128 * 1024 * 1024)?;
         if digest(&bytes) != self.sha256 {
             return Err(DomainError::Conflict);
         }
         let archive: Archive = decode(&bytes)?;
-        let plans = archive.verify()?;
+        let (plans, verifier) = archive.verify_inventory(check_materials)?;
         if pinned(&archive.request.profile)? != archive.inputs["profile"]
             || pinned(&archive.request.inherited_environment)? != archive.inputs["environment"]
         {
@@ -385,6 +422,216 @@ impl ConfigurationCapture {
         if hashes != self.plan_sha256 {
             return Err(DomainError::Conflict);
         }
-        Ok(plans)
+        Ok((plans, verifier))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        ImportRequest,
+        LaunchPlan,
+        ConfigurationCapture,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let server = dir.path().join("server");
+        let weight = dir.path().join("weight");
+        let materials = [(&server, "executable"), (&weight, "weight")]
+            .into_iter()
+            .map(|(path, kind)| {
+                std::fs::write(path, b"fixture").unwrap();
+                Material {
+                    path: path.display().to_string(),
+                    sha256: digest(b"fixture"),
+                    kind: kind.into(),
+                }
+            })
+            .collect();
+        let profile = serde_json::json!({"serverPath":server,"contextWindow":32768,"maxTokens":4096,"priority":false});
+        let plan = resolve_launch_plan(ResolveInput {
+            model_id: "fixture".into(),
+            model_path: weight.display().to_string(),
+            profile_bytes: serde_json::to_vec(&profile).unwrap(),
+            environment: BTreeMap::new(),
+            context_override: None,
+            forced_moe: None,
+            cached_moe: None,
+            vram_mib: None,
+            physical_cores: 1,
+            logical_cores: 1,
+            discovered_projector: None,
+            materials,
+        })
+        .unwrap();
+        let pin = |name: &str, value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let path = dir.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            PinnedInput {
+                path,
+                sha256: digest(&bytes),
+            }
+        };
+        let request = ImportRequest {
+            profile: pin(
+                "profile.json",
+                serde_json::json!({"version":1,"models":{"fixture":profile}}),
+            ),
+            inherited_environment: pin("environment.json", serde_json::json!({})),
+            additional_inputs: BTreeMap::new(),
+            physical_cores: 1,
+            logical_cores: 1,
+            vram_mib: None,
+            models: vec![ModelImport {
+                model_id: plan.model_id.clone(),
+                model_path: plan.model_path.clone(),
+                context_override: None,
+                forced_moe: None,
+                cached_moe: None,
+                discovered_projector: None,
+                materials: plan.materials.clone(),
+                expected: ExpectedLaunch {
+                    command: plan.command.clone(),
+                    args: plan.args.clone(),
+                    environment: plan.environment.clone(),
+                    context_window: plan.requested_context,
+                    max_tokens: plan.max_tokens,
+                },
+            }],
+        };
+        let capture = import_configuration(&dir.path().join("capture.json"), &request).unwrap();
+        (dir, request, plan, capture)
+    }
+
+    #[test]
+    fn capture_transfers_fresh_hashes_and_still_rejects_configuration_drift() {
+        let (_dir, request, plan, capture) = fixture();
+        let weight = PathBuf::from(&plan.model_path);
+        let profile = serde_json::json!({"serverPath":plan.command,"contextWindow":32768,"maxTokens":4096,"priority":false});
+        let (plans, mut verifier) = capture.verify_with_materials().unwrap();
+        assert_eq!(plans[0].plan_sha256, plan.plan_sha256);
+        assert_eq!(verifier.bytes_hashed, 14);
+        verifier.verify(&plans[0].materials).unwrap();
+        assert_eq!(verifier.bytes_hashed, 14);
+        // A separate capture admission gets no previous verifier state.
+        let (_, fresh) = capture.verify_with_materials().unwrap();
+        assert_eq!(fresh.bytes_hashed, 14);
+        let mut wrong_plan = capture.clone();
+        wrong_plan
+            .plan_sha256
+            .insert("fixture".into(), "0".repeat(64));
+        assert!(matches!(
+            wrong_plan.verify_with_materials(),
+            Err(DomainError::Conflict)
+        ));
+        std::fs::write(&request.profile.path, b"{}").unwrap();
+        assert!(matches!(
+            capture.verify_with_materials(),
+            Err(DomainError::Conflict)
+        ));
+        let (_, fresh) = {
+            let bytes =
+                serde_json::to_vec(&serde_json::json!({"version":1,"models":{"fixture":profile}}))
+                    .unwrap();
+            std::fs::write(&request.profile.path, bytes).unwrap();
+            capture.verify_with_materials().unwrap()
+        };
+        assert_eq!(fresh.bytes_hashed, 14);
+        std::fs::write(&weight, b"changed").unwrap();
+        assert!(matches!(
+            capture.verify_with_materials(),
+            Err(DomainError::Conflict)
+        ));
+        std::fs::write(&capture.path, b"{}").unwrap();
+        assert!(matches!(
+            capture.verify_with_materials(),
+            Err(DomainError::Conflict)
+        ));
+    }
+    #[test]
+    fn opening_catalog_does_not_read_weights_but_selected_materials_still_fail_closed() {
+        let (_dir, _request, plan, capture) = fixture();
+        // An unreadable/missing weight must not prevent browsing/opening chats.
+        std::fs::remove_file(&plan.model_path).unwrap();
+        let (plans, mut verifier) = capture.verify_inventory(false).unwrap();
+        assert_eq!(plans[0].plan_sha256, plan.plan_sha256);
+        assert_eq!(verifier.bytes_hashed, 0);
+        assert!(matches!(
+            verifier.verify(&plans[0].materials),
+            Err(DomainError::NotFound)
+        ));
+        // Full cutover/audit verification remains strict.
+        assert!(matches!(capture.verify(), Err(DomainError::NotFound)));
+        std::fs::write(&plan.model_path, b"changed").unwrap();
+        assert!(capture.verify_launch_plans().is_ok());
+        assert!(matches!(
+            verifier.verify(&plans[0].materials),
+            Err(DomainError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn catalog_admission_rejects_changed_capture_configuration_and_plan_hashes() {
+        let (_dir, request, _plan, capture) = fixture();
+        let mut wrong = capture.clone();
+        wrong.plan_sha256.insert("fixture".into(), "0".repeat(64));
+        assert!(matches!(
+            wrong.verify_launch_plans(),
+            Err(DomainError::Conflict)
+        ));
+        std::fs::write(&request.profile.path, b"{}").unwrap();
+        assert!(matches!(
+            capture.verify_launch_plans(),
+            Err(DomainError::Conflict)
+        ));
+        std::fs::write(&capture.path, b"{}").unwrap();
+        assert!(matches!(
+            capture.verify_launch_plans(),
+            Err(DomainError::Conflict)
+        ));
+    }
+    #[tokio::test]
+    async fn real_host_opens_chat_without_touching_missing_model_weights() {
+        let (dir, _request, plan, capture) = fixture();
+        std::fs::remove_file(&plan.model_path).unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let registry = crate::cutover::Registry::at(&dir.path().join("authority")).unwrap();
+        registry.initialize_native(&workspace).unwrap();
+        let config: crate::client::Config = serde_json::from_value(serde_json::json!({
+            "models":[{"id":"fixture","provider":"llamacpp","api":"openai-completions","baseUrl":crate::llama::observation::origin(&plan).unwrap(),"contextWindow":plan.requested_context,"maxTokens":plan.max_tokens,"input":["text"],"reasoning":false}],
+            "selected":"fixture","credential_env":null,"system_prompt":"Fixture","fixture":false,
+            "runtime":{"capture":capture,"process_host":{"path":plan.command,"sha256":digest(b"fixture"),"kind":"process-host"},"exclusive_gpu":false}
+        })).unwrap();
+        let started = std::time::Instant::now();
+        let host = crate::client::Host::open_with_registry(
+            &workspace,
+            &dir.path().join("state"),
+            config,
+            &registry,
+        )
+        .await
+        .unwrap();
+        let view = host.view().unwrap();
+        assert_eq!(view.snapshot.model, "fixture");
+        assert_eq!(view.snapshot.status, "idle");
+        assert_eq!(view.snapshot.message_count, 0);
+        assert!(view.details.activity["runtime_preparation"].is_null());
+        assert!(
+            !dir.path()
+                .join("state/owned-llama-runtime")
+                .read_dir()
+                .unwrap()
+                .any(|e| e
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "log"))
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        host.shutdown().await.unwrap();
     }
 }

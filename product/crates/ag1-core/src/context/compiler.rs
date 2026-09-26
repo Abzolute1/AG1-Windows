@@ -16,6 +16,7 @@ use std::{
 pub const EXACT: &str = "full_result: exact artifact, paged by UTF-8 byte offset";
 const EVICTED: &str = "artifact_metadata_resident: false";
 const BOUNDARY: &str = "ag1-artifact-catalog-boundary";
+mod history;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CompileOptions {
@@ -270,7 +271,7 @@ fn references(
                 ids.push(id.into());
             }
         }
-        if message["toolName"] == "artifact"
+        if crate::tools::surface::message_tool(message) == "artifact"
             && let Some(id) = message["details"]["id"].as_str()
             && !ids.iter().any(|s| s == id)
         {
@@ -362,7 +363,7 @@ fn externalize(
     store: &mut impl ContextArtifactPort,
     threshold: usize,
 ) -> Result<Option<(Value, u64, u64)>, DomainError> {
-    let tool = string(message, "toolName");
+    let tool = crate::tools::surface::message_tool(message);
     let call = string(message, "toolCallId");
     let rehydrated = if tool == "artifact" && message["details"]["action"] == "read" {
         store.get(string(&message["details"], "id")).ok()
@@ -553,7 +554,7 @@ fn evict(message: &Value, store: &impl ContextArtifactPort) -> Option<Value> {
     let bytes: u64 = records.values().map(|r| r.bytes).sum();
     let text = format!(
         "[Historical {} artifact metadata evicted from active attention]\n{EVICTED}\nrecoverable_artifacts: {}; raw_bytes: {}\nExact immutable evidence remains available. Use artifact search with a distinctive identifier or error fragment; do not guess or inspect recent artifacts one by one.",
-        string(message, "toolName"),
+        crate::tools::surface::message_tool(message),
         records.len(),
         commas(bytes)
     );
@@ -680,12 +681,37 @@ pub fn compile_request(
     let snapshot = ContextSnapshot::capture(messages.to_vec())?;
     Ok(compile_snapshot(&snapshot, options, store)?.into_owned())
 }
+/// Continue an admitted compiler projection plus an append-only suffix. The
+/// caller must validate owner, epoch, configuration and original ancestry before
+/// supplying `admitted_prefix`; this length is not an authorization witness.
+/// Below pressure, admitted bytes stay fixed even as the recent-turn window
+/// moves. Under pressure, reduce newest eligible evidence toward low water.
+pub fn compile_continuation(
+    messages: &[Value],
+    admitted_prefix: usize,
+    options: &CompileOptions,
+    store: &mut impl ContextArtifactPort,
+) -> Result<Compilation, DomainError> {
+    if admitted_prefix > messages.len() {
+        return Err(invalid("admitted context prefix length"));
+    }
+    let snapshot = ContextSnapshot::capture(messages.to_vec())?;
+    Ok(compile_inner(&snapshot, options, store, Some(admitted_prefix))?.into_owned())
+}
 /// Pure projection on an immutable capture. Artifact reads and current leases are still refreshed
 /// on every call; cached estimates never grant filesystem freshness or artifact authorization.
 pub fn compile_snapshot(
     snapshot: &ContextSnapshot,
     options: &CompileOptions,
     store: &mut impl ContextArtifactPort,
+) -> Result<SnapshotCompilation, DomainError> {
+    compile_inner(snapshot, options, store, None)
+}
+fn compile_inner(
+    snapshot: &ContextSnapshot,
+    options: &CompileOptions,
+    store: &mut impl ContextArtifactPort,
+    admitted_prefix: Option<usize>,
 ) -> Result<SnapshotCompilation, DomainError> {
     let messages = &snapshot.messages;
     for ratio in [
@@ -741,40 +767,90 @@ pub fn compile_snapshot(
             .unwrap_or(0.1)
             .clamp(0., 0.1))
     .floor() as u64;
+    let recent = protected.clone();
     let (leased_messages, leased_tokens) = leased(messages, store, &mut protected, lease_budget)?;
+    let lease_protected: BTreeSet<_> = protected.difference(&recent).copied().collect();
     let threshold = options.old_tool_result_bytes.unwrap_or(1024).max(256);
     let mut compiled = messages.to_vec();
     let mut ext = 0;
     let mut payloads = 0;
     let mut previews = 0;
-    for (i, m) in compiled.iter_mut().enumerate() {
-        if !protected.contains(&i)
-            && m["role"] == "assistant"
-            && let Some((out, count)) = externalize_payload(m, store)?
-        {
-            *m = ContextMessage::new(out);
-            payloads += count;
+    if let Some(prefix) = admitted_prefix {
+        let mut current = before;
+        // Process the newest candidates first so an adequate suffix reduction
+        // leaves the older provider prefix byte-for-byte intact. Never rewrite
+        // resident artifact previews merely because they aged out of recency.
+        for i in (0..compiled.len()).rev() {
+            if lease_protected.contains(&i)
+                || i < prefix && (!pressure || current <= compact_target)
+            {
+                continue;
+            }
+            let m = &compiled[i];
+            let replacement = if m["role"] == "assistant" && !protected.contains(&i) {
+                externalize_payload(m, store)?.map(|(out, count)| (out, 0, count, 0))
+            } else if m["role"] == "toolResult" && !resident(m) {
+                let threshold = if protected.contains(&i) {
+                    threshold.max(self::threshold(crate::tools::surface::message_tool(m)))
+                } else {
+                    threshold
+                };
+                externalize(m, store, threshold)?
+                    .map(|(out, count, compacted)| (out, count, 0, compacted))
+            } else {
+                None
+            };
+            if let Some((out, results, calls, compacted)) = replacement {
+                let next = ContextMessage::new(out);
+                if next.tokens < compiled[i].tokens {
+                    current -= compiled[i].tokens - next.tokens;
+                    compiled[i] = next;
+                    ext += results;
+                    payloads += calls;
+                    previews += compacted;
+                }
+            }
         }
-    }
-    for (i, m) in compiled.iter_mut().enumerate() {
-        if m["role"] != "toolResult" {
-            continue;
+    } else {
+        for (i, m) in compiled.iter_mut().enumerate() {
+            if !protected.contains(&i)
+                && m["role"] == "assistant"
+                && let Some((out, count)) = externalize_payload(m, store)?
+            {
+                *m = ContextMessage::new(out);
+                payloads += count;
+            }
         }
-        let threshold = if protected.contains(&i) {
-            threshold.max(self::threshold(string(m, "toolName")))
-        } else {
-            threshold
-        };
-        if let Some((out, count, compacted)) = externalize(m, store, threshold)? {
-            *m = ContextMessage::new(out);
-            ext += count;
-            previews += compacted;
+        for (i, m) in compiled.iter_mut().enumerate() {
+            if m["role"] != "toolResult" {
+                continue;
+            }
+            let threshold = if protected.contains(&i) {
+                threshold.max(self::threshold(crate::tools::surface::message_tool(m)))
+            } else {
+                threshold
+            };
+            if let Some((out, count, compacted)) = externalize(m, store, threshold)? {
+                *m = ContextMessage::new(out);
+                ext += count;
+                previews += compacted;
+            }
         }
     }
     let mut stripped = 0;
     if pressure && fixed + sum(&compiled) > compact_target {
         let last = compiled.iter().rposition(|m| m["role"] == "assistant");
-        for (i, m) in compiled.iter_mut().enumerate() {
+        let mut current = fixed + sum(&compiled);
+        let indices: Vec<_> = if admitted_prefix.is_some() {
+            (0..compiled.len()).rev().collect()
+        } else {
+            (0..compiled.len()).collect()
+        };
+        for i in indices {
+            if admitted_prefix.is_some() && current <= compact_target {
+                break;
+            }
+            let m = &mut compiled[i];
             if Some(i) == last
                 || protected.contains(&i)
                 || m["role"] != "assistant"
@@ -794,7 +870,12 @@ pub fn compile_snapshot(
             }
             let mut value = (**m).clone();
             value["content"] = json!(content);
-            *m = ContextMessage::new(value);
+            let next = ContextMessage::new(value);
+            if admitted_prefix.is_some() && next.tokens >= m.tokens {
+                continue;
+            }
+            current = current + next.tokens - m.tokens;
+            *m = next;
             stripped += 1;
         }
     }
@@ -835,6 +916,9 @@ pub fn compile_snapshot(
             }
             if let Some(replacement) = evict(&compiled[i], store) {
                 let old = estimate_tokens(&compiled[i]);
+                if admitted_prefix.is_some() && estimate_tokens(&replacement) >= old {
+                    continue;
+                }
                 current = current + estimate_tokens(&replacement) - old;
                 resident_tokens -= old;
                 compiled[i] = ContextMessage::new(replacement);
@@ -848,9 +932,21 @@ pub fn compile_snapshot(
         .map(|m| m.tokens)
         .sum();
     let (compiled, pruned) = prune(compiled, &protected, fixed, compact_target);
+    // Large-result reduction cannot bound a long sequence of individually
+    // small messages. Archive closed old segments only when those cheaper
+    // reductions still leave the request over its working target.
+    let (compiled, archived) = if target > 0 && fixed + sum(&compiled) > target {
+        history::archive(compiled, options.recent_assistant_turns.unwrap_or(3).max(1),
+            lease_budget, fixed, target, compact_target, store)?
+    } else { (compiled, 0) };
     let after = fixed + sum(&compiled);
+    let mut stats = json!({"tokensBefore":before,"tokensAfter":after,"targetTokens":target,"compactionTargetTokens":compact_target,"fixedTokens":fixed,"protectedMessages":protected.len(),"leasedEvidenceMessages":leased_messages,"leasedEvidenceTokens":leased_tokens,"externalizedToolResults":ext,"externalizedToolCallPayloads":payloads,"compactedArtifactPreviews":previews,"strippedThinkingMessages":stripped,"evictedArtifactMetadata":evicted,"prunedToolRounds":pruned,"residentArtifactMetadataTokens":resident_tokens,"freedTokens":before.saturating_sub(after),"headroomTokens":target.saturating_sub(after),"overTargetTokens":after.saturating_sub(target)});
+    if archived > 0 {
+        stats["archivedHistoryMessages"] = json!(archived);
+        stats["residentArtifactMetadataTokens"] = json!(compiled.iter().filter(|m| resident(m)).map(|m| m.tokens).sum::<u64>());
+    }
     Ok(SnapshotCompilation {
         snapshot: ContextSnapshot { messages: compiled },
-        stats: json!({"tokensBefore":before,"tokensAfter":after,"targetTokens":target,"compactionTargetTokens":compact_target,"fixedTokens":fixed,"protectedMessages":protected.len(),"leasedEvidenceMessages":leased_messages,"leasedEvidenceTokens":leased_tokens,"externalizedToolResults":ext,"externalizedToolCallPayloads":payloads,"compactedArtifactPreviews":previews,"strippedThinkingMessages":stripped,"evictedArtifactMetadata":evicted,"prunedToolRounds":pruned,"residentArtifactMetadataTokens":resident_tokens,"freedTokens":before.saturating_sub(after),"headroomTokens":target.saturating_sub(after),"overTargetTokens":after.saturating_sub(target)}),
+        stats,
     })
 }

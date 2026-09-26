@@ -11,19 +11,23 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{LazyLock, Mutex},
 };
+mod recovery;
 
 pub struct Guard {
     root: PathBuf,
     state: Mutex<repetition::Guard>,
+    recovery: Mutex<recovery::Guard>,
 }
 impl Guard {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
             state: Mutex::default(),
+            recovery: Mutex::default(),
         }
     }
     pub fn reset(&self) -> Result<(), DomainError> {
+        *self.recovery.lock().map_err(|_| DomainError::Conflict)? = Default::default();
         self.state
             .lock()
             .map_err(|_| DomainError::Conflict)?
@@ -38,12 +42,25 @@ impl Guard {
         Ok(())
     }
     pub fn stop_reason(&self) -> Result<Option<String>, DomainError> {
+        if let Some(reason) = &self.recovery.lock().map_err(|_| DomainError::Conflict)?.stop {
+            return Ok(Some(reason.clone()));
+        }
         Ok(self
             .state
             .lock()
             .map_err(|_| DomainError::Conflict)?
             .stop_reason()
             .map(str::to_owned))
+    }
+    /// Observe only acknowledged native outcomes, never extension projections
+    /// or replayed receipts. This does not authorize or execute a retry.
+    pub(super) fn recovery_outcome(
+        &self, tool: &str, call: &str, args: &Value, result: &Value,
+        todo: Option<&Value>,
+    ) -> Result<Vec<repetition::Event>, DomainError> {
+        let candidate = recovery::candidate(&self.root, tool, args, result, todo);
+        Ok(self.recovery.lock().map_err(|_| DomainError::Conflict)?
+            .observe(tool, call, candidate))
     }
     pub fn before(
         &self,

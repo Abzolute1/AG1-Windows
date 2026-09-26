@@ -228,6 +228,7 @@ pub enum WebPurpose {
     Fetch,
     SearchHtml,
     SearchJson,
+    SearchWeb,
 }
 impl WebHttp<SystemResolver> {
     pub fn new(policy: WebPolicy) -> Self {
@@ -294,6 +295,24 @@ impl<R: WebResolver> WebHttp<R> {
             return Err(DomainError::PermissionDenied);
         }
         let requested_url = url.to_string();
+        // DuckDuckGo's HTML/lite forms submit q and the empty submit field b by
+        // POST. GET query URLs can receive a challenge even when the form works.
+        // Keep the logical URL for provenance; send query terms only in the body.
+        let mut search_form = if matches!(purpose, WebPurpose::SearchHtml) {
+            let fields = url
+                .query_pairs()
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect::<Vec<_>>();
+            url.set_query(None);
+            url.query_pairs_mut()
+                .extend_pairs(fields)
+                .append_pair("b", "");
+            let body = url.query().unwrap_or_default().to_owned();
+            url.set_query(None);
+            Some(body)
+        } else {
+            None
+        };
         let deadline = deadline.min(Instant::now() + Duration::from_secs(30));
         let mut chain = vec![];
         for hop in 0..=5 {
@@ -328,7 +347,7 @@ impl<R: WebResolver> WebHttp<R> {
                 .no_proxy()
                 .user_agent(match purpose {
                     WebPurpose::Fetch => "AG1 webFetch",
-                    WebPurpose::SearchHtml => "Mozilla/5.0",
+                    WebPurpose::SearchHtml | WebPurpose::SearchWeb => "Mozilla/5.0",
                     WebPurpose::SearchJson => "AG1 webSearch",
                 })
                 .redirect(reqwest::redirect::Policy::none())
@@ -349,6 +368,25 @@ impl<R: WebResolver> WebHttp<R> {
                         reqwest::header::ACCEPT,
                         HeaderValue::from_static("text/html,application/xhtml+xml"),
                     );
+                    if search_form.is_some() {
+                        headers.insert(
+                            reqwest::header::CONTENT_TYPE,
+                            HeaderValue::from_static("application/x-www-form-urlencoded"),
+                        );
+                        headers.insert(
+                            reqwest::header::REFERER,
+                            HeaderValue::from_str(url.as_str()).map_err(|_| {
+                                DomainError::InvalidInput("search form referer".into())
+                            })?,
+                        );
+                    }
+                }
+                WebPurpose::SearchWeb => {
+                    headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
+                    headers.insert(
+                        reqwest::header::REFERER,
+                        HeaderValue::from_static("https://noai.duckduckgo.com/"),
+                    );
                 }
                 WebPurpose::SearchJson => {
                     headers.insert(
@@ -357,13 +395,22 @@ impl<R: WebResolver> WebHttp<R> {
                     );
                 }
             }
+            let request = if let Some(body) = &search_form {
+                client.post(url.clone()).body(body.clone())
+            } else {
+                client.get(url.clone())
+            }
+            .headers(headers);
             let mut response = tokio::select! {
                 biased;
                 _=cancel.wait()=>return Err(DomainError::Cancelled),
                 _=tokio::time::sleep_until(deadline)=>return Err(DomainError::TimedOut),
-                response=client.get(url.clone()).headers(headers).send()=>response.map_err(|e| if e.is_timeout() { DomainError::TimedOut } else { DomainError::Unavailable("web connection failed".into()) })?,
+                response=request.send()=>response.map_err(|e| if e.is_timeout() { DomainError::TimedOut } else { DomainError::Unavailable("web connection failed".into()) })?,
             };
             if response.status().is_redirection() {
+                if matches!(purpose, WebPurpose::SearchWeb) {
+                    return Err(DomainError::PermissionDenied);
+                }
                 if hop == 5 {
                     return Err(DomainError::LimitExceeded("web redirects".into()));
                 }
@@ -380,6 +427,17 @@ impl<R: WebResolver> WebHttp<R> {
                 let next = url
                     .join(location)
                     .map_err(|_| DomainError::InvalidInput("web redirect URL".into()))?;
+                if search_form.is_some() {
+                    // Do not forward a search form to another origin. Normal
+                    // same-origin 301/302/303 navigation becomes GET; 307/308
+                    // preserve POST. The next hop still passes DNS/TLS policy.
+                    if next.origin() != url.origin() {
+                        return Err(DomainError::PermissionDenied);
+                    }
+                    if matches!(response.status().as_u16(), 301..=303) {
+                        search_form = None;
+                    }
+                }
                 chain.push(url.to_string());
                 url = parse_url(next.as_str())?;
                 continue;

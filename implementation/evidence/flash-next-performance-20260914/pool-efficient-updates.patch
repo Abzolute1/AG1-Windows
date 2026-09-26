@@ -1,0 +1,67 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -869,6 +869,9 @@
+     uint64_t stamp = 0;
+ 
+     // running totals, reported when GGML_MOE_POOL_STATS is set
++    const ggml_tensor * last_update_ids = nullptr;
++    uint64_t update_calls = 0;
++    uint64_t duplicate_updates = 0;
+     uint64_t n_hits = 0;
+     uint64_t n_misses = 0;
+     bool report_stats = false;
+@@ -1802,6 +1805,7 @@
+     // the expert ids read-back cache must not survive across computes: the routing tensors
+     // keep the same address between runs, but their contents change on every graph execution
+     sched->expert_ids_tensor = nullptr;
++    for (auto & ep : sched->expert_pools) ep.last_update_ids = nullptr;
+ 
+     int prev_backend_id = -1;
+ 
+@@ -2079,6 +2083,15 @@
+         const ggml_tensor * ids,
+         ggml_backend_t split_backend) {
+     GGML_ASSERT(ids != nullptr && "pooled expert ids without a routing tensor");
++    ++ep.update_calls;
++    // Reset for every graph execution above: a tensor address can recur next token.
++    // Within one execution, remap and matmul consume the same routing result.
++    if (ep.last_update_ids == ids) {
++        ++ep.duplicate_updates;
++        return;
++    }
++    ep.last_update_ids = ids;
++
+ 
+     if (ids != sched->expert_ids_tensor) {
+         // the ids are produced by a previous split on the compute backend
+@@ -2109,6 +2122,14 @@
+     // stamps assigned during this update, used to guarantee that eviction never picks a slot
+     // that was loaded or refreshed by the current ubatch
+     const uint64_t stamp_base = ep.stamp;
++    // Protect every required resident expert before inserting any miss. Otherwise
++    // a low-numbered miss can evict a high-numbered hit needed by this same batch.
++    for (int e = 0; e < ep.n_expert; ++e) {
++        if (ggml_bitset_get(used.data(), e) && ep.expert_slot[e] >= 0) {
++            ep.slot_stamp[ep.expert_slot[e]] = ++ep.stamp;
++        }
++    }
++
+ 
+     for (int e = 0; e < ep.n_expert; e++) {
+         if (!ggml_bitset_get(used.data(), e)) {
+@@ -2361,6 +2382,15 @@
+         return;
+     }
+     for (auto & ep : sched->expert_pools) {
++        if (const char * trace = getenv("AG1_FLASH_POOL_TRACE")) {
++            if (FILE * f = fopen(trace, "a")) {
++                fprintf(f, "%s calls=%llu duplicates=%llu hits=%llu misses=%llu bytes=%llu\n",
++                    ep.w->name, (unsigned long long) ep.update_calls,
++                    (unsigned long long) ep.duplicate_updates, (unsigned long long) ep.n_hits,
++                    (unsigned long long) ep.n_misses, (unsigned long long) (ep.n_misses * ep.expert_size));
++                fclose(f);
++            }
++        }
+         ggml_backend_buffer_free(ep.pool_buf);
+         ggml_backend_buffer_free(ep.table_buf);
+     }

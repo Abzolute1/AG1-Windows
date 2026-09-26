@@ -52,6 +52,20 @@ fn setup() -> (
 fn call(registry: &Registry, id: &str, name: &str, args: Value) -> ValidatedCall {
     registry.prepare(id, id, name, &args, true).unwrap()
 }
+// Keep captured SDK payloads intact while asserting the native revision fields
+// from the fixture's original source bytes, never from the observed result.
+fn native_file_provenance(expected: &mut Value, tool: &str, path: &str, original: &[u8]) {
+    if !expected.is_object() { return; }
+    let hash = ag1_storage::digest(original);
+    if tool == "read" {
+        expected["details"]["sourceReference"] = json!(format!("file:{path}@sha256:{hash}"));
+        expected["details"]["sourceSha256"] = json!(hash);
+        expected["details"]["sourceKind"] = json!("file_revision");
+    } else if tool == "edit" && expected["details"]["diff"].is_string() {
+        expected["details"]["sourceSha256"] = json!(hash);
+        expected["details"]["mode"] = json!("apply");
+    }
+}
 fn authorize(
     call: ValidatedCall,
     p: &PreparedFile,
@@ -95,11 +109,12 @@ fn authorize(
     }
 }
 #[test]
-fn native_files_match_39_reference_cases_with_explicit_preview_location_correction() {
+fn native_files_match_39_reference_cases_with_explicit_native_safety_corrections() {
     let oracle: Value =
         serde_json::from_str(include_str!("../../../../fixtures/tools/file-oracle.json")).unwrap();
     assert_eq!(oracle["rows"].as_array().unwrap().len(), 39);
     let mut corrected = 0;
+    let mut failure_corrected = 0;
     for (index, row) in oracle["rows"].as_array().unwrap().iter().enumerate() {
         let (dir, _ws, files, registry, scope) = setup();
         let input = &row["input"];
@@ -170,14 +185,50 @@ fn native_files_match_39_reference_cases_with_explicit_preview_location_correcti
                     &next,
                     &normalized["details"]["hunks"],
                 );
+            } else if matches!(index, 25..=27) {
+                // Legacy first-match apply could silently edit the wrong site,
+                // or report partial applications although it wrote no bytes.
+                // Keep the oracle intact and assert the native correction.
+                assert_eq!(normalized["isError"], true, "case {index}");
+                assert_eq!(normalized["details"]["applied"], 0);
+                assert_eq!(normalized["details"]["verified"], false);
+                assert!(
+                    normalized["details"]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("No changes from this call were written")
+                );
+                assert!(output.published.is_none());
+                failure_corrected += 1;
+            } else if matches!(index, 15 | 31 | 34..=36) {
+                // Recorded failure payloads lacked the error discriminator.
+                let mut expected = row["output"]["result"].clone();
+                expected["isError"] = json!(true);
+                assert_eq!(normalized, expected, "case {index}");
+                assert!(output.published.is_none());
+                failure_corrected += 1;
             } else {
-                assert_eq!(normalized, row["output"]["result"], "case {index}");
+                let mut expected = row["output"]["result"].clone();
+                native_file_provenance(&mut expected, input["tool"].as_str().unwrap(), "file.txt", input["original"].as_str().unwrap_or("").as_bytes());
+                assert_eq!(normalized, expected, "case {index}");
             }
         }
         let actual=fs::read(&path).ok().map(|bytes|json!({"bytes":STANDARD.encode(bytes),"mode":fs::metadata(&path).unwrap().permissions().mode()&0o777}));
-        assert_eq!(json!(actual), row["final"], "final {index}");
+        if matches!(index, 25 | 26) {
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                input["original"].as_str().unwrap()
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o750
+            );
+        } else {
+            assert_eq!(json!(actual), row["final"], "final {index}");
+        }
     }
     assert_eq!(corrected, 2);
+    assert_eq!(failure_corrected, 8);
 }
 fn assert_preview_applies(old: &str, new: &str, hunks: &Value) {
     let mut lines: Vec<String> = old.split('\n').map(str::to_string).collect();
@@ -524,7 +575,9 @@ fn native_read_windows_match_sdk_bytes_progress_and_inspection_references() {
                 },
             )
             .unwrap();
-        assert_eq!(result.result, row["output"]["result"], "read {i}");
+        let mut expected = row["output"]["result"].clone();
+        native_file_provenance(&mut expected, "read", "file.txt", row["input"]["text"].as_str().unwrap().as_bytes());
+        assert_eq!(result.result, expected, "read {i}");
         assert!(result.published.is_none());
     }
 }
@@ -3943,7 +3996,13 @@ fn selected_original_file_cases_match_sdk_results_bytes_modes_and_rejections() {
                     .replace(dir.path().to_str().unwrap(), "/fixture"),
             )
             .unwrap();
-            assert_eq!(output, input["output"], "{}", row["name"]);
+            let mut expected = input["output"].clone();
+            if let Some(bytes) = input["before"]["bytes"].as_str()
+                && let Some(result) = expected.get_mut("result") {
+                let relative = path.strip_prefix(dir.path()).unwrap().to_str().unwrap();
+                native_file_provenance(result, input["tool"].as_str().unwrap(), relative, &STANDARD.decode(bytes).unwrap());
+            }
+            assert_eq!(output, expected, "{}", row["name"]);
             assert_eq!(state(), input["after"], "final bytes/mode: {}", row["name"]);
         }
     }

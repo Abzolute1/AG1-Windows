@@ -1,0 +1,17 @@
+# MCP Discover pagination and loading repair — 2026-09-13
+
+> Historical evidence, archived 2026-09-13. Status, commands, permissions and paths below describe their original checkpoint. For current work start with [implementation status](../../../README.md). Original bytes and old paths are preserved in the [relocation manifest](../manifest.json) and recovery archive.
+
+Complete and installed systemwide. Both launchers use the new build; restart AG1.
+
+The 30-result stop was a response-size failure, not a 30-server cap. Discover returned full configuration and registry metadata for ten servers at a time, while the generic client bridge permits 48,000 bytes. A sufficiently large page failed after prior pages had loaded. Directory replies now contain bounded display summaries; exact configurations and provenance stay in the native cache for detail and reviewed setup. Description previews are bounded by escaped JSON bytes, including control characters and Unicode. Existing page counts, cache limits, upstream rate limits, trust checks and reviewed setup remain intact.
+
+Icon requests previously ran one at a time in React and held the native icon-cache mutex throughout network access and decoding. Four UI workers now load missing publisher icons; native fetching releases the cache mutex and admits at most four concurrent requests. Duplicate publisher URLs share the result. The existing numeric GitHub avatar allowlist, public-address validation, timeout, image decoder bounds, rate limit and raster-only renderer boundary remain intact.
+
+A bounded renderer-lifetime cache retains public directory rows and native PNG results. Reopening Discover can render them before native cache lookup returns, preserving loaded pages when the native first-page timestamp still matches. No credentials, reviews or connection authority are cached. An initial visit after restarting the application can still need network access for icons; successful images live for up to one day within the renderer session, with 128 cached publishers and short-lived negative results.
+
+Validation: 20 React checks passed, including immediate remount rendering, retained pagination and four concurrent icon requests. Seven native checks passed, including a regression with 40 bulky listings below the client response limit, concurrent/deduplicated icon fetching, and existing cache/rate-limit/version-bound setup behavior. Source snapshots, logs and native production screenshot evidence are under `.local/mcp-loading-fix`. Layout styling and the requested icon/text sizes are unchanged.
+
+Build uses the existing Cargo cache. Only disposable dependency/build directories from the older MCP row build were removed to recover disk space; its top-level binaries, archives, installed releases and verification records were preserved.
+
+Production typecheck/build, normal package validation and native screenshot review passed. The reopened Discover screenshot, taken 200 ms after tab activation, shows retained icons. Installed release: `/opt/ag1/releases/7b13c4495c1b477bb7afef3248561294`. Desktop SHA-256: `8e83be9607e38258b55e870ed88a2cbcdd26f88897694c7c66e2428c9d9d5766`. Archive SHA-256: `5b6bfa64686b21bc6316c7bd1d0a206d9be330de6584f819f681b3fcd974049c`. Receipts and screenshot hashes are in `.local/mcp-loading-fix/installation.json` and `production-inspection.json`. The native smoke made no model requests and left no owned child processes.

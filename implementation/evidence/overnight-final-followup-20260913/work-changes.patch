@@ -1,0 +1,44 @@
+--- before/product/crates/ag1-core/src/tools/surface.rs
++++ after/product/crates/ag1-core/src/tools/surface.rs
+@@ -158,7 +158,7 @@
+         ),
+         (
+             "work",
+-            "Current task owner: show/reset/set/record/update/remove manage intent and claims. Use action=record with kind=DECISION and statement to store a decision. action=observe accepts only action and observation; it records a reported runtime result, not a decision or an independently verified check. The harness binds observations to the current task and updates task state atomically. No duplicate todo, episode or task records are needed. Tool receipts remain evidence; memory is only for knowledge useful beyond this task.",
++            "Current task owner: use action=set to change objective, currentPhase, currentSubgoal or nextAction. action=update edits an existing claim entry and requires its id; it does not change the objective. show/reset/record/remove manage task state and claims. Use action=record with kind=DECISION and statement to store a decision. action=observe accepts only action and observation; it records a reported runtime result, not a decision or an independently verified check. The harness binds observations to the current task and updates task state atomically. No duplicate todo, episode or task records are needed. Tool receipts remain evidence; memory is only for knowledge useful beyond this task.",
+             task,
+         ),
+         (
+@@ -244,6 +244,9 @@
+             }
+         }
+         "work" => {
++            if args["action"] == "update" && args["id"].as_str().is_none_or(str::is_empty) {
++                return Err(DomainError::InvalidInput("work action=update edits an existing claim entry and requires its id. Use action=set with objective, currentPhase, currentSubgoal or nextAction to change task-level fields.".into()));
++            }
+             if args["action"] == "observe" {
+                 if args.as_object().is_none_or(|fields| {
+                     fields
+--- before/product/crates/ag1-core/tests/native_surface_contract.rs
++++ after/product/crates/ag1-core/tests/native_surface_contract.rs
+@@ -12,6 +12,20 @@
+     r.activate(&names, &names.iter().cloned().collect())
+         .unwrap();
+     r
++}
++#[test]
++fn work_objective_correction_preserves_explicit_action_semantics() {
++    let invalid = json!({"action":"update","objective":"Current repair"});
++    let error = surface::route("work", &invalid, &[]).unwrap_err();
++    assert!(format!("{error:?}").contains("Use action=set"));
++    let args = json!({"action":"set","objective":"Current repair","nextAction":"Check result"});
++    let (target, routed) = surface::route("work", &args, &[]).unwrap().unwrap();
++    assert_eq!(target, "taskState");
++    assert_eq!(routed, args);
++    let plan = ag1_core::tools::task_state::prepare(&[], &routed, "2026-09-13T15:00:00Z", "unused").unwrap();
++    assert_eq!(plan.next.unwrap().value()["objective"], "Current repair");
++    let update = json!({"action":"update","id":"entry","statement":"corrected"});
++    assert_eq!(surface::route("work", &update, &[]).unwrap().unwrap().1, update);
+ }
+ #[test]
+ fn preferred_surface_is_smaller_and_capability_gated_without_removing_legacy_definitions() {

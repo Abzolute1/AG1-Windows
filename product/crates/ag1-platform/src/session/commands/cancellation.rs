@@ -69,6 +69,36 @@ fn receipt(old: &StoredCommand) -> Result<Option<Receipt>, w::ProtocolError> {
 }
 
 impl SessionCommands {
+    /// Signal a live operation without requiring a new durable command
+    /// admission. This remains available when persistence or admission has
+    /// already failed, and is limited to this session's live queue.
+    pub(crate) fn emergency_cancel(
+        &self,
+        target: &w::OperationId,
+    ) -> Result<bool, ag1_core::DomainError> {
+        let cancelled = {
+            let book = self.book()?;
+            book.active
+                .as_ref()
+                .filter(|active| &active.operation == target)
+                .map(|active| active.cancelled.clone())
+                .or_else(|| {
+                    book.queue
+                        .iter()
+                        .find(|queued| &queued.operation == target)
+                        .map(|queued| queued.cancelled.clone())
+                })
+        };
+        let Some(cancelled) = cancelled else {
+            return Ok(false);
+        };
+        // The flag/source signal is set before any persistence-backed runtime
+        // bookkeeping. Preserve the cancellation even when that bookkeeping
+        // reports the same durability failure that stranded the stream.
+        let _ = self.runtime().cancel_command(&cancelled);
+        Ok(true)
+    }
+
     /// Resolve an immutable historical receipt without reconstructing a queue
     /// or treating delivery of cancellation as settlement of its target.
     pub(in crate::session) fn historical_terminal(
