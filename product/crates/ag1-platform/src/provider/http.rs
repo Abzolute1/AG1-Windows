@@ -123,8 +123,9 @@ pub trait GenerationRuntime: Send + Sync {
     }
     fn prepare<'a>(&'a self, request: &'a HttpRequest) -> ag1_core::PortFuture<'a, ()>;
     fn shutdown(&self) -> ag1_core::PortFuture<'_, ()>;
-    /// Success must prove this request's owned runtime has stopped. A remote
-    /// transport disconnect alone is not sufficient settlement evidence.
+    /// Success must prove the owned generation has stopped, either by verified
+    /// idle slots on the retained process or by authenticated process exit.
+    /// A transport disconnect alone is not sufficient settlement evidence.
     fn cancel_generation<'a>(&'a self, _url: &'a str) -> ag1_core::PortFuture<'a, ()> {
         Box::pin(async {
             Err(DomainError::Unavailable(

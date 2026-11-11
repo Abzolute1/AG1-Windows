@@ -6,12 +6,91 @@ use crate::{
 use ag1_core::DomainError;
 use serde::{Deserialize, Serialize};
 use std::{
+    ffi::OsStr,
     fs,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 type Result<T> = std::result::Result<T, DomainError>;
+
+/// The WSL launcher enables this only for the local desktop harness.  Keeping
+/// the switch host-owned means a model or renderer cannot expand its own file
+/// scope, while Windows volumes remain discoverable through the same read-only
+/// folder capabilities as every other local search.
+fn readonly_windows_volume_roots() -> Vec<PathBuf> {
+    if std::env::var_os("AG1_READONLY_WINDOWS_VOLUMES").as_deref()
+        != Some(OsStr::new("1"))
+    {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir("/mnt") else {
+        return Vec::new();
+    };
+    let mut roots = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            (name.len() == 1
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphabetic())
+                && entry.file_type().ok()?.is_dir())
+            .then(|| entry.path())
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
+}
+
+/// Add host-selected discovery roots without changing the chat's writable
+/// working directory.  These are deliberately regular folder grants so the
+/// native `read`, `ls`, `grep`, and `find` tools enforce the same path and
+/// identity checks as they do for user-selected folders.
+fn add_readonly_system_roots(
+    selection: &mut Selection,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<bool> {
+    let registry = WorkspaceService::new()?;
+    let mut changed = false;
+    for path in roots {
+        if selection.folders.len() >= 16
+            || selection
+                .folders
+                .iter()
+                .any(|grant| path.starts_with(&grant.path) || grant.path.starts_with(&path))
+        {
+            continue;
+        }
+        let root = registry.register(&path)?;
+        let (device, inode) = root.directory_identity();
+        selection.folders.push(Grant {
+            path: root.root().into(),
+            mode: AccessMode::ReadOnly,
+            available: true,
+            device,
+            inode,
+        });
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn persist_selection(path: &Path, selection: &Selection) -> Result<()> {
+    let bytes = serde_json::to_vec(selection).map_err(|_| DomainError::Conflict)?;
+    if bytes.len() > 24000 {
+        return Err(DomainError::LimitExceeded("Chat folder paths".into()));
+    }
+    let parent = path.parent().ok_or(DomainError::Conflict)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
+    file.write_all(&bytes).map_err(io_error)?;
+    file.as_file().sync_all().map_err(io_error)?;
+    file.persist(path).map_err(|e| io_error(e.error))?;
+    fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|_| DomainError::DurabilityUnknown)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,8 +169,36 @@ impl Snapshot {
         )))
     }
     pub fn prompt(&self) -> String {
+        let windows = self
+            .selection
+            .folders
+            .iter()
+            .filter(|grant| {
+                grant.mode == AccessMode::ReadOnly
+                    && grant.path.parent() == Some(Path::new("/mnt"))
+                    && grant
+                        .path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.len() == 1
+                                && name
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_alphabetic())
+                        })
+            })
+            .map(|grant| grant.path.display().to_string())
+            .collect::<Vec<_>>();
+        let windows_guidance = if windows.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nRead-only Windows discovery volumes: {}. In WSL, Windows C:\\ is /mnt/c. Use absolute paths under these roots with read, ls, grep, or find when asked to locate local files. They are not writable.",
+                windows.join(", ")
+            )
+        };
         format!(
-            "Chat folder access (user-controlled, revision {}):\nWorking folder: {}\n{}\nRelative paths use the working folder. Use absolute paths for other granted folders. If access is missing, ask the user to update Chat folders. Do not use shell or another tool to bypass a denied file request. Grants do not bypass operation approvals. Shell retains host-wide read access; only listed read/write folders permit persistent shell writes.",
+            "Chat folder access (revision {}; host-selected read-only discovery volumes may be included):\nWorking folder: {}\n{}{}\nRelative paths use the working folder. Use absolute paths for other granted folders. If access is missing, ask the user to update Chat folders. Do not use shell or another tool to bypass a denied file request. Grants do not bypass operation approvals. Only listed read/write folders permit persistent shell writes.",
             self.selection.revision,
             self.selection.primary.display(),
             self.selection
@@ -109,7 +216,8 @@ impl Snapshot {
                     }
                 ))
                 .collect::<Vec<_>>()
-                .join("\n")
+                .join("\n"),
+            windows_guidance,
         )
     }
 }
@@ -179,6 +287,18 @@ mod tests {
         update(&a, "primary", a.storage.root(), None).unwrap();
         let revoked = update(&a, "remove", &other, None).unwrap();
         assert!(revoked.resolve(other.to_str().unwrap(), false).is_err());
+    }
+    #[test]
+    fn host_discovery_roots_are_readonly_and_keep_the_project_primary() {
+        let (dir, access, _) = fixture();
+        let volume = dir.path().join("c");
+        fs::create_dir(&volume).unwrap();
+        let mut selection = access.snapshot().unwrap().selection;
+        assert!(add_readonly_system_roots(&mut selection, vec![volume.clone()]).unwrap());
+        assert_eq!(selection.primary, access.storage.root());
+        let snapshot = FolderAccess::bind(&access.storage, selection, access.fallback.clone()).unwrap();
+        assert!(snapshot.resolve(volume.to_str().unwrap(), false).is_ok());
+        assert!(snapshot.resolve(volume.to_str().unwrap(), true).is_err());
     }
     #[test]
     fn rejects_stale_overlapping_private_and_replaced_directories() {
@@ -256,7 +376,7 @@ impl FolderAccess {
                 PathBuf::from(home).join(".local/state/ag1"),
             ]);
         }
-        let selection = match fs::read(&path) {
+        let mut selection = match fs::read(&path) {
             Ok(bytes) if bytes.len() <= 32768 => serde_json::from_slice(&bytes).map_err(|_| {
                 DomainError::InvalidInput("Saved chat folder permissions are invalid".into())
             })?,
@@ -277,6 +397,10 @@ impl FolderAccess {
             }
             Err(e) => return Err(io_error(e)),
         };
+        let added_system_roots = add_readonly_system_roots(
+            &mut selection,
+            readonly_windows_volume_roots(),
+        )?;
         // A missing primary must not silently reactivate a revoked old project.
         let recovery = directory.join("unavailable");
         fs::create_dir_all(&recovery).map_err(io_error)?;
@@ -284,6 +408,9 @@ impl FolderAccess {
             .register(&recovery)?
             .for_conversation(storage.id())?;
         let value = Self::bind(&storage, selection, fallback.clone())?;
+        if added_system_roots {
+            persist_selection(&path, &value.selection)?;
+        }
         Ok(Arc::new(Self {
             value: Mutex::new(value),
             path,
@@ -421,20 +548,8 @@ impl FolderAccess {
         }
         next.revision = next.revision.checked_add(1).ok_or(DomainError::Conflict)?;
         let next = Self::bind(&self.storage, next, self.fallback.clone())?;
-        let bytes = serde_json::to_vec(&next.selection).map_err(|_| DomainError::Conflict)?;
-        if bytes.len() > 24000 {
-            return Err(DomainError::LimitExceeded("Chat folder paths".into()));
-        }
-        let mut file =
-            tempfile::NamedTempFile::new_in(self.path.parent().ok_or(DomainError::Conflict)?)
-                .map_err(io_error)?;
-        file.write_all(&bytes).map_err(io_error)?;
-        file.as_file().sync_all().map_err(io_error)?;
-        file.persist(&self.path).map_err(|e| io_error(e.error))?;
+        persist_selection(&self.path, &next.selection)?;
         *value = next.clone();
-        fs::File::open(self.path.parent().ok_or(DomainError::Conflict)?)
-            .and_then(|f| f.sync_all())
-            .map_err(|_| DomainError::DurabilityUnknown)?;
         Ok(next)
     }
 }

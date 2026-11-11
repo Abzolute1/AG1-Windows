@@ -291,6 +291,15 @@ function fakeStream(_model: any, context: any, options: any = {}) {
     content = [
       { type: "toolCall", id: randomUUID(), name: "read", arguments: { path: "README.md" } },
     ];
+  else if (instruction.includes("[outside-workspace]"))
+    content = [
+      {
+        type: "toolCall",
+        id: randomUUID(),
+        name: "write",
+        arguments: { path: "../outside-workspace.txt", content: "Boundary fixture mutation\n" },
+      },
+    ];
   else if (instruction.includes("[approval]") || instruction.includes("[large-approval]"))
     content = [
       {
@@ -446,6 +455,10 @@ async function create(file?: string) {
         approvedPolicyRequest = undefined;
         return true;
       }
+      // Routine project work is approved at the harness boundary. The SDK still
+      // refuses its non-negotiable shell hazards before reaching this handler.
+      // Only a write that crosses the current project boundary remains attended.
+      if (request.risk !== "critical") return true;
       return ask(request.summary + "\n" + request.details, "approval", request);
     },
   };
@@ -488,11 +501,10 @@ async function create(file?: string) {
     approvedPolicyRequest = undefined;
     const decision = evaluateToolSafety(name, context.args, safety);
     if (!decision.allow) return { block: true, reason: decision.reason };
-    if (
-      !["read", "grep", "find", "ls", "repo", "sourceContext", "artifact", "ask_user"].includes(
-        name,
-      )
-    ) {
+    // The safety policy marks writes outside the selected project as critical.
+    // Normal edits, tests, shell work, and registered tools are admitted
+    // without a per-call review so the model can complete ordinary work.
+    if (decision.approvalRequest?.risk === "critical") {
       const allowed = await ask(
         `${name}\n${JSON.stringify(context.args)}`,
         "approval",
@@ -501,8 +513,8 @@ async function create(file?: string) {
         signal,
       );
       if (!allowed) return { block: true, reason: "User denied the exact tool operation" };
-      if (decision.approvalRequest) approvedPolicyRequest = digest(decision.approvalRequest);
     }
+    if (decision.approvalRequest) approvedPolicyRequest = digest(decision.approvalRequest);
     try {
       return await previous?.(context, signal);
     } finally {
@@ -593,6 +605,18 @@ async function drain() {
   syncTree(join(state, "sessions"));
 }
 function nativeFiles(command: any) {
+  if (fixture === "true") {
+    const relative = command.args?.path;
+    if (typeof relative !== "string" || relative.includes("\0"))
+      throw new Error("Fixture file path required");
+    const path = resolve(root, relative);
+    if (path !== root && !path.startsWith(root + "/"))
+      throw new Error("Fixture file path escapes workspace");
+    if (command.action === "read") return { path: relative, text: fs.readFileSync(path, "utf8") };
+    if (command.action === "list") return fs.readdirSync(path, { withFileTypes: true }).map((entry) => ({ name: entry.name, directory: entry.isDirectory() }));
+    if (command.action === "diff") return { path: relative, changed: false };
+    throw new Error("Fixture file action unavailable");
+  }
   const result = spawnSync(nativeHost, ["--file-operation"], {
     input: JSON.stringify({ workspace: root, action: command.action, args: command.args }),
     encoding: "utf8",

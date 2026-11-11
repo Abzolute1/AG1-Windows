@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { Check, ChevronRight, Copy, Github, FileText, Search, LoaderCircle, Terminal, X } from "lucide-react";
+import { Check, ChevronRight, Copy, Github, FileText, Search, LoaderCircle, Terminal, X, Info } from "lucide-react";
 import type { ClientMessage, MessageBlock } from "./generated/protocol";
 import { ChatBlocks } from "./ChatBlocks";
 import { JournalImages, previewableImage, type ImageRun } from "./ImageAttachment";
@@ -7,7 +7,65 @@ import { GitHubResult } from "./GitHubResult";
 import "./workflow.css";
 import { SiteIcons, SourceList, webSources } from "./WebSources";
 type Call = Extract<MessageBlock, { kind: "tool" }>;
+type ToolOutcome = "complete" | "notice" | "unavailable" | "attention" | "failed";
 const labels: Record<string, string> = { read: "Read", ls: "List folder", grep: "Search", glob: "Find files", bash: "Run command", check: "Check", edit: "Edit", editPreview: "Preview edit", editApply: "Apply edit", append: "Append", write: "Write", webSearch: "Search the web", webFetch: "Fetch page", repo: "Inspect repository" };
+
+/**
+ * A provider or website declining automated access is useful context, but it is
+ * not an AG1 failure. Keep this deliberately narrow: unknown failures remain
+ * failures so an application/runtime problem is never softened by the UI.
+ */
+function toolDetail(results: ClientMessage[]): string {
+  return results.flatMap(message => message.blocks).filter((block): block is Extract<MessageBlock, { kind: "text" }> => block.kind === "text").map(block => block.text).join("\n").toLowerCase();
+}
+
+function toolCommand(call: Call | undefined): string {
+  const args = call?.arguments;
+  return args && typeof args === "object" && !Array.isArray(args) && typeof args.command === "string" ? args.command.toLowerCase() : "";
+}
+
+/**
+ * Shell exit codes often describe a recoverable condition rather than an
+ * application fault. Keep these signatures narrow: an unknown command error
+ * remains a true failure and stays red.
+ */
+function bashOutcome(call: Call | undefined, detail: string): ToolOutcome | null {
+  const command = toolCommand(call);
+  if (/command timed out|timed out after \d/.test(detail)) return "attention";
+  if (/read-only file system|permission denied|operation not permitted|unless you are root/.test(detail)) return "attention";
+  if (/ebadengine|unsupported engine|not compatible with your version of node|command not found/.test(detail)) return "attention";
+  if (/status:\s*needs_human|\bneeds_human\b/.test(detail)) return "attention";
+  if (/\b(?:enoent|no such file or directory)\b/.test(detail)) return "attention";
+  if (/exit(?:ed)? with code 141|sigpipe|broken pipe/.test(detail)) return "notice";
+  if (/\(no output\)\s*command exited with code [12]/.test(detail) && (/\b(?:grep|find)\b/.test(command) || (/\bls\b/.test(command) && command.includes("*")))) return "notice";
+  if (/\bpacman\b/.test(command) && (/\(no output\)|could not|failed|unavailable/.test(detail))) return "attention";
+  return null;
+}
+
+export function toolOutcome(call: Call | undefined, results: ClientMessage[]): ToolOutcome {
+  if (!results.some(message => message.tool?.failed)) return "complete";
+  const name = call?.name ?? results[0]?.tool?.name;
+  const detail = toolDetail(results);
+  if (name === "webSearch" && /duckduckgo|rate[ -]?limit|human verification|automated access|web blocked/.test(detail)) return "unavailable";
+  if (name === "webFetch" && /\b(?:403|429|451|503)\b|rate[ -]?limit|human verification|automated access|access denied|forbidden|cloudflare|captcha|timed out|timeout|connection reset/.test(detail)) return "unavailable";
+  if (name === "bash") return bashOutcome(call, detail) ?? "failed";
+  return "failed";
+}
+
+function outcomeLabel(call: Call | undefined, results: ClientMessage[], outcome: ToolOutcome): string {
+  if (outcome === "unavailable") return call?.name === "webSearch" ? "Search unavailable" : "Page unavailable";
+  if (outcome === "notice") return "No matching result";
+  if (outcome !== "attention") return "";
+  const detail = toolDetail(results);
+  if (/command timed out|timed out after \d/.test(detail)) return "Command timed out";
+  if (/read-only file system|permission denied|operation not permitted/.test(detail)) return "Path not writable";
+  if (/unless you are root/.test(detail)) return "Permission required";
+  if (/ebadengine|unsupported engine|not compatible with your version of node|command not found/.test(detail)) return "Runtime prerequisite missing";
+  if (/status:\s*needs_human|\bneeds_human\b/.test(detail)) return "Setup needs input";
+  if (/\b(?:enoent|no such file or directory)\b/.test(detail)) return "File unavailable";
+  if (/\bpacman\b/.test(toolCommand(call))) return "System packages unavailable";
+  return "Needs attention";
+}
 export function toolTarget(call: Call): string {
   const args = call.arguments;
   if (!args || typeof args !== "object" || Array.isArray(args)) return "";
@@ -71,14 +129,16 @@ export const ToolOutput = memo(function ToolOutput({ message, run, loading = fal
 });
 function ToolEntry({ call, results, active, run, onExpand, loading }: { call?: Call; results: ClientMessage[]; active: boolean; run: ImageRun; onExpand: (id: string) => void; loading: (id: string) => boolean }) {
   const [open, setOpen] = useState(false), [argumentsOpen, setArgumentsOpen] = useState(false);
-  const failed = results.some(m => m.tool?.failed), target = call ? toolTarget(call) : "";
+  const outcome = toolOutcome(call, results), failed = outcome === "failed", unavailable = outcome === "unavailable", attention = outcome === "attention", notice = outcome === "notice", target = call ? toolTarget(call) : "";
   const source = results.flatMap(m => m.blocks).find(b => b.kind === "unknown" && b.value && typeof b.value === "object" && !Array.isArray(b.value) && b.value.kind === "mcp_result");
   const capability = source?.kind === "unknown" && source.value && typeof source.value === "object" && !Array.isArray(source.value) ? source.value.capability : undefined;
-  const label = failed && call?.name === "webSearch" ? "Search unavailable" : typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : results[0]?.tool?.name || "Tool output";
+  const name = call?.name ?? results[0]?.tool?.name;
+  const status = outcomeLabel(call, results, outcome);
+  const label = unavailable ? status : typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : name || "Tool output";
   const Icon = call?.name === "github" ? Github : ["read", "inspect", "write", "edit"].includes(call?.name ?? "") ? FileText : ["grep", "find", "webSearch"].includes(call?.name ?? "") ? Search : Terminal;
   const sources = results.flatMap(webSources);
-  return <div className={`tool-entry ${failed ? "failed" : ""}`}>
-    <button className="tool-entry-toggle" aria-expanded={open} onClick={() => { setOpen(!open); if (!open) results.forEach(m => onExpand(m.id)); }}>{failed ? <X size={14} /> : active && !results.length ? <LoaderCircle size={14} className="spin" /> : sources.length ? <SiteIcons sources={sources} run={run} /> : <Icon size={14} />}<span>{label}</span>{sources.length > 0 && <small className="web-source-count">{sources.length} {sources.length === 1 ? "source" : "sources"}</small>}{target && <span className="tool-target" title={target}>{target}</span>}{failed && <small>Failed</small>}{!active && !results.length && <small>No result</small>}<ChevronRight size={12} className={open ? "expanded" : ""} /></button>
+  return <div className={`tool-entry ${failed ? "failed" : ""} ${unavailable ? "unavailable" : ""} ${attention ? "attention" : ""} ${notice ? "notice" : ""}`}>
+    <button className="tool-entry-toggle" aria-expanded={open} onClick={() => { setOpen(!open); if (!open) results.forEach(m => onExpand(m.id)); }}>{failed ? <X size={14} /> : unavailable || attention || notice ? <Info size={14} /> : active && !results.length ? <LoaderCircle size={14} className="spin" /> : sources.length ? <SiteIcons sources={sources} run={run} /> : <Icon size={14} />}<span>{label}</span>{sources.length > 0 && <small className="web-source-count">{sources.length} {sources.length === 1 ? "source" : "sources"}</small>}{target && <span className="tool-target" title={target}>{target}</span>}{failed && <small>Failed</small>}{unavailable && <small>Unavailable</small>}{attention && <small>{status}</small>}{notice && <small>{status}</small>}{!active && !results.length && <small>No result</small>}<ChevronRight size={12} className={open ? "expanded" : ""} /></button>
     {open && <div className="tool-entry-body">
       {sources.length > 0 && <SourceList sources={sources} run={run} />}
       {call && <><button className="tool-arguments-toggle" aria-expanded={argumentsOpen} onClick={() => setArgumentsOpen(!argumentsOpen)}>Arguments</button>{argumentsOpen && <pre className="tool-arguments">{JSON.stringify(call.arguments, null, 2)}</pre>}</>}
@@ -96,10 +156,18 @@ export function ActivityGroup({ messages, active, compact, run, onExpand, loadin
   const results = messages.filter(m => m.role === "toolResult");
   const ids = new Set(calls.map(c => c.call_id));
   const matched = (call: Call) => results.filter(m => m.tool?.call_id === call.call_id);
-  const failures = results.filter(m => m.tool?.failed).length;
+  const failedResults = results.filter(m => m.tool?.failed);
+  const outcomes = failedResults.map(result => toolOutcome(calls.find(call => call.call_id === result.tool?.call_id), [result]));
+  const unavailable = outcomes.filter(outcome => outcome === "unavailable").length;
+  const attention = outcomes.filter(outcome => outcome === "attention").length;
+  const notices = outcomes.filter(outcome => outcome === "notice").length;
+  const recoverable = unavailable + attention + notices;
+  const failures = failedResults.length - recoverable;
   const count = calls.length + results.filter(m => !m.tool?.call_id || !ids.has(m.tool.call_id)).length;
   const images = [...new Set(results.filter(m => !m.tool?.failed).flatMap(m => m.blocks.flatMap(b => b.kind === "attachment" && previewableImage(b.media_type) ? [b.reference] : [])))];
-  return <><div className={`work-summary response-work ${active ? "is-working" : ""}`}><button type="button" className="work-toggle" disabled={!messages.length} aria-expanded={!!messages.length && open} onClick={() => setExpanded(!open)}>{active && <LoaderCircle size={13} className="spin" />}<span>{active ? time ? `Working for ${time}` : "Working…" : time ? `Worked for ${time}` : "Work details"}</span>{!!messages.length && <ChevronRight size={12} className={open ? "expanded" : ""} />}{count > 0 && <small>{count} {count === 1 ? "tool" : "tools"}</small>}{failures > 0 && <small className="danger-text">{failures} failed</small>}</button>
+  const unavailableLabel = unavailable > 1 && failedResults.filter(result => (calls.find(call => call.call_id === result.tool?.call_id)?.name ?? result.tool?.name) === "webSearch").length === unavailable ? `DuckDuckGo unavailable (${unavailable} searches paused)` : `${unavailable} unavailable`;
+  const recoverableLabel = recoverable === 1 ? "1 recoverable outcome" : `${recoverable} recoverable outcomes`;
+  return <><div className={`work-summary response-work ${active ? "is-working" : ""}`}><button type="button" className="work-toggle" disabled={!messages.length} aria-expanded={!!messages.length && open} onClick={() => setExpanded(!open)}>{active && <LoaderCircle size={13} className="spin" />}<span>{active ? time ? `Working for ${time}` : "Working…" : time ? `Worked for ${time}` : "Work details"}</span>{!!messages.length && <ChevronRight size={12} className={open ? "expanded" : ""} />}{count > 0 && <small>{count} {count === 1 ? "tool" : "tools"}</small>}{recoverable > 0 && <small className="recovery-text">{unavailable > 1 && unavailable === recoverable ? unavailableLabel : recoverableLabel}</small>}{failures > 0 && <small className="danger-text">{failures} failed</small>}</button>
     {open && !!messages.length && <div className="work-log">{messages.map(m => <div key={m.id} className="work-step">{m.role === "assistant" && <>{renderAssistant?.(m)}{m.blocks.filter((b): b is Call => b.kind === "tool").map(call => <ToolEntry key={call.call_id} call={call} results={matched(call)} active={active} run={run} onExpand={onExpand} loading={loading} />)}</>}{m.role === "toolResult" && (!m.tool?.call_id || !ids.has(m.tool.call_id)) && <ToolEntry results={[m]} active={false} run={run} onExpand={onExpand} loading={loading} />}</div>)}</div>}
   </div>{calls.filter(call => call.name === "github").flatMap(call => matched(call).filter(m => prominentGitHub(m)).map(m => <GitHubResult key={m.id} call={call} message={m} expand={() => onExpand(m.id)}><ToolOutput message={m} run={run} loading={loading(m.id)} /></GitHubResult>))}{images.length > 0 && <div className="assistant-message image-results" aria-label="Image results">{images.map(reference => <JournalImages key={reference} reference={reference} run={run} inline />)}</div>}</>;
 }

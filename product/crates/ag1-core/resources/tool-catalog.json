@@ -36,7 +36,7 @@
   {
     "name": "bash",
     "label": "bash",
-    "description": "Execute a bash command in the current working directory. Use this for pipelines, tests, git log/blame, jq, and other shell work — not as a substitute for read, grep, find, ls, repo, job, or memory. Returns stdout and stderr. Oversized output is externalized when session artifacts are available; the active preview is limited to the last 2000 lines or 50KB. Default timeout: 300s.",
+    "description": "Execute a bash command in the current working directory. Use this for pipelines, tests, git log/blame, jq, and other shell work — not as a substitute for read, grep, find, ls, repo, job, or memory. Bash can also inspect the host filesystem read-only when a task explicitly asks for system-wide discovery. Keep those searches bounded to named roots and use a suitable timeout. Returns stdout and stderr. Oversized output is externalized when session artifacts are available; the active preview is limited to the last 2000 lines or 50KB. Default timeout: 300s.",
     "parameters": {
       "type": "object",
       "required": [
@@ -58,6 +58,9 @@
       "Prefer read, grep, find, and ls for routine inspection when those dedicated tools are sufficient.",
       "Use bash when shell semantics, compound commands, or tools outside the dedicated toolset are actually needed.",
       "After an inspection-style bash command surfaces the needed path or status, switch to a targeted read/grep/find step instead of repeating shell discovery.",
+      "For host-wide read-only discovery, start with command -v or type -P, then search bounded roots such as /usr, /opt, /home, or one explicit /mnt/c path; never use find / or another unbounded recursive scan.",
+      "Run independent probes separately or make expected no-match checks explicit with || true; command -v, grep, package listings, and snap/flatpak queries commonly return exit 1 when nothing is installed.",
+      "Keep system searches focused with explicit roots, maxdepth or a narrow glob, and a timeout that matches the scope so a slow scan is reported as a bounded search rather than a generic failure.",
       "Do not start python -m http.server, npx serve, or similar just to screenshot static HTML — call screenshot_url or verify_ui with the file path.",
       "Do not bash-sleep to wait on a background test/build. Use job wait with the job id.",
       "Do not bash tsc, cargo check, go build, gcc, or cmake --build — use check."
@@ -236,7 +239,7 @@
   {
     "name": "grep",
     "label": "grep",
-    "description": "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.",
+    "description": "Search file contents for a pattern in the current workspace or granted folder. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars. Use bash for explicitly requested host-wide read-only searches outside granted folders.",
     "parameters": {
       "type": "object",
       "required": [
@@ -284,7 +287,7 @@
   {
     "name": "find",
     "label": "find",
-    "description": "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first).",
+    "description": "Search for files by glob pattern in the current workspace or granted folder. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first). Use bash with bounded roots for explicitly requested host-wide read-only discovery.",
     "parameters": {
       "type": "object",
       "required": [

@@ -154,6 +154,34 @@ where
             })
             .await
     }
+    async fn settle_cancelled_generation(&self) -> Result<()> {
+        let state = self.state.clone();
+        let plans = self.plans.clone();
+        let timeout = self.load_timeout.min(Duration::from_secs(30));
+        self.pool.submit(move || {
+            let mut s = state.lock().map_err(|_| DomainError::DurabilityUnknown)?;
+            let Some(model) = s.active.clone() else { return Ok(()); };
+            let plan = &plans[&model];
+            let started = Instant::now();
+            loop {
+                // Closing the response cancels llama.cpp's request. Retain the
+                // model and lease, and acknowledge only verified slot settlement.
+                if s.controller.poll_generation_idle(plan)? {
+                    s.events.push(Event {
+                        model, plan_sha256: plan.plan_sha256.clone(),
+                        action: "owned_generation_cancelled".into(),
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                    });
+                    if s.events.len() > 1024 { s.events.remove(0); }
+                    return Ok(());
+                }
+                if started.elapsed() >= timeout { return Err(DomainError::TimedOut); }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            // An unavailable/uncertain observation keeps the model alive and
+            // leaves the caller's generation permit quarantined for recovery.
+        }).await
+    }
     async fn ensure(&self, model: String) -> Result<()> {
         if !self.plans.contains_key(&model) {
             return Err(DomainError::PermissionDenied);
@@ -171,6 +199,8 @@ where
                     return Err(DomainError::PermissionDenied);
                 }
                 let plan = &plans[&model];
+                let previous_progress = progress.lock().ok().and_then(|value| value.clone());
+                let mut started_here = false;
                 let started_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let phase = |name: &str| {
                     if let Ok(mut value) = progress.lock() {
@@ -192,6 +222,9 @@ where
                                 *value = Some(serde_json::json!({"model":model,"phase":"verifying","percent":percent,"started_at":started_at}));
                             }
                         })?;
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(DomainError::Cancelled);
+                    }
                     if let Some(previous) = s.active.clone()
                         && s.controller.reap_exited_owned_runtime()?
                     {
@@ -220,6 +253,7 @@ where
                         }
                         phase("loading");
                         s.controller.start_owned_runtime(plan)?;
+                        started_here = true;
                         s.active = Some(model.clone());
                         s.events.push(Event {
                             model: model.clone(),
@@ -250,7 +284,13 @@ where
                     phase("ready");
                     Ok(())
                 })();
-                if let Err(error) = &result {
+                if result == Err(DomainError::Cancelled) && !started_here {
+                    // Cancelling admission to an existing model must not eject
+                    // it. A newly started, incomplete load still drains below.
+                    if let Ok(mut value) = progress.lock() {
+                        *value = if s.active.is_some() { previous_progress } else { None };
+                    }
+                } else if let Err(error) = &result {
                     phase("failed");
                     if let Ok(mut value) = progress.lock()
                         && let Some(value) = value.as_mut() {
@@ -297,7 +337,7 @@ where
             if endpoint_origin(url)? != self.origin {
                 return Err(DomainError::PermissionDenied);
             }
-            self.unload_owned().await
+            self.settle_cancelled_generation().await
         })
     }
     fn shutdown(&self) -> PortFuture<'_, ()> {

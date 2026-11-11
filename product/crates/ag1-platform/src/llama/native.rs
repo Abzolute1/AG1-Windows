@@ -287,6 +287,9 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             _ => Err(DomainError::Conflict),
         }
     }
+    fn generation_idle(&mut self, _handle: &Self::Handle, plan: &LaunchPlan) -> Result<bool, DomainError> {
+        super::observation::blocking_generation_idle(plan)
+    }
     fn stop(&mut self, handle: &mut Self::Handle) -> Result<(), DomainError> {
         // The helper owns/reaps the target tree even if its original PID exited.
         // No discovered target PID is ever used as a signal capability.

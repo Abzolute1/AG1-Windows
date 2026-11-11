@@ -22,6 +22,11 @@ pub struct Audit {
     pub loading: bool,
     pub external: bool,
     pub maximum_active: usize,
+    pub generation_busy: bool,
+    pub idle_polls: usize,
+    pub idle_observation_error: bool,
+    pub verification_hold: bool,
+    pub verification_calls: usize,
 }
 pub struct FakeHost {
     pub audit: Arc<Mutex<Audit>>,
@@ -38,6 +43,10 @@ impl FakeHost {
 impl RuntimeHost for FakeHost {
     type Handle = String;
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError> {
+        self.audit.lock().unwrap().verification_calls += 1;
+        while self.audit.lock().unwrap().verification_hold {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         self.verifier.verify(materials)
     }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError> {
@@ -77,6 +86,15 @@ impl RuntimeHost for FakeHost {
     }
     fn owned_alive(&mut self, handle: &String) -> Result<bool, DomainError> {
         Ok(self.audit.lock().unwrap().active.as_ref() == Some(handle))
+    }
+    fn generation_idle(&mut self, handle: &String, _plan: &LaunchPlan) -> Result<bool, DomainError> {
+        let mut audit = self.audit.lock().unwrap();
+        assert_eq!(audit.active.as_ref(), Some(handle));
+        audit.idle_polls += 1;
+        if audit.idle_observation_error {
+            return Err(DomainError::Unavailable("fixture idle observation failed".into()));
+        }
+        Ok(!audit.generation_busy)
     }
     fn stop(&mut self, handle: &mut String) -> Result<(), DomainError> {
         let mut a = self.audit.lock().unwrap();

@@ -87,7 +87,6 @@ impl Host {
         fs::create_dir_all(&preference_state).map_err(crate::io_error)?;
         let approval_policy =
             approval_policy::ApprovalPolicy::open(&preference_state, "interactive")?;
-        approval_policy.set(ag1_core::tools::policy::Mode::Interactive)?;
         let ui = Arc::new(extensions::Ui::default());
         let source = &self.services;
         let services = Arc::new(Services {

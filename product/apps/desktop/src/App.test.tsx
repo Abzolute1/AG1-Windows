@@ -582,6 +582,15 @@ test("pasting an image creates a removable preview without sending or replacing 
   await waitFor(() => expect(screen.queryByRole("button", { name: "Preview pasted.png" })).toBeNull());
 });
 
+test("pasting an image exposed by WebKit as a clipboard item creates a preview", async () => {
+  URL.createObjectURL = vi.fn(() => "blob:item-pasted"); URL.revokeObjectURL = vi.fn();
+  render(<App />);
+  const composer = screen.getByRole("textbox", { name: "Message AG1" });
+  const file = new File(["png bytes"], "item-pasted.png", { type: "image/png" });
+  fireEvent.paste(composer, { clipboardData: { files: [], items: [{ kind: "file", type: "image/png", getAsFile: () => file }], getData: () => "" } });
+  expect(await screen.findByRole("button", { name: "Preview item-pasted.png" })).toBeTruthy();
+});
+
 test("native navigation keeps background work alive, restores drafts, and Stop targets the visible conversation", async () => {
   const make = (session: string) => ({ snapshot: { version: { major: 1, minor: 0, schema: "fixture" }, scope: { workspace: "ws", session, instance: session, epoch: "1" }, revision: "1", watermark: "1", workspace_path: "/private/general-chat", status: "streaming", active_operation: `run-${session}`, messages: [], message_count: 1, pending: [], model: "initial", diagnostic: null, session_file: null, fixture_provider: true }, details: { context: { selected_model: { provider: "fixture" } }, activity: {}, messages: [{ id: `user-${session}`, role: "user", blocks: [{ kind: "text", text: `Question ${session}` }] }] }, error: null, progress: "" });
   const views = { a: make("a"), b: make("b") }; let selected: "a" | "b" = "a";
@@ -621,6 +630,23 @@ test("project plus browses folders and cancellation preserves the selected works
   fireEvent.click(screen.getByRole("button", { name: "Browse folders…" }));
   await waitFor(() => expect(invoke.mock.calls.filter(([name]) => name === "choose_chat_folder")).toHaveLength(2));
   expect((screen.getByRole("textbox", { name: "Project folder" }) as HTMLInputElement).value).toBe("/home/alex/New project");
+});
+
+test("a denied folder error opens a prefilled read/write grant", async () => {
+  const snapshot = { version: { major: 1, minor: 0, schema: "fixture" }, scope: { workspace: "ws", session: "s", instance: "i", epoch: "1" }, revision: "1", watermark: "1", workspace_path: "/private/general-chat", status: "idle", active_operation: null, messages: [], message_count: 0, pending: [], model: "fixture", diagnostic: null, session_file: null, fixture_provider: true };
+  const selection = { revision: 1, primary: "/private/general-chat", folders: [{ path: "/private/general-chat", mode: "read_write", available: true }] };
+  invoke.mockImplementation(async (name: string, args: any) => {
+    if (name === "catalog") return { projects: [], chats: [], theme: "light" };
+    if (name === "bridge_view") return { snapshot, error: "Folder access is not granted for /home/alex/Project. Ask the user to add its folder in Chat folders; do not work around this with another tool.", progress: "", details: { authority: "rust-isolated", messages: [], task: null, context: { folder_access: selection }, memory: null, artifacts: [], activity: {}, models: [], capabilities: [] } };
+    if (name === "bridge_command") return { kind: "reply", id: args.envelope.id, scope: snapshot.scope, revision: "1", durable: false, status: "query", data: selection };
+    return null;
+  });
+  render(<App />);
+  await screen.findByText(/Folder access is not granted/);
+  fireEvent.click(screen.getByRole("button", { name: "Make this folder writable…" }));
+  expect(await screen.findByRole("dialog")).toBeTruthy();
+  expect((screen.getByLabelText("Add a folder") as HTMLInputElement).value).toBe("/home/alex/Project");
+  expect((screen.getByRole("combobox", { name: "New folder access" }) as HTMLSelectElement).value).toBe("read_write");
 });
 
 test("manual local model loading preserves an editable draft and sends no prompt", async () => {

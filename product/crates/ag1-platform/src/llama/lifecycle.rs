@@ -59,6 +59,11 @@ pub trait RuntimeHost {
     fn spawn(&mut self, plan: &LaunchPlan) -> Result<Self::Handle, DomainError>;
     /// Verifies both process lifetime and executable identity; false means exited.
     fn owned_alive(&mut self, handle: &Self::Handle) -> Result<bool, DomainError>;
+    /// Called after the cancelled HTTP stream is closed. Idle observation settles
+    /// generation without releasing the authenticated process or its loaded model.
+    fn generation_idle(&mut self, _handle: &Self::Handle, _plan: &LaunchPlan) -> Result<bool, DomainError> {
+        Err(DomainError::Unavailable("Owned generation status unavailable".into()))
+    }
     /// Returns only after verified exit. Never signals a process found just by port.
     fn stop(&mut self, handle: &mut Self::Handle) -> Result<(), DomainError>;
     /// Optional authenticated runtime observation, never a control capability.
@@ -236,6 +241,20 @@ impl<H: RuntimeHost> RuntimeController<H> {
         self.plan_hash = None;
         self.state = RuntimeState::Inspect;
         Ok(())
+    }
+    pub fn poll_generation_idle(&mut self, plan: &LaunchPlan) -> Result<bool, DomainError> {
+        if self.plan_hash.as_deref() != Some(&plan.plan_sha256) {
+            return Err(DomainError::Conflict);
+        }
+        let handle = self.owned.as_ref().ok_or(DomainError::PermissionDenied)?;
+        if !self.host.owned_alive(handle)? {
+            return Err(DomainError::Unavailable("Owned runtime exited".into()));
+        }
+        let idle = self.host.generation_idle(handle, plan)?;
+        if !self.host.owned_alive(handle)? {
+            return Err(DomainError::Unavailable("Owned runtime exited".into()));
+        }
+        Ok(idle)
     }
     pub fn timeout_loading(&mut self) -> Result<(), DomainError> {
         self.stop_owned_runtime()?;

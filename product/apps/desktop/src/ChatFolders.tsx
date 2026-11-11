@@ -5,11 +5,12 @@ export type FolderMode = "read_only" | "read_write";
 export type FolderSelection = { revision: number; primary: string; folders: { path: string; mode: FolderMode; available?: boolean }[] };
 export type FolderChange = { revision: number; action: "add" | "mode" | "primary" | "remove"; path: string; mode?: FolderMode };
 
-export function ChatFolders({ selection, blocked, change, chooseFolder = api.chooseChatFolder }: { selection?: FolderSelection; blocked?: string; change: (request: FolderChange) => Promise<FolderSelection>; chooseFolder?: () => Promise<string | null> }) {
-  const [value, setValue] = useState(selection), [path, setPath] = useState(""), [mode, setMode] = useState<FolderMode>("read_only");
+export function ChatFolders({ selection, blocked, requestedPath, change, chooseFolder = api.chooseChatFolder }: { selection?: FolderSelection; blocked?: string; requestedPath?: string; change: (request: FolderChange) => Promise<FolderSelection>; chooseFolder?: () => Promise<string | null> }) {
+  const [value, setValue] = useState(selection), [path, setPath] = useState(requestedPath || ""), [mode, setMode] = useState<FolderMode>(requestedPath ? "read_write" : "read_only");
   const [busy, setBusy] = useState(false), [error, setError] = useState("");
   const pending = useRef(false);
   useEffect(() => { setValue(selection); }, [selection]);
+  useEffect(() => { if (requestedPath) { setPath(requestedPath); setMode("read_write"); } }, [requestedPath]);
   async function browse() {
     if (blocked || pending.current) return;
     pending.current = true; setBusy(true); setError("");

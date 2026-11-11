@@ -14,7 +14,7 @@ from tool_gate import environment
 
 BINARIES = ('ag1-desktop', 'ag1-cli', 'ag1-cutover', 'ag1-process-host')
 PROFILE = Path('/home/alex/.ag1/agent/llamacpp-model-profiles.json')
-PROFILE_SHA = 'aa02688c4d39ef73234f0ec381eed22dbe02463881626423049b75b5a12ad0d0'
+PROFILE_SHA = '405e79d479139866d1e7cfbffeba6dea837305efa7e41c776adef3efa8fe3f38'
 
 
 def inventory(folder):

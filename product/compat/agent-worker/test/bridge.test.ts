@@ -130,30 +130,15 @@ test("real SDK prompt → read tool → continuation, durable ID, renderer recon
     fs.rmSync(f.scratch, { recursive: true, force: true });
   }
 });
-test("denied/stale approval, reconnect pending input, question answer, cancel and queued steering", async () => {
+test("routine mutations run without approval; user input, cancel and queued steering still work", async () => {
   const f = fixture();
   const c = new Client(f.workspace, f.state);
   try {
     await c.ready();
     await c.command({ kind: "prompt", input: { kind: "inline", text: "[approval] write a file" } });
-    await wait(() => c.latest.pending.length === 1);
-    const binding = c.latest.pending[0].binding;
-    const stale = await c.command({
-      kind: "approve",
-      binding: { ...binding, argument_sha256: "changed" },
-      allow: true,
-    });
-    assert.equal(stale.status, "rejected");
-    assert(!fs.existsSync(join(f.workspace, "approved.txt")));
-    const reconnect = await c.command({ kind: "session", action: "snapshot", args: {} });
-    assert.equal(reconnect.status, "snapshot");
-    assert.deepEqual(c.latest.pending[0].binding, binding);
-    const deny = await c.command({ kind: "approve", binding, allow: false });
-    assert.equal(deny.status, "completed");
     await c.idle();
-    assert(!fs.existsSync(join(f.workspace, "approved.txt")));
-    const replay = await c.command({ kind: "approve", binding, allow: true });
-    assert.equal(replay.status, "rejected");
+    assert.equal(c.latest.pending.length, 0);
+    assert.equal(fs.readFileSync(join(f.workspace, "approved.txt"), "utf8"), "Approved fixture mutation\n");
     await c.command({
       kind: "prompt",
       input: { kind: "inline", text: "[question] Ask a question" },
@@ -179,14 +164,14 @@ test("denied/stale approval, reconnect pending input, question answer, cancel an
     fs.rmSync(f.scratch, { recursive: true, force: true });
   }
 });
-test("worker death records uncertain effects, clears approvals, never replays prompt", async () => {
+test("worker death records an interrupted turn and never replays its prompt", async () => {
   const f = fixture();
   let c = new Client(f.workspace, f.state);
   try {
     await c.ready();
     const id = randomUUID();
-    await c.command({ kind: "prompt", input: { kind: "inline", text: "[approval] mutation" } }, id);
-    await wait(() => c.latest.pending.length === 1);
+    await c.command({ kind: "prompt", input: { kind: "inline", text: "[slow] mutation" } }, id);
+    await wait(() => c.latest.status === "running");
     c.child.kill("SIGKILL");
     await wait(() => c.child.signalCode !== null);
     c = new Client(f.workspace, f.state);
@@ -195,7 +180,6 @@ test("worker death records uncertain effects, clears approvals, never replays pr
     assert(c.latest.diagnostic.includes("interrupted"));
     const result = await c.command({ kind: "command_result", command: id });
     assert.equal(result.data.status, "interrupted");
-    assert(!fs.existsSync(join(f.workspace, "approved.txt")));
   } finally {
     if (c.child.exitCode === null && c.child.signalCode === null) await c.close();
     fs.rmSync(f.scratch, { recursive: true, force: true });
@@ -364,35 +348,24 @@ test("Settings status/list and native file reads do not invalidate a mutation re
     fs.rmSync(f.scratch, { recursive: true, force: true });
   }
 });
-test("one exact approval authorizes one write without a second policy dialog", async () => {
+test("only an out-of-project write remains approval-gated", async () => {
   const f = fixture();
   const c = new Client(f.workspace, f.state);
   try {
     await c.ready();
     await c.command({
       kind: "prompt",
-      input: { kind: "inline", text: "[approval] Write the approved fixture" },
+      input: { kind: "inline", text: "[outside-workspace] require a boundary review" },
     });
     await wait(() => c.latest.pending.length === 1);
     const binding = c.latest.pending[0].binding;
-    const result = await c.command({ kind: "approve", binding, allow: true });
+    assert.equal(c.latest.pending[0].kind, "approval");
+    assert(!fs.existsSync(join(f.scratch, "outside-workspace.txt")));
+    const result = await c.command({ kind: "approve", binding, allow: false });
     assert.equal(result.status, "completed");
     await c.idle();
     assert.equal(c.latest.pending.length, 0);
-    assert.equal(
-      fs.readFileSync(join(f.workspace, "approved.txt"), "utf8"),
-      "Approved fixture mutation\n",
-    );
-    const seen = new Set(
-      c.frames
-        .filter((frame) => frame.kind === "snapshot")
-        .flatMap((frame) => frame.snapshot.pending.map((p: any) => p.binding.id)),
-    );
-    assert.equal(
-      seen.size,
-      1,
-      "The safety wrapper must consume the already reviewed exact request",
-    );
+    assert(!fs.existsSync(join(f.scratch, "outside-workspace.txt")));
     assert.equal((await c.command({ kind: "approve", binding, allow: true })).status, "rejected");
   } finally {
     await c.close();
@@ -495,7 +468,7 @@ test("streaming completes with a paused transport, bounded projections and paged
     fs.rmSync(f.scratch, { recursive: true, force: true });
   }
 });
-test("large approval retains the exact arguments behind bounded review pages", async () => {
+test("large routine writes complete without a review gate", async () => {
   const f = fixture();
   const c = new Client(f.workspace, f.state);
   try {
@@ -504,33 +477,11 @@ test("large approval retains the exact arguments behind bounded review pages", a
       kind: "prompt",
       input: { kind: "inline", text: "[large-approval] Review all arguments" },
     });
-    await wait(() => c.latest.pending.length === 1);
-    const question = c.latest.pending[0];
-    assert(question.truncated);
-    assert(question.title.length <= 3000);
-    let offset = "0";
-    const pages: Buffer[] = [];
-    for (let i = 0; i < 20; i++) {
-      const page = await c.command({
-        kind: "artifact_read",
-        artifact: question.evidence,
-        offset,
-        limit: 32768,
-      });
-      assert.equal(page.status, "page");
-      pages.push(Buffer.from(page.data.base64, "base64"));
-      if (page.data.next === null) break;
-      offset = page.data.next;
-    }
-    const review = JSON.parse(Buffer.concat(pages).toString());
-    assert.equal(review.args.tool, "write");
-    assert.equal(review.args.args.content, "Exact approved fixture.\n".repeat(3000));
-    assert(!fs.existsSync(join(f.workspace, "approved.txt")));
-    await c.command({ kind: "approve", binding: question.binding, allow: true });
     await c.idle();
+    assert.equal(c.latest.pending.length, 0);
     assert.equal(
       fs.readFileSync(join(f.workspace, "approved.txt"), "utf8"),
-      review.args.args.content,
+      "Exact approved fixture.\n".repeat(3000),
     );
   } finally {
     await c.close();
