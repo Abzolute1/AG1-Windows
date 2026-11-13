@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Globe } from "lucide-react";
 import type { ClientMessage } from "./generated/protocol";
 import type { ImageRun } from "./ImageAttachment";
-export type WebSource = { entry: string; url: string; title: string; host: string };
+export type WebSource = { entry: string; url: string; title: string; description: string; host: string };
 export function webSources(message: ClientMessage): WebSource[] {
   if (message.tool?.failed || !["webSearch", "webFetch"].includes(message.tool?.name ?? "")) return [];
   const block = message.blocks.find(b => b.kind === "unknown" && (b.value as any)?.kind === "web_result");
@@ -12,7 +12,14 @@ export function webSources(message: ClientMessage): WebSource[] {
     try {
       const url = new URL(row.url);
       if (!["https:", "http:"].includes(url.protocol) || url.username || url.password) return [];
-      return [{ entry: message.id, url: url.href, title: String(row.title || url.hostname).slice(0, 240), host: url.hostname.replace(/^www\./, "") }];
+      return [{
+        entry: message.id,
+        url: url.href,
+        title: String(row.title || url.hostname).slice(0, 240),
+        // This comes from the search result itself. It is not fetched by the UI.
+        description: String(row.description || "").replace(/\s+/g, " ").trim().slice(0, 280),
+        host: url.hostname.replace(/^www\./, ""),
+      }];
     } catch { return []; }
   });
 }
@@ -90,5 +97,5 @@ export function SiteIcons({ sources, run }: { sources: WebSource[]; run: ImageRu
   return <span className="site-icons" aria-label={unique.map(s => s.host).join(", ")}>{unique.map(source => <SiteIcon key={source.host} source={source} run={run} />)}</span>;
 }
 export function SourceList({ sources, run }: { sources: WebSource[]; run: ImageRun }) {
-  return <div className="web-sources" aria-label="Web sources">{sources.map(source => <a key={source.url} className="web-source" href={source.url} target="_blank" rel="noopener noreferrer"><SiteIcon source={source} run={run} /><span><strong>{source.title}</strong><small>{source.host}</small></span></a>)}</div>;
+  return <div className="web-sources" aria-label="Web sources">{sources.map(source => <a key={source.url} className="web-source" href={source.url} target="_blank" rel="noopener noreferrer"><SiteIcon source={source} run={run} /><span><strong>{source.title}</strong><small>{source.host}</small>{source.description && <p>{source.description}</p>}</span></a>)}</div>;
 }

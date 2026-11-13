@@ -4230,15 +4230,22 @@ fn web_sources(message: &Value) -> Option<Vec<Value>> {
         {
             continue;
         }
-        let title = details["results"]
+        let result = details["results"]
             .as_array()
             .into_iter()
             .flatten()
-            .find(|row| row["url"] == url)
+            .find(|row| row["url"] == url);
+        let title = result
             .and_then(|row| row["title"].as_str())
             .or_else(|| details["title"].as_str())
             .unwrap_or_else(|| parsed.host_str().unwrap_or("Webpage"));
-        sources.push(json!({"url":url,"title":utf8_prefix(title, 240)}));
+        // Search snippets are already durable evidence. Passing a bounded one
+        // through lets the renderer show a useful source preview without a
+        // second page request or any new data entering the model context.
+        let description = result
+            .and_then(|row| row["snippet"].as_str())
+            .map(|snippet| utf8_prefix(snippet, 280));
+        sources.push(json!({"url":url,"title":utf8_prefix(title, 240),"description":description}));
         if sources.len() == 4 {
             break;
         }
@@ -5546,7 +5553,7 @@ mod tests {
                 "isError":false,
                 "details":{
                     "sourceUrls":["https://docs.example.com/guide"],
-                    "results":[{"url":"https://docs.example.com/guide","title":"Example guide"}]
+                    "results":[{"url":"https://docs.example.com/guide","title":"Example guide","snippet":"A short guide summary."}]
                 },
                 "content":[{"type":"text","text":"One result"}]
             }
@@ -5557,6 +5564,10 @@ mod tests {
         assert_eq!(
             search["blocks"][0]["value"]["sources"][0]["title"],
             "Example guide"
+        );
+        assert_eq!(
+            search["blocks"][0]["value"]["sources"][0]["description"],
+            "A short guide summary."
         );
     }
 

@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { SiteIcons, SourceList, webSources } from "./WebSources";
 import type { ClientMessage } from "./generated/protocol";
 afterEach(() => { cleanup(); vi.useRealTimers(); });
-const message: ClientMessage = { id: "result", role: "toolResult", tool: { name: "webSearch", call_id: "call", failed: false }, blocks: [{ kind: "unknown", value: { kind: "web_result", sources: [{ url: "https://example.com/a", title: "First page" }, { url: "https://example.com/b", title: "Second page" }, { url: "javascript:alert(1)", title: "Bad" }] } }] };
+const message: ClientMessage = { id: "result", role: "toolResult", tool: { name: "webSearch", call_id: "call", failed: false }, blocks: [{ kind: "unknown", value: { kind: "web_result", sources: [{ url: "https://example.com/a", title: "First page", description: "A short result summary." }, { url: "https://example.com/b", title: "Second page" }, { url: "javascript:alert(1)", title: "Bad" }] } }] };
 test("source URLs are validated, icons deduplicate and use only native raster data", async () => {
   const run = vi.fn(async () => ({ dataUrl: "data:image/png;base64,aGVsbG8=" }));
   const sources = webSources(message); expect(sources).toHaveLength(2);
@@ -12,6 +12,7 @@ test("source URLs are validated, icons deduplicate and use only native raster da
   expect(run).toHaveBeenCalledTimes(1);
   expect(run).toHaveBeenCalledWith({ kind: "runtime", action: "website_icon", args: { entry: "result", url: "https://example.com/a" } });
   expect(screen.getByRole('link', { name: /First page/ }).getAttribute('href')).toBe('https://example.com/a');
+  expect(screen.getByText("A short result summary.")).toBeTruthy();
   fireEvent.error(container.querySelector('img')!); expect(container.querySelectorAll('img')).toHaveLength(2);
   expect(webSources({ ...message, tool: { ...message.tool!, failed: true } })).toEqual([]);
 });
@@ -29,7 +30,7 @@ test("more than four visible hosts queue and every icon eventually resolves", as
     active++; peak = Math.max(peak, active);
     pending.push(() => { active--; resolve({ dataUrl: "data:image/png;base64,aGVsbG8=" }); });
   }));
-  const sources = Array.from({ length: 12 }, (_, i) => ({ entry: `entry-${i}`, url: `https://site${i}.example/a`, title: `Site ${i}`, host: `site${i}.example` }));
+  const sources = Array.from({ length: 12 }, (_, i) => ({ entry: `entry-${i}`, url: `https://site${i}.example/a`, title: `Site ${i}`, description: "", host: `site${i}.example` }));
   const { container } = render(<SourceList sources={sources} run={run} />);
   await waitFor(() => expect(run).toHaveBeenCalledTimes(4));
   for (let batch = 0; batch < 3; batch++) {
