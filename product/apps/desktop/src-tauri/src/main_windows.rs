@@ -560,6 +560,16 @@ async fn bridge_command(
                 }
             }
         }
+        Command::Task { action, args } => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                match state.host.task_action(action, args) {
+                    Ok(data) => reply(&envelope, &current_view(&state)?, "accepted", true, data),
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
         Command::Runtime { action, args } if action == "load_model" => {
             let provider = args["provider"].as_str().ok_or("Missing model provider")?;
             let id = args["model_id"].as_str().ok_or("Missing model ID")?;

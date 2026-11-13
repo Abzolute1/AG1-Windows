@@ -512,6 +512,40 @@ impl NativeHost {
         Ok(())
     }
 
+    /// Change the current chat's task through AG1's shared reducer. The task
+    /// becomes a journal record, which makes it survive restart and lets the
+    /// context compiler add it to later model requests.
+    pub fn task_action(&self, action: &str, args: &Value) -> Result<Value, String> {
+        let (session, session_id) = {
+            let active = self.active()?;
+            let active = active.as_ref().ok_or("Open a local chat first")?;
+            if active.busy || active.loading {
+                return Err("Wait for the local model to finish before changing the task".into());
+            }
+            (active.session.clone(), active.id.as_str().to_owned())
+        };
+
+        let mut input = args
+            .as_object()
+            .cloned()
+            .ok_or("Task arguments must be an object")?;
+        if input.contains_key("action") {
+            return Err("Task action must be supplied by the command, not its arguments".into());
+        }
+        input.insert("action".into(), json!(action));
+
+        let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let stamp = timestamp(now_ms());
+        session
+            .update_task(
+                &format!("{session_id}-task-{serial}"),
+                &format!("{session_id}-task-state-{serial}"),
+                &stamp,
+                &Value::Object(input),
+            )
+            .map_err(describe)
+    }
+
     /// Accept the renderer's bounded, chunked attachment protocol. Images are
     /// parsed before they can become a model message, so a renderer bug cannot
     /// turn arbitrary bytes into a durable prompt.
@@ -2022,6 +2056,16 @@ impl NativeHost {
         };
 
         let records = active.session.records().map_err(describe)?;
+        let task = records
+            .iter()
+            .rev()
+            .find(|record| record["type"] == "custom" && record["customType"] == "task_state")
+            .map(|record| {
+                ag1_core::task::TaskState::parse(&record["data"]).map(|task| task.value().clone())
+            })
+            .transpose()
+            .map_err(describe)?
+            .unwrap_or(Value::Null);
         let all_messages = records
             .iter()
             .filter_map(project_message)
@@ -2146,7 +2190,7 @@ impl NativeHost {
             "details": {
                 "authority":"windows-native-local",
                 "messages":messages,
-                "task":Value::Null,
+                "task":task,
                 "context":{"mode":"real-ag1-context-virtualization","working_context_limit":configuration.context_limit(),"maximum_context_limit":active.model["contextWindow"],"tools":tools,"selected_model":{"provider":active.model["provider"],"id":active.model["id"]},"approval_policy":{"mode":active.approval_mode,"scope":"current-chat"},"folder_access":folder_access},
                 "artifacts":[],
                 "memory":Value::Null,
@@ -4495,6 +4539,43 @@ mod tests {
         assert_eq!(
             resumed.view().unwrap()["details"]["context"]["working_context_limit"],
             4_096
+        );
+    }
+
+    #[test]
+    fn native_task_objective_is_durable_and_visible_in_the_details_view() {
+        let state = tempdir().unwrap();
+        let config_path = write_fixture_config(state.path(), "task-fixture");
+        let host =
+            NativeHost::open_from_config(state.path().to_path_buf(), config_path.clone()).unwrap();
+        host.open_general().unwrap();
+        let session = host.view().unwrap()["snapshot"]["scope"]["session"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let result = host
+            .task_action(
+                "set",
+                &json!({"objective":"Validate the Windows-native chat runtime."}),
+            )
+            .unwrap();
+        assert_eq!(
+            result["details"]["snapshot"]["objective"],
+            "Validate the Windows-native chat runtime."
+        );
+        assert_eq!(
+            host.view().unwrap()["details"]["task"]["objective"],
+            "Validate the Windows-native chat runtime."
+        );
+        drop(host);
+
+        let resumed =
+            NativeHost::open_from_config(state.path().to_path_buf(), config_path).unwrap();
+        resumed.open_session(&session).unwrap();
+        assert_eq!(
+            resumed.view().unwrap()["details"]["task"]["objective"],
+            "Validate the Windows-native chat runtime."
         );
     }
 

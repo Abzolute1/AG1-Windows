@@ -23,7 +23,7 @@ use ag1_core::{
     inference::{EndpointKind, Scheduler},
     provider::{ApiFamily, BlockKind, ProviderEvent, StopReason, assistant_message},
     runtime::{
-        SessionRuntime,
+        SessionRuntime, context as runtime_context, messages as runtime_messages,
         session::{CompactionCapture, Configuration, PreparationAction},
         tree,
     },
@@ -1338,6 +1338,25 @@ impl NativeSession {
         Self::commit(&mut state, action, self.store.as_ref())
     }
 
+    /// Apply AG1's validated task reducer, then journal the next task state as
+    /// a normal durable record. The context compiler reads this record on the
+    /// next turn, so a desktop task is not merely a UI note.
+    pub fn update_task(
+        &self,
+        command: &str,
+        id: &str,
+        timestamp: &str,
+        args: &Value,
+    ) -> Result<Value, DomainError> {
+        let mut state = self.state()?;
+        let plan = ag1_core::tools::task_state::prepare(state.branch(), args, timestamp, id)?;
+        if let Some(task) = plan.next {
+            let action = state.append_task_state(command, id, timestamp, task)?;
+            Self::commit(&mut state, action, self.store.as_ref())?;
+        }
+        Ok(plan.result)
+    }
+
     /// Build the real context-virtualized request projection. This retains the
     /// immutable journal and request inputs before any compiler reduction so a
     /// later UI can inspect or reproduce the exact context decision.
@@ -1703,11 +1722,38 @@ impl NativeSession {
             timestamp,
             Features::default(),
         )?;
-        let compiled = context.compile(
-            &preparation.messages().values().cloned().collect::<Vec<_>>(),
-            &preparation.compile_options(),
-            preparation.journal_revision(),
-        )?;
+        let messages = preparation.messages().values().cloned().collect::<Vec<_>>();
+        // Tasks are durable custom records, not chat messages. Build AG1's
+        // request-local projection from the captured branch so a task set in
+        // the details drawer reaches the model without changing chat history.
+        let working_state = runtime_context::working_state_with_control_tool(
+            preparation.branch(),
+            &messages,
+            &context,
+            |_| None,
+            None,
+        );
+        let request_messages =
+            runtime_context::append_working_state(&messages, working_state.as_deref())?;
+        let mut options = preparation.compile_options();
+        if let Some(working_state) = &working_state {
+            let task_tokens = ag1_core::context::estimate_tokens(&json!({
+                "role":"custom",
+                "content":working_state,
+            }));
+            options.fixed_tokens = Some(
+                options
+                    .fixed_tokens
+                    .unwrap_or_else(|| preparation.configuration().fixed_tokens())
+                    .saturating_add(task_tokens),
+            );
+        }
+        let mut compiled =
+            context.compile(&request_messages, &options, preparation.journal_revision())?;
+        // Context compilation preserves AG1's durable/custom message shape.
+        // Convert its request-only tail before serializing the llama.cpp call.
+        compiled.projection.messages =
+            runtime_messages::to_provider(&compiled.projection.messages)?;
         Ok(CompiledContext {
             projection: compiled.projection,
             original_journal: compiled.original_journal,
@@ -2526,6 +2572,53 @@ mod tests {
         let resumed = NativeSession::resume(store, id, "windows-origin", 2, config()).unwrap();
         assert_eq!(resumed.journal_revision().unwrap(), 1);
         assert_eq!(resumed.records().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn durable_task_state_is_projected_into_the_next_local_request() {
+        let directory = tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let id = SessionId::new("windows-task-projection").unwrap();
+        let session = NativeSession::create(
+            store,
+            id,
+            "windows-task-projection-origin",
+            "C:\\lab",
+            "2026-11-13T00:00:00.000Z",
+            1,
+            config(),
+        )
+        .unwrap();
+
+        session
+            .update_task(
+                "set-task",
+                "set-task-state",
+                "2026-11-13T00:00:01.000Z",
+                &json!({"action":"set","objective":"Document the Windows-native runtime."}),
+            )
+            .unwrap();
+        session
+            .append_message(
+                "task-user",
+                "task-user",
+                "2026-11-13T00:00:02.000Z",
+                json!({"role":"user","content":"What should I work on now?"}),
+            )
+            .unwrap();
+
+        let preparation = session.state().unwrap().prepare_request().unwrap();
+        let compiled = session
+            .compile_preparation(
+                &preparation,
+                "task-projection-compile",
+                "2026-11-13T00:00:03.000Z",
+            )
+            .unwrap();
+        let request = serde_json::to_string(&compiled.projection.messages).unwrap();
+        assert!(request.contains("Document the Windows-native runtime."));
+        assert!(request.contains("Recorded task state"));
+        session.discard_preparation(preparation, DomainError::Cancelled);
     }
 
     #[test]
