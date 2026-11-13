@@ -2220,15 +2220,7 @@ impl NativeSession {
             registry.activate(&[name.to_owned()], &available)?;
             let prepared = registry.prepare(operation, call_id, name, args, true)?;
             let mut authorizer = Authorizer::new(operation)?;
-            let policy = Policy {
-                // Research is read-only, but Autonomous makes that explicit
-                // for the policy engine instead of silently bypassing it.
-                mode: ToolMode::Autonomous,
-                cwd: self.cwd.clone(),
-                planning_read_only_tools: None,
-                trusted_tools: vec![],
-                extension_tools: vec![],
-            };
+            let policy = Self::web_tool_policy();
             let target = if name == "webSearch" {
                 search.target_revision().to_owned()
             } else {
@@ -2290,6 +2282,22 @@ impl NativeSession {
         }
         .await;
         result.unwrap_or_else(|error| web_tool_error_result(call, error))
+    }
+
+    fn web_tool_policy() -> Policy {
+        // The shared policy layer uses a portable POSIX-shaped path only as a
+        // captured policy namespace. It is never used to open files here.
+        // Passing a Windows drive path made every native web call fail before
+        // it reached the search service.
+        Policy {
+            // Research is read-only, but Autonomous makes that explicit for
+            // the policy engine instead of silently bypassing it.
+            mode: ToolMode::Autonomous,
+            cwd: "/ag1w/public-web".into(),
+            planning_read_only_tools: None,
+            trusted_tools: vec![],
+            extension_tools: vec![],
+        }
     }
 
     fn web_services(
@@ -2895,6 +2903,19 @@ mod tests {
             denied["content"][0]["text"],
             "This chat is set to ask before changes. Choose Allow routine changes or Bypass approvals, then ask again."
         );
+    }
+
+    #[test]
+    fn native_web_policy_uses_a_portable_captured_workspace() {
+        let decision = ag1_core::tools::policy::evaluate(
+            "webSearch",
+            &json!({"query":"Qwen release notes"}),
+            &NativeSession::web_tool_policy(),
+            false,
+        )
+        .unwrap();
+        assert!(decision.allow);
+        assert!(decision.reason.is_none());
     }
 
     #[test]

@@ -12,6 +12,9 @@ pub mod http;
 pub mod input;
 #[cfg(target_os = "linux")]
 pub mod manager;
+#[cfg(windows)]
+#[path = "manager_windows.rs"]
+pub mod manager;
 pub mod oauth;
 pub(crate) mod operation;
 pub mod registry;

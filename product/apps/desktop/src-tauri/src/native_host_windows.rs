@@ -19,6 +19,15 @@ use ag1_platform::{
     folder_access::{Change as FolderChange, FolderAccess},
     llama::{Material, ResolveInput, resolve_launch_plan},
     local_runtime::WindowsRuntimeConfig,
+    mcp::{
+        catalog::CatalogScope,
+        definitions::{Availability as McpAvailability, Draft as McpDraft, LocalAccess},
+        discovery::DiscoveryLimits,
+        manager::{
+            ConnectedCatalog, ConnectionConsent, ConnectionHealth, ConnectionReview,
+            ConnectionStatus, Diagnostic as McpDiagnostic, Manager as McpManager,
+        },
+    },
     process::{ProcessSpec, ProcessSupervisor},
     provider::http::{
         CancelSource, GenerationRuntime, ProviderHttp, cancellation, endpoint_origin,
@@ -308,6 +317,13 @@ struct DiffReview {
     bytes: Vec<u8>,
 }
 
+// A review is intentionally held only in memory.  The UI gets an opaque key,
+// while this owner retains the exact configuration it inspected.
+struct PendingMcpReview {
+    scope: CatalogScope,
+    review: ConnectionReview,
+}
+
 enum ChangeDiff {
     Bytes(Vec<u8>),
     Unavailable(&'static str),
@@ -316,6 +332,8 @@ enum ChangeDiff {
 struct Inner {
     state: PathBuf,
     store: Arc<Store>,
+    mcp: Arc<McpManager>,
+    mcp_reviews: Mutex<BTreeMap<String, PendingMcpReview>>,
     config: Mutex<Option<HostConfig>>,
     active: Mutex<Option<ActiveSession>>,
     runtime: Mutex<Option<Arc<dyn GenerationRuntime>>>,
@@ -361,11 +379,17 @@ impl NativeHost {
     fn open_from_config(state: PathBuf, config_path: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&state).map_err(|error| format!("Create AG1W state: {error}"))?;
         let store = Store::open(&state.join("store")).map_err(describe)?;
+        // MCP owns a separate small Store because AG1's storage writer is
+        // intentionally exclusive.  It never reconnects a server during open.
+        let mcp =
+            McpManager::open(&state.join("mcp"), DiscoveryLimits::default()).map_err(describe)?;
         let config = read_config(&config_path)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 state,
                 store: Arc::new(store),
+                mcp: Arc::new(mcp),
+                mcp_reviews: Mutex::new(BTreeMap::new()),
                 config: Mutex::new(config),
                 active: Mutex::new(None),
                 runtime: Mutex::new(None),
@@ -2607,6 +2631,265 @@ impl NativeHost {
         )
     }
 
+    /// Dispatch the narrow Windows MCP management surface.  This deliberately
+    /// manages inspected stdio servers only; model-side MCP tool execution is
+    /// added separately once its per-turn capability boundary exists.
+    pub fn mcp_action(&self, args: &Value) -> Result<Value, String> {
+        let action = args["action"].as_str().ok_or("Missing MCP action")?;
+        match action {
+            "list" => self.mcp_view(),
+            "add" => {
+                let draft = mcp_draft(&args["draft"])?;
+                let access = mcp_access(args)?;
+                let ids = self
+                    .inner
+                    .mcp
+                    .add_drafts_with_access(vec![draft], access)
+                    .map_err(describe)?;
+                Ok(json!({
+                    "ids":ids,
+                    "message":"Saved inactive. Enable this server for the current chat, then review its host-account launch before connecting."
+                }))
+            }
+            "edit" => {
+                let id = mcp_id(args)?;
+                let revision = mcp_revision(args)?;
+                let draft = mcp_draft(&args["draft"])?;
+                let access = mcp_access(args)?;
+                self.inner
+                    .mcp
+                    .edit_with_access(id, revision, draft, access)
+                    .map_err(describe)?;
+                Ok(json!({"message":"Saved inactive and retired any old connection."}))
+            }
+            "remove" => {
+                let id = mcp_id(args)?;
+                self.inner
+                    .mcp
+                    .remove(id, mcp_revision(args)?)
+                    .map_err(describe)?;
+                Ok(
+                    json!({"message":"Removed the MCP configuration and stopped its owned connections."}),
+                )
+            }
+            "availability" => {
+                let id = mcp_id(args)?;
+                let revision = mcp_revision(args)?;
+                let enabled = args["enabled"]
+                    .as_bool()
+                    .ok_or("Missing MCP availability state")?;
+                let target = args["target"]
+                    .as_str()
+                    .ok_or("Missing MCP availability target")?;
+                let scope = self.mcp_scope()?;
+                let record = self
+                    .inner
+                    .mcp
+                    .records()
+                    .map_err(describe)?
+                    .into_iter()
+                    .find(|record| record.id == id)
+                    .ok_or("MCP server no longer exists")?;
+                if record.revision != revision {
+                    return Err(describe(DomainError::Conflict));
+                }
+                let availability =
+                    update_mcp_availability(record.availability, &scope, target, enabled)?;
+                self.inner
+                    .mcp
+                    .set_availability(id, revision, availability)
+                    .map_err(describe)?;
+                Ok(json!({"message":"Updated MCP availability for the reviewed scope."}))
+            }
+            "review" => {
+                let id = mcp_id(args)?;
+                let revision = mcp_revision(args)?;
+                let scope = self.mcp_scope()?;
+                let inspection = args["test"].as_bool().unwrap_or(false);
+                let review = if inspection {
+                    self.inner
+                        .mcp
+                        .review_test_connection(id, revision, scope.clone())
+                } else {
+                    self.inner
+                        .mcp
+                        .review_connection(id, revision, scope.clone())
+                }
+                .map_err(describe)?;
+                let ticket = format!(
+                    "mcp-review-{}-{}",
+                    now_ms(),
+                    self.inner.next.fetch_add(1, Ordering::Relaxed)
+                );
+                let display = json!({
+                    "review":ticket,
+                    "server":review.record(),
+                    "scope":mcp_scope_value(&scope),
+                    "executableSha256":review.executable_sha256(),
+                    "warning":"This starts the exact reviewed command with your Windows account permissions. It has filesystem and network access available to your account; AG1W does not present it as a sandbox.",
+                    "purpose":"Handshake and capability discovery only. AG1W will not call an advertised tool during this connection review.",
+                });
+                self.inner
+                    .mcp_reviews
+                    .lock()
+                    .map_err(|_| "MCP review state is unavailable")?
+                    .insert(ticket, PendingMcpReview { scope, review });
+                Ok(display)
+            }
+            "dismiss" => {
+                let ticket = args["review"].as_str().ok_or("Missing MCP review")?;
+                self.inner
+                    .mcp_reviews
+                    .lock()
+                    .map_err(|_| "MCP review state is unavailable")?
+                    .remove(ticket);
+                Ok(json!({"message":"Dismissed the MCP connection review."}))
+            }
+            "confirm" => {
+                let ticket = args["review"].as_str().ok_or("Missing MCP review")?;
+                let pending = self
+                    .inner
+                    .mcp_reviews
+                    .lock()
+                    .map_err(|_| "MCP review state is unavailable")?
+                    .remove(ticket)
+                    .ok_or("MCP review expired or was already used")?;
+                if pending.scope != self.mcp_scope()? {
+                    return Err(describe(DomainError::PermissionDenied));
+                }
+                let connection = self
+                    .inner
+                    .mcp
+                    .connect(pending.review, ConnectionConsent::LocalHostAccountExecution)
+                    .map_err(describe)?;
+                Ok(json!({"connection":connection,"message":"Starting reviewed MCP discovery."}))
+            }
+            "disconnect" => {
+                let connection = args["connection"]
+                    .as_str()
+                    .ok_or("Missing MCP connection")?;
+                self.inner.mcp.disconnect(connection).map_err(describe)?;
+                Ok(json!({"message":"Stopping the owned MCP connection."}))
+            }
+            "catalog" => self.mcp_catalog(args),
+            "detail" => self.mcp_detail(args),
+            // The desktop's shared MCP page also exposes registry, OAuth,
+            // private-entry and project-import commands.  Those need distinct
+            // native implementations, so fail plainly rather than routing into
+            // the Linux host or suggesting that credentials were stored.
+            _ => Err(self.unsupported("That MCP management action")),
+        }
+    }
+
+    fn mcp_scope(&self) -> Result<CatalogScope, String> {
+        let active = self.active()?;
+        let active = active
+            .as_ref()
+            .ok_or("Open a chat before managing MCP servers")?;
+        if active.workspace.is_some() {
+            Ok(CatalogScope::Workspace(active.workspace_scope.clone()))
+        } else {
+            Ok(CatalogScope::GeneralChat)
+        }
+    }
+
+    fn mcp_view(&self) -> Result<Value, String> {
+        let scope = self.mcp_scope()?;
+        let records = self.inner.mcp.records().map_err(describe)?;
+        let connections = self.inner.mcp.recent_connections().map_err(describe)?;
+        let servers: Vec<_> = records
+            .into_iter()
+            .map(|record| {
+                let available = record.availability.allows(&scope);
+                let requires_auth = record.draft.auth_profile.is_some();
+                json!({
+                    "record":record,
+                    "availableHere":available,
+                    "authentication":{"status":if requires_auth {"unavailable"} else {"none"}},
+                })
+            })
+            .collect();
+        Ok(json!({
+            "scope":mcp_scope_value(&scope),
+            "servers":servers,
+            "connections":connections.iter().map(mcp_connection_value).collect::<Vec<_>>(),
+            "privateEntryAvailable":false,
+            "oauthAvailable":false,
+            "projectImportAvailable":false,
+            "windowsNative":true,
+        }))
+    }
+
+    fn mcp_catalog(&self, args: &Value) -> Result<Value, String> {
+        let connection = args["connection"]
+            .as_str()
+            .ok_or("Missing MCP connection")?;
+        let kind = mcp_catalog_kind(args["kind"].as_str().ok_or("Missing MCP catalog kind")?)?;
+        let scope = self.mcp_scope()?;
+        // This is the management UI's inspect path. It permits a test-only
+        // connection to display its catalog without making it model-callable.
+        let catalog = self
+            .inner
+            .mcp
+            .catalog(connection, &scope, true)
+            .map_err(describe)?;
+        let rows = mcp_catalog_rows(&catalog, kind);
+        let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+        if offset > rows.len() {
+            return Err("Invalid MCP catalog offset".into());
+        }
+        let items: Vec<_> = rows
+            .iter()
+            .skip(offset)
+            .take(20)
+            .map(|entry| mcp_catalog_item(entry, kind))
+            .collect();
+        Ok(json!({
+            "binding":mcp_binding_value(&catalog.binding),
+            "total":rows.len(),
+            "items":items,
+            "next":if offset + items.len() < rows.len() {Some(offset + items.len())} else {None::<usize>},
+        }))
+    }
+
+    fn mcp_detail(&self, args: &Value) -> Result<Value, String> {
+        let connection = args["connection"]
+            .as_str()
+            .ok_or("Missing MCP connection")?;
+        let kind = mcp_catalog_kind(args["kind"].as_str().ok_or("Missing MCP catalog kind")?)?;
+        let key = args["key"].as_str().ok_or("Missing MCP capability key")?;
+        let scope = self.mcp_scope()?;
+        let catalog = self
+            .inner
+            .mcp
+            .catalog(connection, &scope, true)
+            .map_err(describe)?;
+        let entry = mcp_catalog_rows(&catalog, kind)
+            .into_iter()
+            .find(|entry| mcp_catalog_key(entry, kind) == Some(key))
+            .ok_or("MCP capability no longer exists")?;
+        let wire_name = if matches!(kind, McpCatalogKind::Tool) {
+            catalog
+                .tools
+                .iter()
+                .find(|tool| *tool == entry)
+                .and_then(|tool| tool["name"].as_str())
+                .map(|name| ag1_core::tools::mcp::wire_name(&catalog.binding.server_id, name))
+        } else {
+            None
+        };
+        Ok(json!({
+            "identity":{"originalName":mcp_catalog_key(entry, kind).unwrap_or(""),"kind":mcp_catalog_kind_name(kind)},
+            "original":entry,
+            "parameters":entry.get("inputSchema").cloned().unwrap_or_else(|| json!({})),
+            "schemaSupported":matches!(kind, McpCatalogKind::Tool),
+            "classification":"unknown",
+            "classificationBasis":"Reviewed local MCP catalog",
+            "wireName":wire_name,
+            "approval":"MCP model execution is not wired into the Windows session yet; this screen is inspection only.",
+        }))
+    }
+
     fn ensure_session(&self) -> Result<(), String> {
         if self.active()?.is_some() {
             return Ok(());
@@ -4068,6 +4351,178 @@ fn usage_with_rate(mut usage: Value, first_delta_ms: Option<u64>, now: u64) -> V
     usage
 }
 
+#[derive(Clone, Copy)]
+enum McpCatalogKind {
+    Tool,
+    Resource,
+    ResourceTemplate,
+    Prompt,
+}
+
+fn mcp_draft(value: &Value) -> Result<McpDraft, String> {
+    serde_json::from_value(value.clone()).map_err(|_| "Invalid MCP server configuration".into())
+}
+
+fn mcp_access(args: &Value) -> Result<LocalAccess, String> {
+    match args["local_access"].as_str().unwrap_or("hostAccount") {
+        "hostAccount" => Ok(LocalAccess::HostAccount),
+        "readOnlyDirectory" => Ok(LocalAccess::ReadOnlyDirectory),
+        _ => Err("Unknown MCP local access mode".into()),
+    }
+}
+
+fn mcp_id(args: &Value) -> Result<&str, String> {
+    args["id"]
+        .as_str()
+        .ok_or_else(|| "Missing MCP server ID".into())
+}
+
+fn mcp_revision(args: &Value) -> Result<u64, String> {
+    args["revision"]
+        .as_u64()
+        .filter(|revision| *revision > 0)
+        .ok_or_else(|| "Missing MCP configuration revision".into())
+}
+
+fn mcp_scope_value(scope: &CatalogScope) -> Value {
+    match scope {
+        CatalogScope::GeneralChat => json!({"kind":"generalChat"}),
+        CatalogScope::Workspace(id) => json!({"kind":"workspace","id":id}),
+    }
+}
+
+fn update_mcp_availability(
+    mut availability: McpAvailability,
+    scope: &CatalogScope,
+    target: &str,
+    enabled: bool,
+) -> Result<McpAvailability, String> {
+    match target {
+        "current" => {
+            availability.enabled |= enabled;
+            match scope {
+                CatalogScope::GeneralChat => availability.general_chat = enabled,
+                CatalogScope::Workspace(id) if availability.all_workspaces => {
+                    if enabled {
+                        availability.denied_workspaces.remove(id);
+                    } else {
+                        availability.denied_workspaces.insert(id.clone());
+                    }
+                }
+                CatalogScope::Workspace(id) if enabled => {
+                    availability.workspaces.insert(id.clone());
+                }
+                CatalogScope::Workspace(id) => {
+                    availability.workspaces.remove(id);
+                }
+            }
+        }
+        "all_workspaces" => {
+            availability.enabled |= enabled;
+            availability.all_workspaces = enabled;
+            if enabled {
+                availability.denied_workspaces.clear();
+            }
+        }
+        "everywhere" if !enabled => {
+            availability = McpAvailability::default();
+        }
+        "everywhere" => {
+            availability.enabled = true;
+            availability.all_workspaces = true;
+            availability.general_chat = true;
+            availability.workspaces.clear();
+            availability.denied_workspaces.clear();
+        }
+        _ => return Err("Unknown MCP availability target".into()),
+    }
+    Ok(availability)
+}
+
+fn mcp_connection_value(status: &ConnectionStatus) -> Value {
+    let health = match status.health {
+        ConnectionHealth::Connecting => "connecting",
+        ConnectionHealth::Ready => "ready",
+        ConnectionHealth::Stopping => "stopping",
+        ConnectionHealth::Stopped => "stopped",
+        ConnectionHealth::Failed => "failed",
+    };
+    let diagnostic = status.diagnostic.map(|diagnostic| match diagnostic {
+        McpDiagnostic::Cancelled => "cancelled",
+        McpDiagnostic::TimedOut => "timeout",
+        McpDiagnostic::Unavailable => "unavailable",
+        McpDiagnostic::InvalidPeer => "invalidPeer",
+        McpDiagnostic::StartFailed => "startFailed",
+        McpDiagnostic::WorkerFailed => "workerFailed",
+        McpDiagnostic::PermissionDenied => "permissionDenied",
+        McpDiagnostic::TransportFailed => "transportFailed",
+    });
+    json!({
+        "id":status.id,
+        "serverId":status.server_id,
+        "scope":mcp_scope_value(&status.scope),
+        "health":health,
+        "inspectionOnly":status.inspection_only,
+        "diagnostic":diagnostic,
+        "waitingForInput":false,
+    })
+}
+
+fn mcp_catalog_kind(value: &str) -> Result<McpCatalogKind, String> {
+    match value {
+        "tool" => Ok(McpCatalogKind::Tool),
+        "resource" => Ok(McpCatalogKind::Resource),
+        "resourceTemplate" => Ok(McpCatalogKind::ResourceTemplate),
+        "prompt" => Ok(McpCatalogKind::Prompt),
+        _ => Err("Unknown MCP catalog kind".into()),
+    }
+}
+
+fn mcp_catalog_kind_name(kind: McpCatalogKind) -> &'static str {
+    match kind {
+        McpCatalogKind::Tool => "tool",
+        McpCatalogKind::Resource => "resource",
+        McpCatalogKind::ResourceTemplate => "resourceTemplate",
+        McpCatalogKind::Prompt => "prompt",
+    }
+}
+
+fn mcp_catalog_rows(catalog: &ConnectedCatalog, kind: McpCatalogKind) -> &[Value] {
+    match kind {
+        McpCatalogKind::Tool => &catalog.tools,
+        McpCatalogKind::Resource => &catalog.resources,
+        McpCatalogKind::ResourceTemplate => &catalog.templates,
+        McpCatalogKind::Prompt => &catalog.prompts,
+    }
+}
+
+fn mcp_catalog_key(entry: &Value, kind: McpCatalogKind) -> Option<&str> {
+    match kind {
+        McpCatalogKind::Tool | McpCatalogKind::Prompt => entry["name"].as_str(),
+        McpCatalogKind::Resource => entry["uri"].as_str(),
+        McpCatalogKind::ResourceTemplate => entry["uriTemplate"].as_str(),
+    }
+}
+
+fn mcp_catalog_item(entry: &Value, kind: McpCatalogKind) -> Value {
+    let key = mcp_catalog_key(entry, kind).unwrap_or_default();
+    let name = entry["name"].as_str().unwrap_or(key);
+    let description = entry["description"]
+        .as_str()
+        .map(|text| utf8_prefix(text, 160))
+        .unwrap_or_default();
+    json!({"key":key,"name":name,"description":description})
+}
+
+fn mcp_binding_value(binding: &ag1_platform::mcp::catalog::CatalogBinding) -> Value {
+    json!({
+        "serverId":binding.server_id,
+        "scope":mcp_scope_value(&binding.scope),
+        "configRevision":binding.config_revision,
+        "protocol":binding.protocol.as_str(),
+    })
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4237,6 +4692,99 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn native_mcp_review_connects_and_lists_a_local_catalog() {
+        let state = tempdir().unwrap();
+        let config = write_fixture_config(state.path(), "mcp-fixture");
+        let host = NativeHost::open_from_config(state.path().to_path_buf(), config).unwrap();
+        host.open_general().unwrap();
+
+        // cmd.exe reads exactly the two discovery messages AG1W sends, then
+        // waits on stdin. This proves the owned Windows pipe path without a
+        // network server or an installed third-party MCP package.
+        let script = state.path().join("fixture-mcp.cmd");
+        fs::write(
+            &script,
+            concat!(
+                "@echo off\r\n",
+                "setlocal\r\n",
+                "set /p first=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-1\",\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"private\",\"capabilities\":{\"tools\":{}}}}\r\n",
+                "set /p second=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-2\",\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"fixture_echo\",\"description\":\"Fixture tool\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}\r\n",
+                ":wait\r\n",
+                "set /p later=\r\n",
+                "goto wait\r\n"
+            ),
+        )
+        .unwrap();
+        let executable = std::env::var("COMSPEC").unwrap();
+        let added = host
+            .mcp_action(&json!({
+                "action":"add",
+                "local_access":"hostAccount",
+                "draft":{
+                    "name":"fixture server",
+                    "protocol":"2026-07-28",
+                    "auth_profile":null,
+                    "provenance":{"source":"manual"},
+                    "configuration":{
+                        "transport":"local",
+                        "executable":executable,
+                        "arguments":["/Q","/D","/C",script.to_string_lossy()],
+                        "cwd":state.path().to_string_lossy(),
+                        "public_environment":{},
+                        "secret_environment":[]
+                    }
+                }
+            }))
+            .unwrap();
+        let id = added["ids"][0].as_str().unwrap().to_owned();
+        let view = host.mcp_action(&json!({"action":"list"})).unwrap();
+        let revision = view["servers"][0]["record"]["revision"].as_u64().unwrap();
+        host.mcp_action(&json!({
+            "action":"availability","id":id,"revision":revision,"enabled":true,"target":"current"
+        }))
+        .unwrap();
+        let view = host.mcp_action(&json!({"action":"list"})).unwrap();
+        let revision = view["servers"][0]["record"]["revision"].as_u64().unwrap();
+        let review = host
+            .mcp_action(&json!({"action":"review","id":id,"revision":revision,"test":false}))
+            .unwrap();
+        let connection = host
+            .mcp_action(&json!({"action":"confirm","review":review["review"]}))
+            .unwrap()["connection"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let view = host.mcp_action(&json!({"action":"list"})).unwrap();
+            if view["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == connection && row["health"] == "ready")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "MCP fixture did not become ready"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let catalog = host
+            .mcp_action(
+                &json!({"action":"catalog","connection":connection,"kind":"tool","offset":0}),
+            )
+            .unwrap();
+        assert_eq!(catalog["items"][0]["key"], "fixture_echo");
+        host.mcp_action(&json!({"action":"disconnect","connection":connection}))
+            .unwrap();
     }
 
     fn read_http_request(socket: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {

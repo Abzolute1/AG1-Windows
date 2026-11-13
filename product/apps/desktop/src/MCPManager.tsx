@@ -64,6 +64,7 @@ export function MCPManager({ scope, run, back }: Props) {
     return () => { const imported = importPending.current; importPending.current = null; if (imported) void run({ action: "import_dismiss", review: imported }).catch(() => {}); ++mounted.current; window.clearInterval(timer); const id = pending.current; pending.current = null; if (id) void run({ action: "dismiss", review: id }).catch(() => {}); };
   }, [scope, run]);
   const servers: any[] = view?.servers ?? [];
+  const windowsNative = view?.windowsNative === true;
   const row = servers.find(r => r.record.id === selected), record: Record | undefined = row?.record;
   const oauth = row?.authentication?.target?.kind === "oauth";
   const connections: any[] = (view?.connections ?? []).filter((c: any) => c.serverId === selected);
@@ -72,7 +73,9 @@ export function MCPManager({ scope, run, back }: Props) {
   function edit(value: Record | null) {
     if (pending.current) void dismiss().catch(() => {});
     const d = value ? { ...value.draft, provenance: { source: "manual" as const } } : empty();
-    setLocalAccess(value?.local_access ?? (value ? "hostAccount" : "readOnlyDirectory"));
+    // Windows does not have AG1's Bubblewrap isolation. Start its manual
+    // configuration at the only mode the native host can honestly run.
+    setLocalAccess(value?.local_access ?? (value ? "hostAccount" : windowsNative ? "hostAccount" : "readOnlyDirectory"));
     setDraft(d); setEditing(value); setArguments(JSON.stringify(d.configuration.arguments ?? [], null, 2)); setEnvironment(JSON.stringify(d.configuration.public_environment ?? {}, null, 2)); setSecretNames((d.configuration.secret_environment ?? []).join("\n")); setReview(null); setError("");
   }
   async function save() {
@@ -122,8 +125,8 @@ export function MCPManager({ scope, run, back }: Props) {
         <label>Executable · absolute path<input required maxLength={4096} placeholder="/usr/bin/python3" value={draft.configuration.executable} onChange={e => setDraft({ ...draft, configuration: { ...draft.configuration, executable: e.target.value } })} /></label>
         <label>Arguments · JSON array<textarea rows={4} maxLength={16000} value={argumentsText} onChange={e => setArguments(e.target.value)} /></label>
         <label>Working directory · absolute path<input required maxLength={4096} value={draft.configuration.cwd} onChange={e => setDraft({ ...draft, configuration: { ...draft.configuration, cwd: e.target.value } })} /></label>
-        <label>Local process access<select value={localAccess} onChange={e => setLocalAccess(e.target.value)}><option value="readOnlyDirectory">Read-only directory · no network</option><option value="hostAccount">Host account · full account access</option></select></label>
-        <p>{localAccess === "readOnlyDirectory" ? "The canonical working directory and system runtimes are readable. Other user directories are hidden, and writes and networking are blocked. This requires Linux user namespaces and bubblewrap. Runtimes requiring writes or sockets cannot run in this mode." : "This command runs with your operating-system account permissions, including filesystem and network access. Workspace selection and tool rules do not contain the process."}</p>
+        <label>Local process access<select value={localAccess} onChange={e => setLocalAccess(e.target.value)}><option value="readOnlyDirectory" disabled={windowsNative}>Read-only directory · no network{windowsNative ? " (Linux only)" : ""}</option><option value="hostAccount">Host account · full account access</option></select></label>
+        <p>{localAccess === "readOnlyDirectory" ? windowsNative ? "Windows-native AG1W will not emulate this Linux-only sandbox. Choose host-account access to run the reviewed server, or leave it inactive." : "The canonical working directory and system runtimes are readable. Other user directories are hidden, and writes and networking are blocked. This requires Linux user namespaces and bubblewrap. Runtimes requiring writes or sockets cannot run in this mode." : "This command runs with your operating-system account permissions, including filesystem and network access. Workspace selection and tool rules do not contain the process."}</p>
         <label>Public environment · JSON object<textarea rows={3} maxLength={16000} value={environment} onChange={e => setEnvironment(e.target.value)} /></label><p>Use public configuration values only. Do not enter tokens or passwords. No shell expansion or credential environment is inherited.</p>
         <label>Private environment names · one per line<textarea rows={3} maxLength={4096} placeholder="API_TOKEN" value={secretNames} onChange={e => setSecretNames(e.target.value)} /></label><p>Enter names only. After saving, use native private entry to supply their values.</p>
       </>}
