@@ -272,6 +272,10 @@ struct ActiveSession {
     approval_mode: String,
     busy: bool,
     loading: bool,
+    // The renderer uses this stable label for Stop and progress reporting.
+    // Do not infer it from `busy`: compaction and a branch summary are model
+    // work too, but they are not ordinary assistant generation.
+    operation: Option<String>,
     progress: String,
     diagnostic: Option<String>,
     cancel: Option<Arc<CancelSource>>,
@@ -1165,6 +1169,7 @@ impl NativeHost {
             approval_mode: "interactive".into(),
             busy: false,
             loading: false,
+            operation: None,
             progress: String::new(),
             diagnostic: None,
             cancel: None,
@@ -1249,6 +1254,7 @@ impl NativeHost {
                 );
             }
             active.busy = true;
+            active.operation = Some("local-branch-summary".into());
             active.progress = "Summarizing the abandoned branch".into();
             active.diagnostic = None;
             active.last_usage = None;
@@ -1422,6 +1428,7 @@ impl NativeHost {
             approval_mode: "interactive".into(),
             busy: false,
             loading: false,
+            operation: None,
             progress: String::new(),
             diagnostic: None,
             cancel: None,
@@ -1555,6 +1562,7 @@ impl NativeHost {
         let stamp = now_ms();
         let (cancel_source, cancel_token) = cancellation();
         active.busy = true;
+        active.operation = Some("local-generation".into());
         active.progress = "Preparing local request".into();
         active.diagnostic = None;
         active.last_usage = None;
@@ -1681,11 +1689,105 @@ impl NativeHost {
         self.view()
     }
 
+    /// Reserve the chat for a user-requested context compaction. It follows
+    /// the same busy and cancellation rules as a normal prompt, but the model
+    /// receives AG1's isolated summary request rather than the chat prompt.
+    pub fn begin_context_compaction(&self, focus: Option<&str>) -> Result<String, String> {
+        self.ensure_session()?;
+        if focus.is_some_and(|focus| focus.len() > 1024 * 1024) {
+            return Err("Context-compaction instructions are too large".into());
+        }
+        let mut active = self.active()?;
+        let active = active.as_mut().ok_or("Open a local chat first")?;
+        if active.busy || active.loading {
+            return Err("The local model is already working on this chat".into());
+        }
+        let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let stamp = now_ms();
+        let command = format!("{}-compact-{serial}", active.id.as_str());
+        let (cancel_source, cancel_token) = cancellation();
+        active.busy = true;
+        active.operation = Some("local-context-compaction".into());
+        active.progress = "Preparing context compaction".into();
+        active.diagnostic = None;
+        active.last_usage = None;
+        active.cancel = Some(Arc::new(cancel_source));
+        active.cancel_token = Some(cancel_token);
+        active.live = Some(LiveActivity::new(command.clone(), stamp));
+        Ok(command)
+    }
+
+    /// Finish the compaction that was reserved by `begin_context_compaction`.
+    /// The host does not write a replacement transcript: `NativeSession` owns
+    /// the capture, artifact custody, provider request, and durable append.
+    pub async fn run_started_context_compaction(
+        &self,
+        command: String,
+        focus: Option<String>,
+    ) -> Result<Value, String> {
+        let outcome = async {
+            self.ensure_runtime().await?;
+            let (session, model, runtime, timestamp, mut cancel) = {
+                let mut active = self.active()?;
+                let active = active.as_mut().ok_or("Open a local chat first")?;
+                if !active.busy || active.loading {
+                    return Err("The local context compaction is no longer active".into());
+                }
+                let cancel = active
+                    .cancel_token
+                    .take()
+                    .ok_or("The local context compaction has no cancellation token")?;
+                active.progress = "Summarizing durable context".into();
+                (
+                    active.session.clone(),
+                    active.model.clone(),
+                    self.runtime()?,
+                    timestamp(now_ms()),
+                    cancel,
+                )
+            };
+
+            let base_url = model["baseUrl"]
+                .as_str()
+                .ok_or("Selected local model has no baseUrl")?
+                .to_owned();
+            let origin = endpoint_origin(&base_url).map_err(describe)?;
+            let mut http =
+                ProviderHttp::new(&[origin], Duration::from_secs(10)).map_err(describe)?;
+            if let Some(runtime) = runtime {
+                http = http.with_runtime(runtime);
+            }
+            let host = self.clone();
+            session
+                .compact_local(
+                    &command,
+                    &timestamp,
+                    focus.as_deref(),
+                    &self.inner.scheduler,
+                    &http,
+                    &mut cancel,
+                    move |event| {
+                        host.note_event(event);
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(describe)?;
+            Ok(())
+        }
+        .await;
+
+        self.finish_prompt(outcome.as_ref().err().cloned());
+        outcome?;
+        self.view()
+    }
+
     fn finish_prompt(&self, diagnostic: Option<String>) {
         if let Ok(mut active) = self.active()
             && let Some(active) = active.as_mut()
         {
             active.busy = false;
+            active.operation = None;
             active.progress.clear();
             active.cancel = None;
             active.cancel_token = None;
@@ -1717,6 +1819,7 @@ impl NativeHost {
             return Err("Choose that model before loading it".into());
         }
         active.loading = true;
+        active.operation = Some("local-model-load".into());
         active.progress = format!("Preparing owned local model · {id}");
         active.diagnostic = None;
         Ok(())
@@ -1737,6 +1840,7 @@ impl NativeHost {
         let mut active = self.active()?;
         if let Some(active) = active.as_mut() {
             active.loading = false;
+            active.operation = None;
             active.progress.clear();
             if let Err(error) = &outcome {
                 active.diagnostic = Some(describe(error.clone()));
@@ -1764,7 +1868,12 @@ impl NativeHost {
             .as_ref()
             .ok_or("The local model is not generating")?;
         cancel.cancel();
-        active.progress = "Stopping local generation".into();
+        active.progress = match active.operation.as_deref() {
+            Some("local-context-compaction") => "Stopping local context compaction",
+            Some("local-branch-summary") => "Stopping local branch summary",
+            _ => "Stopping local generation",
+        }
+        .into();
         Ok(())
     }
 
@@ -2176,7 +2285,7 @@ impl NativeHost {
                 "watermark": revision.to_string(),
                 "workspace_path": active.workspace_path.to_string_lossy(),
                 "status": status,
-                "active_operation": if active.busy { json!("local-generation") } else if active.loading { json!("local-model-load") } else { Value::Null },
+                "active_operation": active.operation.clone().map(Value::String).unwrap_or(Value::Null),
                 "messages": snapshot_messages,
                 "message_count": total_messages,
                 "pending": [],
@@ -2289,6 +2398,7 @@ impl NativeHost {
             approval_mode: "interactive".into(),
             busy: false,
             loading: false,
+            operation: None,
             progress: String::new(),
             diagnostic: None,
             cancel: None,
@@ -3913,6 +4023,33 @@ mod tests {
                 .unwrap()
                 > 0
         );
+    }
+
+    #[test]
+    fn compaction_admission_uses_the_live_stop_lifecycle() {
+        let state = tempdir().unwrap();
+        let config_path = write_fixture_config(state.path(), "compact-fixture");
+        let host = NativeHost::open_from_config(state.path().to_path_buf(), config_path).unwrap();
+        host.open_general().unwrap();
+
+        let operation = host
+            .begin_context_compaction(Some("Keep the checked evidence."))
+            .unwrap();
+        assert!(operation.contains("-compact-"));
+        let live = host.view().unwrap();
+        assert_eq!(live["snapshot"]["status"], "streaming");
+        assert_eq!(
+            live["snapshot"]["active_operation"],
+            "local-context-compaction"
+        );
+        assert_eq!(live["progress"], "Preparing context compaction");
+
+        host.cancel().unwrap();
+        assert_eq!(
+            host.view().unwrap()["progress"],
+            "Stopping local context compaction"
+        );
+        host.finish_prompt(Some("fixture stop".into()));
     }
 
     #[test]

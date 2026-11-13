@@ -667,6 +667,32 @@ async fn bridge_command(
                 }
             }
         }
+        Command::Session { action, args } if action == "compact" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                let focus = args["focus"].as_str().map(str::to_owned);
+                match state.host.begin_context_compaction(focus.as_deref()) {
+                    Ok(command) => {
+                        // Compaction can take a normal local-model request.
+                        // Acknowledge it now so the renderer can show its live
+                        // state and offer the same Stop control as generation.
+                        let host = state.host.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = host.run_started_context_compaction(command, focus).await;
+                        });
+                        reply(
+                            &envelope,
+                            &current_view(&state)?,
+                            "accepted",
+                            false,
+                            json!({"kind":"accepted","operation":{"operation":"local-context-compaction","status":"running"}}),
+                        )
+                    }
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
         Command::Session { action, args } if action == "messages" => {
             if let Err(error) = check_scope(&envelope, &before) {
                 reject(&envelope, &before, error)

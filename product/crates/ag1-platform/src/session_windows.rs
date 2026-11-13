@@ -19,7 +19,13 @@ use crate::{
 };
 use ag1_core::{
     DomainError, OperationId, SecretBytes, SessionId,
-    context::{ContextArtifact, ContextArtifactPort, compiler::Compilation, features::Features},
+    context::{
+        ContextArtifact, ContextArtifactPort,
+        compaction::{self, Settings},
+        compiler::Compilation,
+        features::Features,
+        summary_request::{self, SummaryRequest},
+    },
     inference::{EndpointKind, Scheduler},
     provider::{ApiFamily, BlockKind, ProviderEvent, StopReason, assistant_message},
     runtime::{
@@ -95,6 +101,16 @@ pub struct LocalTurnResult {
     pub original_request: ContextArtifact,
     pub output: ContextArtifact,
     pub estimated_input_tokens: u64,
+}
+
+/// The durable facts produced by an explicit context compaction. The summary
+/// itself is in the journal; the raw history and provider output remain in
+/// artifacts so a future turn can rehydrate evidence instead of trusting a
+/// lossy string.
+pub struct LocalCompactionResult {
+    pub result: Value,
+    pub context_epoch: u64,
+    pub journal_revision: u64,
 }
 
 /// A prompt gets this mode from the desktop's explicit approval setting.
@@ -1357,6 +1373,170 @@ impl NativeSession {
         Ok(plan.result)
     }
 
+    /// Compact the active durable branch through the selected local model.
+    ///
+    /// This keeps AG1's normal contract: capture and fence the journal first,
+    /// preserve the raw input as an artifact, ask the model for a summary, and
+    /// append that summary only if the original capture is still current.
+    /// Nothing in this method mutates an in-memory chat transcript.
+    pub async fn compact_local(
+        &self,
+        command: &str,
+        timestamp: &str,
+        focus: Option<&str>,
+        scheduler: &Scheduler,
+        http: &ProviderHttp,
+        cancel: &mut CancelToken,
+        mut observe: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
+    ) -> Result<Option<LocalCompactionResult>, DomainError> {
+        OperationId::new(command)?;
+
+        // The reservation makes a slow summary safe. New turns cannot slip
+        // between this capture and the checked append at the end.
+        let (token, capture) = {
+            let mut state = self.state()?;
+            let token = state.reserve_compaction()?;
+            let capture = match state.capture_compaction(&token) {
+                Ok(capture) => capture,
+                Err(error) => {
+                    let _ = state.abandon_compaction(&token);
+                    return Err(error);
+                }
+            };
+            (token, capture)
+        };
+
+        let result = async {
+            let branch = capture.branch().to_vec();
+            let messages = compaction::context_messages(&branch);
+            let revision = capture.journal_revision();
+            let settings = Self::local_compaction_settings(capture.configuration().context_limit());
+
+            // Keep the raw pre-summary request and the exact cut input. The
+            // compaction text is an index; these artifacts remain the source
+            // when a later action needs primary evidence.
+            let mut artifacts = ContextStore::new(
+                self.store.as_ref(),
+                self.session.clone(),
+                &self.origin,
+                command,
+                timestamp,
+                Features::default(),
+            )?;
+            let original = artifacts.project(&messages, revision, |messages, _| {
+                Ok(Compilation {
+                    messages: messages.to_vec(),
+                    stats: json!({}),
+                })
+            })?;
+            let Some(preparation) = compaction::prepare_full(&branch, &settings)? else {
+                self.state()?.abandon_compaction(&token)?;
+                return Ok(None);
+            };
+            let trajectory = artifacts.put_evidence(
+                &json!({
+                    "version": 1,
+                    "kind": "compaction-trajectory",
+                    "createdAt": timestamp,
+                    "tokensBefore": preparation["tokensBefore"],
+                    "firstKeptEntryId": preparation["firstKeptEntryId"],
+                    "isSplitTurn": preparation["isSplitTurn"],
+                    "previousSummaryIncluded": preparation["previousSummary"].as_str().is_some_and(|text| !text.is_empty()),
+                    "messagesToSummarize": preparation["messagesToSummarize"],
+                    "turnPrefixMessages": preparation["turnPrefixMessages"],
+                })
+                .to_string(),
+                "compaction-trajectory",
+                &json!({"type":"session","name":"semantic-compaction"}),
+                &[],
+                None,
+            )?;
+
+            let split = preparation["isSplitTurn"] == true
+                && preparation["turnPrefixMessages"]
+                    .as_array()
+                    .is_some_and(|messages| !messages.is_empty());
+            let mut summary_outputs = Vec::new();
+            let history = if split
+                && preparation["messagesToSummarize"]
+                    .as_array()
+                    .is_some_and(Vec::is_empty)
+            {
+                "No prior history.".to_owned()
+            } else {
+                let (text, output) = self.summarize_compaction_part(
+                    &capture,
+                    &preparation,
+                    focus,
+                    false,
+                    command,
+                    timestamp,
+                    scheduler,
+                    http,
+                    cancel,
+                    &mut observe,
+                )
+                .await?;
+                summary_outputs.push(output);
+                text
+            };
+            let prefix = if split {
+                let (text, output) = self.summarize_compaction_part(
+                        &capture,
+                        &preparation,
+                        focus,
+                        true,
+                        command,
+                        timestamp,
+                        scheduler,
+                        http,
+                        cancel,
+                        &mut observe,
+                    )
+                    .await?;
+                summary_outputs.push(output);
+                Some(text)
+            } else {
+                None
+            };
+
+            let mut summary = compaction::finish_summary(
+                &preparation,
+                &history,
+                prefix.as_deref(),
+                None,
+            )?;
+            compaction::attach_provenance(&mut summary, &trajectory)?;
+            summary["details"]["originalJournal"] = json!(original.original_journal);
+            summary["details"]["originalRequest"] = json!(original.original_request);
+            summary["details"]["summaryOutputs"] = json!(summary_outputs);
+
+            // `append_compaction` rechecks the capture. If any new journal
+            // record appeared while the summary was running, this fails rather
+            // than applying a summary to the wrong branch.
+            let id = format!("{command}-summary");
+            let mut state = self.state()?;
+            let action = state.append_compaction(&capture, command, &id, timestamp, summary.clone())?;
+            let commit = Self::commit(&mut state, action, self.store.as_ref())?;
+            let context_epoch = state.stamp().epoch();
+            Ok(Some(LocalCompactionResult {
+                result: summary,
+                context_epoch,
+                journal_revision: commit.revision,
+            }))
+        }
+        .await;
+
+        if result.is_err() {
+            // A cancelled or failed summary did not write a journal entry, so
+            // release its fence and leave the conversation untouched.
+            if let Ok(mut state) = self.state() {
+                let _ = state.abandon_compaction(&token);
+            }
+        }
+        result
+    }
+
     /// Build the real context-virtualized request projection. This retains the
     /// immutable journal and request inputs before any compiler reduction so a
     /// later UI can inspect or reproduce the exact context decision.
@@ -1812,6 +1992,185 @@ impl NativeSession {
                 },
             },
         ))
+    }
+
+    fn local_compaction_settings(context_limit: u64) -> Settings {
+        // The upstream defaults target large working windows. Scale them down
+        // for a smaller model so the compaction request itself still fits in
+        // the selected context instead of failing after the journal is fenced.
+        let reserve_tokens = 40_000.min((context_limit / 2).max(2_048));
+        let keep_recent_tokens = 20_000.min((context_limit / 4).max(1_024));
+        Settings {
+            enabled: true,
+            reserve_tokens,
+            keep_recent_tokens,
+        }
+    }
+
+    async fn summarize_compaction_part(
+        &self,
+        capture: &CompactionCapture,
+        preparation: &Value,
+        focus: Option<&str>,
+        split_prefix: bool,
+        command: &str,
+        timestamp: &str,
+        scheduler: &Scheduler,
+        http: &ProviderHttp,
+        cancel: &mut CancelToken,
+        observe: &mut impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
+    ) -> Result<(String, ContextArtifact), DomainError> {
+        let key = if split_prefix {
+            "turnPrefixMessages"
+        } else {
+            "messagesToSummarize"
+        };
+        let messages = preparation[key]
+            .as_array()
+            .ok_or_else(|| DomainError::InvalidInput("compaction summary messages".into()))?
+            .clone();
+        if messages.is_empty() {
+            return Err(DomainError::InvalidInput(
+                "compaction summary has no messages".into(),
+            ));
+        }
+
+        // Use AG1's isolated summary prompt. The normal system prompt, tools,
+        // and reasoning mode would make a summary less predictable and waste
+        // part of the selected model's context window.
+        let isolated = summary_request::request(SummaryRequest {
+            messages: &messages,
+            reserve_tokens: Self::local_compaction_settings(
+                capture.configuration().context_limit(),
+            )
+            .reserve_tokens,
+            previous: preparation["previousSummary"].as_str(),
+            focus,
+            memory: Some(&preparation["workingMemory"]),
+            split_prefix,
+            root_session: Some(self.session.as_str()),
+            model_max: capture.configuration().model["maxTokens"]
+                .as_u64()
+                .unwrap_or(0),
+        })?;
+        let messages = isolated.context["messages"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| DomainError::InvalidInput("compaction summary request".into()))?;
+        let system_prompt = isolated.context["systemPrompt"]
+            .as_str()
+            .ok_or_else(|| DomainError::InvalidInput("compaction summary prompt".into()))?;
+        let mut configuration = capture.configuration().clone();
+        configuration.tools.clear();
+        configuration.thinking = "off".into();
+        configuration.system_prompt = system_prompt.into();
+
+        // Refuse a summary request which would overflow the same model window
+        // used for normal turns. A compacted chat must not rely on a hidden
+        // larger context than the user selected.
+        let estimated = configuration.fixed_tokens()
+            + messages
+                .iter()
+                .map(ag1_core::context::estimate_tokens)
+                .sum::<u64>();
+        if estimated.saturating_mul(11).div_ceil(10) > configuration.context_limit() {
+            return Err(DomainError::LimitExceeded(
+                "compaction summary context admission margin".into(),
+            ));
+        }
+
+        self.state()?.check_compaction_capture(capture)?;
+        let endpoint = Self::local_endpoint(&configuration)?;
+        let family: ApiFamily = serde_json::from_value(configuration.model["api"].clone())
+            .map_err(|_| DomainError::InvalidInput("local provider family".into()))?;
+        let context = json!({
+            "systemPrompt": configuration.system_prompt,
+            "messages": messages,
+            "tools": [],
+        });
+        let overrides = json!({
+            "maxTokens": isolated.max_tokens,
+            "sessionId": isolated.session_id,
+            "cacheRetention": "none",
+        });
+        let options = session_options(
+            &configuration.model,
+            &configuration.thinking,
+            Some(&overrides),
+        )?;
+        let credential = SecretBytes::new(b"ag1-local".to_vec());
+        let operation = format!(
+            "{command}-summary-{}",
+            if split_prefix { "prefix" } else { "history" }
+        );
+        let request = generation_http_request(
+            &RequestContext {
+                model: &configuration.model,
+                context: &context,
+                options: &options,
+                anthropic_oauth: false,
+                google_project: None,
+                request_id: &operation,
+            },
+            HttpCredential::Bearer(&credential),
+            32 * 1024 * 1024,
+        )?;
+        let generation = GenerationRequest {
+            request_id: operation.clone(),
+            tool_names: Vec::new(),
+            family,
+            request,
+            limits: GenerationLimits {
+                max_output_bytes: 32 * 1024 * 1024,
+                prefill_ms: 120_000,
+                idle_ms: 120_000,
+                overall_ms: 0,
+            },
+        };
+
+        scheduler.register(&endpoint, EndpointKind::Local)?;
+        let ticket = scheduler.submit(&endpoint, OperationId::new(operation.clone())?)?;
+        let permit = loop {
+            if cancel.cancelled() {
+                scheduler.cancel(&ticket)?;
+                return Err(DomainError::Cancelled);
+            }
+            if let Some(permit) = scheduler.start(&ticket)? {
+                break permit;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let outcome =
+            request_generation(http, generation, permit, cancel, |event| observe(event)).await;
+        let (raw_snapshot, raw_error) = match &outcome {
+            Ok(snapshot) => (Some(snapshot), None),
+            Err(failure) => (failure.partial.as_ref(), Some(&failure.error)),
+        };
+        let output = self.retain_provider_output(&operation, timestamp, raw_snapshot, raw_error)?;
+        let snapshot = outcome.map_err(|failure| failure.error)?;
+        if matches!(snapshot.stop_reason, Some(StopReason::Error)) {
+            return Err(DomainError::Unavailable(
+                snapshot
+                    .error
+                    .unwrap_or_else(|| "local compaction summary failed".into()),
+            ));
+        }
+        if matches!(snapshot.stop_reason, Some(StopReason::Aborted)) {
+            return Err(DomainError::Cancelled);
+        }
+        let text = snapshot
+            .content
+            .iter()
+            .filter(|block| block.kind == BlockKind::Text)
+            .map(|block| block.text.as_str())
+            .collect::<String>();
+        if text.trim().is_empty() {
+            return Err(DomainError::Unavailable(
+                "local compaction summary returned no text".into(),
+            ));
+        }
+        Ok((text, output))
     }
 
     fn local_endpoint(configuration: &Configuration) -> Result<String, DomainError> {
@@ -2760,6 +3119,111 @@ mod tests {
                 .contains("Native reply")
         );
         assert_eq!(session.records().unwrap().len(), 2);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_keeps_raw_evidence_and_updates_the_context_epoch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = vec![0u8; 128 * 1024];
+            let _ = socket.read(&mut request).unwrap();
+            let body = concat!(
+                "data: {\"id\":\"windows-compaction\",\"choices\":[{\"delta\":{\"content\":\"The earlier research established the local Windows runtime.\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":10,\"total_tokens\":110}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            socket.flush().unwrap();
+        });
+
+        let directory = tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let id = SessionId::new("windows-manual-compaction").unwrap();
+        let mut configuration = config();
+        configuration.model = json!({
+            "provider":"llamacpp",
+            "id":"fixture-model",
+            "api":"openai-completions",
+            "baseUrl":format!("http://{address}/v1"),
+            "contextWindow":16_384,
+            "maxTokens":256,
+            "input":["text"],
+            "reasoning":false,
+        });
+        let session = NativeSession::create(
+            store.clone(),
+            id.clone(),
+            "windows-compaction-origin",
+            "C:\\lab",
+            "2026-11-13T00:00:00.000Z",
+            1,
+            configuration,
+        )
+        .unwrap();
+
+        // This deliberately crosses the four-thousand-token retained tail for
+        // a 16K context while keeping the summary request well inside it.
+        for number in 0..5 {
+            let content = format!("turn {number}: {}", "evidence ".repeat(700));
+            session
+                .append_message(
+                    &format!("compact-user-{number}"),
+                    &format!("compact-user-{number}"),
+                    &format!("2026-11-13T00:00:0{number}.000Z"),
+                    json!({"role":"user","content":content}),
+                )
+                .unwrap();
+        }
+
+        let endpoint = format!("http://{address}");
+        let http = ProviderHttp::new(&[endpoint], Duration::from_secs(5)).unwrap();
+        let scheduler = Scheduler::default();
+        let (_source, mut cancel) = crate::provider::http::cancellation();
+        let result = session
+            .compact_local(
+                "windows-manual-compact",
+                "2026-11-13T00:01:00.000Z",
+                Some("Preserve the runtime evidence."),
+                &scheduler,
+                &http,
+                &mut cancel,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap()
+            .expect("the long fixture history should need compaction");
+
+        assert!(result.context_epoch > 1);
+        assert_eq!(result.journal_revision, 6);
+        assert!(
+            result.result["summary"]
+                .as_str()
+                .unwrap()
+                .contains("earlier research established")
+        );
+        assert!(
+            result.result["details"]["trajectoryArtifactId"]
+                .as_str()
+                .is_some()
+        );
+        assert_eq!(
+            session.records().unwrap().last().unwrap()["type"],
+            "compaction"
+        );
+
+        let resumed =
+            NativeSession::resume(store, id, "windows-compaction-origin", 2, config()).unwrap();
+        let record = resumed.records().unwrap().last().unwrap().clone();
+        assert_eq!(record["type"], "compaction");
+        assert!(record["details"]["originalJournal"].is_object());
         server.join().unwrap();
     }
 }
