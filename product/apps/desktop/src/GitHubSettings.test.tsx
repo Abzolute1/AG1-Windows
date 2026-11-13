@@ -47,6 +47,15 @@ test("clone uses shared native folder custody, never the legacy gh clone action"
   expect(invoke.mock.calls.some(([, args]) => args.action === "clone")).toBe(false);expect(effect).not.toHaveBeenCalled();
 });
 
+test("Windows-native AG1W hides local Git until its custody layer exists", async () => {
+  invoke.mockImplementation(async (_, { action }) => action === "status" ? { state: "connected", login: "fixture" } : action === "repos" ? { items: [{ name: "fixture/project", private: false, branch: "main", url: "https://github.com/fixture/project" }] } : []);
+  render(<GitHubSettings workspace="/owned" attach={vi.fn()} gitRun={vi.fn()} gitEffect={vi.fn()} nativeHost />);
+  fireEvent.click(await screen.findByRole("button", { name: "Browse repositories" }));
+  fireEvent.click(await screen.findByRole("button", { name: /fixture\/project/ }));
+  expect(screen.getByRole("button", { name: "Clone repository" })).toHaveProperty("disabled", true);
+  expect(screen.queryByRole("button", { name: "Local Git" })).toBeNull();
+});
+
 test("PR checkout enters the shared exact-head workflow instead of legacy gh checkout", async () => {
   const sha = "c".repeat(40);
   invoke.mockImplementation(async (_, { action }) => action === "status" ? { state: "connected", login: "fixture" } : action === "repos" ? { items: [{ name: "fixture/project", private: false, branch: "main", url: "https://github.com/fixture/project" }] } : action === "pulls" ? [{ id: 7, number: 7, title: "Reviewed PR", state: "open" }] : action === "item" ? { item: { number: 7, title: "Reviewed PR", state: "open", head: { sha, ref: "topic", label: "fixture:topic" }, base: { ref: "main", label: "fixture:main" } }, comments: [] } : []);

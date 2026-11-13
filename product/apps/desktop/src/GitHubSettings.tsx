@@ -17,7 +17,14 @@ import { GitHubReviewContext } from "./GitHubPullReview";
 import { GitHubItemActions, GitHubItemMetadata } from "./GitHubItemActions";
 type Connection = { state: string; available?: boolean; login?: string; name?: string; code?: string; error?: string };
 type Repository = { name: string; description?: string; private: boolean; branch: string; url: string };
-export function GitHubSettings({ workspace, attach, discuss, gitRun, gitEffect, changes }: { workspace?: string; attach: (path: string) => void; discuss?: (text: string) => void; gitRun?: GitRun; gitEffect?: GitRun; changes?: () => void }) {
+function isWindowsNativeHost() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window && /Win/i.test(navigator.platform || navigator.userAgent);
+}
+export function GitHubSettings({ workspace, attach, discuss, gitRun: sharedGitRun, gitEffect: sharedGitEffect, changes, nativeHost = isWindowsNativeHost() }: { workspace?: string; attach: (path: string) => void; discuss?: (text: string) => void; gitRun?: GitRun; gitEffect?: GitRun; changes?: () => void; nativeHost?: boolean }) {
+  // AG1W can manage remote GitHub work, but local clone/checkout/push needs
+  // its own Windows custody layer. Keep its incomplete actions inactive.
+  const gitRun = nativeHost ? undefined : sharedGitRun;
+  const gitEffect = nativeHost ? undefined : sharedGitEffect;
   const remoteReview = useContext(GitHubReviewContext);
   const [connection, setConnection] = useState<Connection>({ state: "loading" }), [error, setError] = useState(""), [busy, setBusy] = useState(false);
   const [repos, setRepos] = useState<Repository[]>([]), [repo, setRepo] = useState<Repository | null>(null), [search, setSearch] = useState(""), [repoPage, setRepoPage] = useState(1);
