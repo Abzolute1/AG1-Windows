@@ -65,7 +65,7 @@ const PROJECT_TOOL_MAX_TEXT: usize = 32 * 1024;
 const PROJECT_SEARCH_MAX_FILES: usize = 200;
 const PROJECT_SEARCH_MAX_MATCHES: usize = 100;
 const PROJECT_SEARCH_LINE_BYTES: usize = 400;
-const MAX_PROJECT_TOOL_CALLS: usize = 8;
+const MAX_LOCAL_TOOL_CALLS: usize = 8;
 const PROJECT_COMMAND_MAX_ARGS: usize = 64;
 const PROJECT_COMMAND_MAX_ARG_BYTES: usize = 4 * 1024;
 const PROJECT_COMMAND_MAX_TIMEOUT_MS: u64 = 120_000;
@@ -920,6 +920,23 @@ fn unavailable_local_tool_result(call: &Value) -> Value {
         "toolName":call["name"],
         "content":[{"type":"text","text":"Attach a project before using file or command tools."}],
         "isError":true,
+    })
+}
+
+fn repeated_tool_error_result(call: &Value) -> Value {
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":call["name"],
+        "content":[{"type":"text","text":"This exact tool call already failed during this answer, so AG1W did not run it again. Use materially different arguments or explain the limitation from the recorded error."}],
+        "isError":true,
+    })
+}
+
+fn repeats_failed_call(failed_calls: &[(String, Value)], call: &Value) -> bool {
+    let name = call["name"].as_str().unwrap_or_default();
+    failed_calls.iter().any(|(previous_name, previous_args)| {
+        previous_name == name && previous_args == &call["arguments"]
     })
 }
 
@@ -2023,6 +2040,10 @@ impl NativeSession {
         // instead of an in-memory transcript of uncommitted tool output.
         let mut round = 0u8;
         let mut tool_calls = 0usize;
+        // Keep failed calls for this one user turn. A model sometimes retries
+        // the exact same request after an error, which only wastes time and
+        // can make a real provider block the chat for longer.
+        let mut failed_calls: Vec<(String, Value)> = Vec::new();
         // Web research is available in ordinary chats, even before a project
         // is attached. Project tools are added only from the prompt's frozen
         // folder snapshot. Plan drafts deliberately receive neither surface.
@@ -2246,7 +2267,7 @@ impl NativeSession {
                     "local project tool rounds".into(),
                 ));
             }
-            if calls.len() > MAX_PROJECT_TOOL_CALLS.saturating_sub(tool_calls) {
+            if calls.len() > MAX_LOCAL_TOOL_CALLS.saturating_sub(tool_calls) {
                 return Err(DomainError::LimitExceeded(
                     "local project tool calls".into(),
                 ));
@@ -2258,23 +2279,32 @@ impl NativeSession {
                 timestamp_ms: input.timestamp_ms,
             };
             for (index, call) in calls.iter().enumerate() {
-                let result = match call["name"].as_str() {
-                    Some("webSearch") | Some("webFetch") => {
-                        self.execute_web_tool(
-                            call,
-                            &format!("{assistant_id}-web-{round}-{index}"),
-                            &input.timestamp,
-                            input.timestamp_ms,
-                            cancel,
-                        )
-                        .await
+                let name = call["name"].as_str().unwrap_or_default();
+                let repeated_failure = repeats_failed_call(&failed_calls, call);
+                let result = if repeated_failure {
+                    repeated_tool_error_result(call)
+                } else {
+                    match call["name"].as_str() {
+                        Some("webSearch") | Some("webFetch") => {
+                            self.execute_web_tool(
+                                call,
+                                &format!("{assistant_id}-web-{round}-{index}"),
+                                &input.timestamp,
+                                input.timestamp_ms,
+                                cancel,
+                            )
+                            .await
+                        }
+                        Some("mcpSearch") => self.execute_mcp_search(mcp.as_ref(), call),
+                        Some("mcpCall") => self.execute_mcp_call(mcp.as_ref(), call, cancel).await,
+                        _ => tools
+                            .map(|tools| tools.execute_with_changes(call, Some(&change)))
+                            .unwrap_or_else(|| unavailable_local_tool_result(call)),
                     }
-                    Some("mcpSearch") => self.execute_mcp_search(mcp.as_ref(), call),
-                    Some("mcpCall") => self.execute_mcp_call(mcp.as_ref(), call, cancel).await,
-                    _ => tools
-                        .map(|tools| tools.execute_with_changes(call, Some(&change)))
-                        .unwrap_or_else(|| unavailable_local_tool_result(call)),
                 };
+                if result["isError"] == true {
+                    failed_calls.push((name.to_owned(), call["arguments"].clone()));
+                }
                 let id = format!("{}-tool-{round}-{index}", input.assistant_id);
                 self.append_message(&id, &id, &input.timestamp, result)?;
             }
@@ -3101,6 +3131,38 @@ mod tests {
         assert_eq!(
             denied["content"][0]["text"],
             "This chat is set to ask before changes. Choose Allow routine changes or Bypass approvals, then ask again."
+        );
+    }
+
+    #[test]
+    fn repeated_failed_tool_calls_are_detected_without_matching_new_arguments() {
+        let first = json!({
+            "id":"first-search",
+            "name":"webSearch",
+            "arguments":{"query":"AG1W release notes"}
+        });
+        let same_request = json!({
+            "id":"second-search",
+            "name":"webSearch",
+            "arguments":{"query":"AG1W release notes"}
+        });
+        let different_request = json!({
+            "id":"third-search",
+            "name":"webSearch",
+            "arguments":{"query":"AG1W native model setup"}
+        });
+        let failed = vec![("webSearch".to_owned(), first["arguments"].clone())];
+
+        assert!(repeats_failed_call(&failed, &same_request));
+        assert!(!repeats_failed_call(&failed, &different_request));
+
+        let result = repeated_tool_error_result(&same_request);
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("did not run it again")
         );
     }
 

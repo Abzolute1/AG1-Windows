@@ -72,7 +72,7 @@ const MAX_ATTACHMENT_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ATTACHMENT_IMAGES: usize = 8;
 const MAX_WORKSPACE_DIFF_BYTES: usize = 1024 * 1024;
 const CHANGE_PAGE_BYTES: usize = 24 * 1024;
-const DEFAULT_SYSTEM_PROMPT: &str = "You are AG1, a local coding and research assistant. Use the tool definitions supplied with the request when they help. For current information, use webSearch and webFetch instead of claiming that browsing is unavailable. Inspect a project before changing it, and base conclusions on tool results when they are available.";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are AG1, a local coding and research assistant. Use the tool definitions supplied with the request when they help. For current information, use webSearch and webFetch instead of claiming that browsing is unavailable. If a tool returns an error or no result, do not repeat that exact call; take a materially different action or explain the limitation. Inspect a project before changing it, and base conclusions on tool results when they are available.";
 static SETUP_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// The three files AG1W needs to own a local llama.cpp runtime.
