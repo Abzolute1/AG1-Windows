@@ -1,3 +1,8 @@
+// This suite covers the Linux-to-native cutover and rollback implementation.
+// Windows has a smaller native-only registry, so these Linux rollback APIs are
+// intentionally absent there.
+#![cfg(target_os = "linux")]
+
 #[path = "../../../../../fixtures/runtime/custody.rs"]
 mod custody_fixture;
 use ag1_platform::{

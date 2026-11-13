@@ -272,7 +272,16 @@ impl ProviderHttp {
             biased;
             _=cancel.wait()=>return Err(DomainError::Cancelled),
             _=deadline_reached(deadline)=>return Err(DomainError::TimedOut),
-            value=pending=>value.map_err(|e|if e.is_timeout(){DomainError::TimedOut}else{DomainError::Unavailable("provider HTTP connection failed".into())})?,
+            value=pending=>value.map_err(|error| {
+                if error.is_timeout() {
+                    DomainError::TimedOut
+                } else {
+                    // reqwest's debug value includes the socket/TLS cause but not
+                    // request headers, so it makes local failures diagnosable
+                    // without leaking the provider credential in those headers.
+                    DomainError::Unavailable(format!("provider HTTP connection failed: {error:?}"))
+                }
+            })?,
         };
         if response
             .content_length()

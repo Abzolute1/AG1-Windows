@@ -567,6 +567,19 @@ async fn bridge_command(
                 Err(error) => reject(&envelope, &before, error),
             }
         }
+        Command::Model { action, args } if action == "reasoning" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                let provider = args["provider"].as_str().ok_or("Missing model provider")?;
+                let id = args["model_id"].as_str().ok_or("Missing model ID")?;
+                let mode = args["mode"].as_str().ok_or("Missing reasoning mode")?;
+                match state.host.select_reasoning_mode(provider, id, mode) {
+                    Ok(data) => reply(&envelope, &before, "accepted", false, data),
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
         Command::Model { action, args } if action == "context" => {
             if let Err(error) = check_scope(&envelope, &before) {
                 reject(&envelope, &before, error)

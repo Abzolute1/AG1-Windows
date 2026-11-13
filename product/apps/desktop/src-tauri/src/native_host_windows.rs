@@ -440,16 +440,49 @@ impl NativeHost {
     /// Return the capability for one configured local model. Keeping this in
     /// the host means the picker and the model catalog cannot disagree.
     pub fn reasoning_controls(&self, provider: &str, id: &str) -> Result<Value, String> {
+        let model = self.model(provider, id)?;
+        Ok(model_reasoning_controls(&model))
+    }
+
+    /// The shared composer submits its selected reasoning mode before a prompt.
+    /// Qwen has one fixed native mode, so accepting only that mode confirms the
+    /// choice without inventing cloud-style effort controls or mutating a model.
+    pub fn select_reasoning_mode(
+        &self,
+        provider: &str,
+        id: &str,
+        mode: &str,
+    ) -> Result<Value, String> {
+        let model = self.model(provider, id)?;
+        let controls = model_reasoning_controls(&model);
+        let selected = controls["modes"]
+            .as_array()
+            .and_then(|modes| {
+                modes
+                    .iter()
+                    .find(|candidate| candidate["id"].as_str() == Some(mode))
+            })
+            .ok_or("That reasoning mode is not available for this local model")?;
+        Ok(json!({
+            "provider": provider,
+            "model_id": id,
+            "mode": mode,
+            "level": selected["level"],
+            "source": controls["source"],
+        }))
+    }
+
+    fn model(&self, provider: &str, id: &str) -> Result<Value, String> {
         let config = self.config()?;
-        let model = config
+        config
             .as_ref()
             .and_then(|config| {
                 config.models.iter().find(|model| {
                     model["provider"].as_str() == Some(provider) && model["id"].as_str() == Some(id)
                 })
             })
-            .ok_or("That model is not in AG1W's local catalog")?;
-        Ok(model_reasoning_controls(model))
+            .cloned()
+            .ok_or("That model is not in AG1W's local catalog".into())
     }
 
     /// Give the sidebar the current native chat's state without rebuilding its
@@ -4672,6 +4705,23 @@ mod tests {
     }
 
     #[test]
+    fn native_reasoning_selection_accepts_only_qwens_fixed_mode() {
+        let state = tempdir().unwrap();
+        let config = write_fixture_config(state.path(), "Qwen3.6-35B-A3B-UD-Q4_K_XL");
+        let host = NativeHost::open_from_config(state.path().to_path_buf(), config).unwrap();
+
+        let accepted = host
+            .select_reasoning_mode("llamacpp", "Qwen3.6-35B-A3B-UD-Q4_K_XL", "on")
+            .unwrap();
+        assert_eq!(accepted["level"], "high");
+        assert_eq!(accepted["source"], "qwen-chat-template");
+        assert!(
+            host.select_reasoning_mode("llamacpp", "Qwen3.6-35B-A3B-UD-Q4_K_XL", "low")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn qwen_session_configuration_enables_native_thinking() {
         let configuration = session_configuration(
             json!({
@@ -5867,6 +5917,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires outbound loopback permission for Cargo's temporary test executable"
+    )]
     async fn branch_summary_uses_the_local_model_and_stays_durable() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -6008,6 +6062,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires outbound loopback permission for Cargo's temporary test executable"
+    )]
     async fn cancelling_a_branch_summary_keeps_the_original_branch_selected() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -6122,6 +6180,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires outbound loopback permission for Cargo's temporary test executable"
+    )]
     async fn local_host_runs_a_durable_loopback_turn() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -6226,6 +6288,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        windows,
+        ignore = "requires outbound loopback permission for Cargo's temporary test executable"
+    )]
     async fn pasted_vision_image_reaches_the_local_openai_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();

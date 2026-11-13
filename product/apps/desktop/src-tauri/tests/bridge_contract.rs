@@ -1,3 +1,7 @@
+// This contract drives AG1's Linux worker process and imports Linux-only
+// desktop symbols. Native Windows has its own host contract tests instead.
+#![cfg(target_os = "linux")]
+
 use ag1_desktop::{Desktop, file_operation};
 use ag1_protocol::{BridgeFrame, Command, CommandEnvelope, PromptInput, Sequence};
 use serde_json::{Value, json};
