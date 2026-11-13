@@ -23,8 +23,8 @@ pub use artifact_search::{ArtifactSearchMatch, ArtifactSearchResult, ArtifactSea
 
 mod session_lifecycle;
 pub use session_lifecycle::{SessionBootstrap, SessionSeed};
-mod runtime_recovery;
 mod file_changes;
+mod runtime_recovery;
 mod runtime_selection;
 pub use runtime_recovery::InterruptedCommand;
 pub use runtime_selection::{RuntimeSelection, SelectionAck, SelectionChange, StoredSelection};

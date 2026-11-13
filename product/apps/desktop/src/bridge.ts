@@ -6,6 +6,7 @@ export type ConversationStatus = { session: string; workspace: string; status: s
 export type Chat = { session: string; workspace: string; title: string; updated?: string; archived?: boolean; deleted?: boolean; renamed?: boolean; general?: boolean; empty?: boolean };
 export type ReasoningControls = { kind: "toggle" | "levels" | "unknown" | "unsupported"; modes: { id: string; label: string; level: string }[]; default?: string; source: string };
 export type Model = { input?: string[]; id: string; provider: string; contextWindow?: number; reasoning?: boolean; reasoningControls?: ReasoningControls; conflict?: unknown };
+export type NativeModelSetup = { modelId: string; serverPath: string; modelPath: string; profilePath: string; projectorPath?: string; port: number; vramMiB?: number; systemPrompt?: string };
 export type Catalog = { projects: string[]; theme: import("./themes").Theme; chats?: Chat[]; themes?: import("./themes").ThemePlugin[] };
 export const api = {
   chooseChatFolder: () => invoke<string | null>("choose_chat_folder"),
@@ -18,6 +19,8 @@ export const api = {
   github: (action: string, args: Record<string, unknown> = {}) => invoke<any>("github_command", { action, args }),
   preferences: () => invoke<{ approval_mode: string }>("desktop_preferences"),
   models: () => invoke<Model[]>("desktop_models"),
+  configureNativeModel: (setup: NativeModelSetup) => invoke<Model[]>("configure_native_model", { setup }),
+  chooseNativeRuntimeFile: (kind: "server" | "model" | "projector" | "profile") => invoke<string | null>("choose_native_runtime_file", { kind }),
   general: () => invoke<View>("open_general"),
   indexChat: (chat: Chat) => invoke<void>("save_chat", { chat: { ...chat, discovered: true } }),
   saveChat: (chat: Chat) => invoke<void>("save_chat", { chat }),

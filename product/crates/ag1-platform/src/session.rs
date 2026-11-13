@@ -42,14 +42,14 @@ pub mod extensions;
 pub mod files;
 mod job_notices;
 mod lifecycle;
+#[cfg(target_os = "linux")]
+pub mod mcp;
 pub mod planning;
 mod preparation;
 pub mod print;
 mod prompt;
 mod recovery;
 pub mod registry;
-#[cfg(target_os = "linux")]
-pub mod mcp;
 pub mod repetition;
 pub mod restart;
 pub mod runtime_commands;
@@ -93,19 +93,38 @@ pub trait ProviderResolver: Send + Sync {
 /// drain accepted effects even if cancellation is requested.
 pub trait ToolRunner: Send + Sync {
     #[cfg(target_os = "linux")]
-    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> { None }
+    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> {
+        None
+    }
     /// Capture an immutable native MCP selection for this one request/batch.
     #[cfg(target_os = "linux")]
-    fn mcp_request_runner(&self, _scope:&Scope) -> Result<Option<Arc<dyn ToolRunner>>,DomainError> { Ok(None) }
+    fn mcp_request_runner(
+        &self,
+        _scope: &Scope,
+    ) -> Result<Option<Arc<dyn ToolRunner>>, DomainError> {
+        Ok(None)
+    }
     #[cfg(target_os = "linux")]
-    fn mcp_request_definitions(&self) -> Option<Vec<ag1_core::tools::mcp::SelectedDefinition>> { None }
+    fn mcp_request_definitions(&self) -> Option<Vec<ag1_core::tools::mcp::SelectedDefinition>> {
+        None
+    }
     /// Request-local MCP schemas are host-owned and rechecked after async work.
     #[cfg(target_os = "linux")]
-    fn prepare_mcp_request(&self, _scope:&Scope, tools:&[Value]) -> Result<Vec<Value>,DomainError> { Ok(tools.to_vec()) }
+    fn prepare_mcp_request(
+        &self,
+        _scope: &Scope,
+        tools: &[Value],
+    ) -> Result<Vec<Value>, DomainError> {
+        Ok(tools.to_vec())
+    }
     #[cfg(target_os = "linux")]
-    fn validate_mcp_request(&self, _scope:&Scope, _tools:&[Value]) -> Result<(),DomainError> { Ok(()) }
+    fn validate_mcp_request(&self, _scope: &Scope, _tools: &[Value]) -> Result<(), DomainError> {
+        Ok(())
+    }
 
-    fn folder_access(&self) -> Option<(Arc<crate::folder_access::FolderAccess>, u64)> { None }
+    fn folder_access(&self) -> Option<(Arc<crate::folder_access::FolderAccess>, u64)> {
+        None
+    }
     fn client_activity(&self) -> Result<Value, DomainError> {
         Ok(serde_json::json!({}))
     }
@@ -947,7 +966,10 @@ impl NativeSession {
                 source: Arc::new(source),
             });
         }
-        let mut lease = TurnLease { session: self, completed: false };
+        let mut lease = TurnLease {
+            session: self,
+            completed: false,
+        };
         let serial = NEXT_TURN
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| DomainError::Conflict)?;

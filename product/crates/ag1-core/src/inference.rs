@@ -94,10 +94,12 @@ impl Pool {
 impl Scheduler {
     pub fn capacity(&self, endpoint: &str) -> Result<usize, DomainError> {
         let inner = self.inner.lock().map_err(|_| DomainError::Conflict)?;
-        Ok(match inner.pools.get(endpoint).ok_or(DomainError::NotFound)?.kind {
-            EndpointKind::Local => 1,
-            EndpointKind::Remote => 3,
-        })
+        Ok(
+            match inner.pools.get(endpoint).ok_or(DomainError::NotFound)?.kind {
+                EndpointKind::Local => 1,
+                EndpointKind::Remote => 3,
+            },
+        )
     }
     /// Endpoint identity is resolved by the host, independently of model/provider aliases.
     /// Registration is bounded and cannot reconfigure an occupied pool.
@@ -221,9 +223,20 @@ impl Scheduler {
     // must not release local runtime custody without positive stop evidence.
     fn abandoned(&self, ticket: &Ticket) -> Result<(), DomainError> {
         self.check_owner(ticket)?;
-        let remote = self.inner.lock().map_err(|_| DomainError::Conflict)?
-            .pools.get(&ticket.endpoint).ok_or(DomainError::NotFound)?.kind == EndpointKind::Remote;
-        if remote { self.finish(ticket) } else { self.cancel(ticket) }
+        let remote = self
+            .inner
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .pools
+            .get(&ticket.endpoint)
+            .ok_or(DomainError::NotFound)?
+            .kind
+            == EndpointKind::Remote;
+        if remote {
+            self.finish(ticket)
+        } else {
+            self.cancel(ticket)
+        }
     }
     fn finish(&self, ticket: &Ticket) -> Result<(), DomainError> {
         self.check_owner(ticket)?;

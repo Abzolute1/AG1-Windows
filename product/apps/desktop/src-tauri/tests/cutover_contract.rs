@@ -1844,13 +1844,14 @@ async fn durable_desktop_startup_and_actual_cli_compete_for_the_same_workspace()
     assert!(desktop.selects(&f.workspace).unwrap());
     let desktop_state = f._dir.path().join("desktop-private");
     fs::create_dir(&desktop_state).unwrap();
-    desktop
-        .open(&f.workspace, &desktop_state)
-        .await
-        .unwrap();
+    desktop.open(&f.workspace, &desktop_state).await.unwrap();
     let cli = std::env::current_exe()
         .unwrap()
-        .parent().unwrap().parent().unwrap().join("ag1-cli");
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("ag1-cli");
     let run = |state: &Path| {
         std::process::Command::new(&cli)
             .arg("--workspace")

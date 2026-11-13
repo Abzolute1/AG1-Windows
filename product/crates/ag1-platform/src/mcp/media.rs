@@ -18,31 +18,52 @@ impl Projection {
         self.attempts += 1;
         let reason = if self.attempts > 8 {
             Some("the result exceeds the eight-image preview limit")
-        } else if !matches!(mime, "image/png" | "image/jpeg" | "image/gif" | "image/webp") {
+        } else if !matches!(
+            mime,
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
             Some("this image format is unsupported")
         } else if data.len() > 8 * 1024 * 1024 {
             Some("the encoded image exceeds the preview byte limit")
         } else {
             None
         };
-        if let Some(reason) = reason { return Ok(vec![omitted(reason)]); }
-        let bytes = STANDARD.decode(data).map_err(|_| super::invalid("image base64"))?;
+        if let Some(reason) = reason {
+            return Ok(vec![omitted(reason)]);
+        }
+        let bytes = STANDARD
+            .decode(data)
+            .map_err(|_| super::invalid("image base64"))?;
         match crate::image_tools::mcp_preview(&bytes, mime) {
             Ok(preview) => {
-                let blocks = preview["content"].as_array().ok_or_else(|| super::invalid("native image preview"))?;
-                let size: usize = blocks.iter().filter_map(|b| b["data"].as_str()).map(str::len).sum();
+                let blocks = preview["content"]
+                    .as_array()
+                    .ok_or_else(|| super::invalid("native image preview"))?;
+                let size: usize = blocks
+                    .iter()
+                    .filter_map(|b| b["data"].as_str())
+                    .map(str::len)
+                    .sum();
                 if self.encoded_bytes.saturating_add(size) > 8 * 1024 * 1024 {
-                    return Ok(vec![omitted("the result exceeds the aggregate preview byte limit")]);
+                    return Ok(vec![omitted(
+                        "the result exceeds the aggregate preview byte limit",
+                    )]);
                 }
                 self.encoded_bytes += size;
-                let mut result = vec![json!({"type":"text","text":"MCP image preview (rasterized; original bytes retained separately):"})];
+                let mut result = vec![
+                    json!({"type":"text","text":"MCP image preview (rasterized; original bytes retained separately):"}),
+                ];
                 // Keep native size/resize notes, never server-supplied details.
                 result.extend(blocks.iter().cloned());
                 Ok(result)
             }
             Err(DomainError::QueueFull) => Ok(vec![omitted("the image decoder is busy")]),
-            Err(DomainError::LimitExceeded(_)) => Ok(vec![omitted("the image exceeds the decoder byte or pixel limit")]),
-            Err(_) => Ok(vec![omitted("the image is malformed or its MIME type does not match its bytes")]),
+            Err(DomainError::LimitExceeded(_)) => Ok(vec![omitted(
+                "the image exceeds the decoder byte or pixel limit",
+            )]),
+            Err(_) => Ok(vec![omitted(
+                "the image is malformed or its MIME type does not match its bytes",
+            )]),
         }
     }
 }
@@ -54,14 +75,29 @@ fn omitted(reason: &str) -> Value {
 pub(super) fn references(envelope: &Value, kind: ag1_core::tools::mcp::Kind) -> Vec<Value> {
     let result = &envelope["result"];
     let rows: Vec<&Value> = match kind {
-        ag1_core::tools::mcp::Kind::Tool => result["content"].as_array().into_iter().flatten().collect(),
-        ag1_core::tools::mcp::Kind::Prompt => result["messages"].as_array().into_iter().flatten().map(|m| &m["content"]).collect(),
-        _ => result["contents"].as_array().into_iter().flatten().collect(),
+        ag1_core::tools::mcp::Kind::Tool => {
+            result["content"].as_array().into_iter().flatten().collect()
+        }
+        ag1_core::tools::mcp::Kind::Prompt => result["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|m| &m["content"])
+            .collect(),
+        _ => result["contents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .collect(),
     };
     fn label(value: &Value, limit: usize) -> String {
-        let text=value.as_str().unwrap_or("");
-        let mut chars=text.chars();let mut clipped:String=chars.by_ref().take(limit).collect();
-        if chars.next().is_some(){clipped.push('…');}clipped
+        let text = value.as_str().unwrap_or("");
+        let mut chars = text.chars();
+        let mut clipped: String = chars.by_ref().take(limit).collect();
+        if chars.next().is_some() {
+            clipped.push('…');
+        }
+        clipped
     }
     rows.into_iter().filter_map(|row| {
         let (resource, retained) = if row["type"]=="resource_link" {(row,false)}

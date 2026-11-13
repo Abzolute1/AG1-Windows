@@ -936,14 +936,29 @@ fn compile_inner(
     // small messages. Archive closed old segments only when those cheaper
     // reductions still leave the request over its working target.
     let (compiled, archived) = if target > 0 && fixed + sum(&compiled) > target {
-        history::archive(compiled, options.recent_assistant_turns.unwrap_or(3).max(1),
-            lease_budget, fixed, target, compact_target, store)?
-    } else { (compiled, 0) };
+        history::archive(
+            compiled,
+            options.recent_assistant_turns.unwrap_or(3).max(1),
+            lease_budget,
+            fixed,
+            target,
+            compact_target,
+            store,
+        )?
+    } else {
+        (compiled, 0)
+    };
     let after = fixed + sum(&compiled);
     let mut stats = json!({"tokensBefore":before,"tokensAfter":after,"targetTokens":target,"compactionTargetTokens":compact_target,"fixedTokens":fixed,"protectedMessages":protected.len(),"leasedEvidenceMessages":leased_messages,"leasedEvidenceTokens":leased_tokens,"externalizedToolResults":ext,"externalizedToolCallPayloads":payloads,"compactedArtifactPreviews":previews,"strippedThinkingMessages":stripped,"evictedArtifactMetadata":evicted,"prunedToolRounds":pruned,"residentArtifactMetadataTokens":resident_tokens,"freedTokens":before.saturating_sub(after),"headroomTokens":target.saturating_sub(after),"overTargetTokens":after.saturating_sub(target)});
     if archived > 0 {
         stats["archivedHistoryMessages"] = json!(archived);
-        stats["residentArtifactMetadataTokens"] = json!(compiled.iter().filter(|m| resident(m)).map(|m| m.tokens).sum::<u64>());
+        stats["residentArtifactMetadataTokens"] = json!(
+            compiled
+                .iter()
+                .filter(|m| resident(m))
+                .map(|m| m.tokens)
+                .sum::<u64>()
+        );
     }
     Ok(SnapshotCompilation {
         snapshot: ContextSnapshot { messages: compiled },

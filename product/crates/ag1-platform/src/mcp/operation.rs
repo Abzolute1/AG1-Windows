@@ -117,7 +117,12 @@ pub(crate) fn error_code(error: &DomainError, sent: bool) -> &'static str {
         DomainError::Unavailable(reason) if reason == super::auth::PRIVATE_ECHO => {
             "private_output_withheld"
         }
-        DomainError::Unavailable(reason) if reason.starts_with("MCP input") || reason.starts_with("MCP supports one user form") => "unsupported_input",
+        DomainError::Unavailable(reason)
+            if reason.starts_with("MCP input")
+                || reason.starts_with("MCP supports one user form") =>
+        {
+            "unsupported_input"
+        }
         _ if !sent => "not_sent",
         _ => "transport_error",
     }
@@ -167,7 +172,11 @@ pub(crate) fn retain_result(
             true,
         ),
     };
-    let references = if code != "protocol_error" && !continuation { super::media::references(&envelope, identity.kind) } else { vec![] };
+    let references = if code != "protocol_error" && !continuation {
+        super::media::references(&envelope, identity.kind)
+    } else {
+        vec![]
+    };
     Ok(AdapterOutcome {
         result: json!({"content":content,"isError":is_error,"details":{"mcp":{"outcome":code,"source":identity,"references":references,"sendAdmitted":true,"originalResponse":original,"completeResponseRetained":!continuation,"omission":if continuation {Some("unsupported continuation state and input requests discarded")} else {None}}}}),
         effect: Effect::Unknown,
@@ -242,7 +251,10 @@ fn normalize(
                         .filter(|r| matches!(*r, "user" | "assistant"))
                         .ok_or_else(|| invalid("prompt role"))?;
                     content.push(json!({"type":"text","text":format!("MCP prompt message ({role}; untrusted source):")}));
-                    content.extend(project_blocks(std::slice::from_ref(&message["content"]), &mut media)?);
+                    content.extend(project_blocks(
+                        std::slice::from_ref(&message["content"]),
+                        &mut media,
+                    )?);
                 }
                 content
             }
@@ -286,7 +298,10 @@ fn normalize(
     ))
 }
 
-fn project_blocks(blocks: &[Value], media: &mut super::media::Projection) -> Result<Vec<Value>, DomainError> {
+fn project_blocks(
+    blocks: &[Value],
+    media: &mut super::media::Projection,
+) -> Result<Vec<Value>, DomainError> {
     if blocks.len() > 256 {
         return Err(DomainError::LimitExceeded("MCP result blocks".into()));
     }
@@ -319,7 +334,9 @@ fn project_blocks(blocks: &[Value], media: &mut super::media::Projection) -> Res
             let data = block["data"]
                 .as_str()
                 .ok_or_else(|| invalid("media data"))?;
-            if data.len() > 8 * 1024 * 1024 { return Err(DomainError::LimitExceeded("MCP media bytes".into())); }
+            if data.len() > 8 * 1024 * 1024 {
+                return Err(DomainError::LimitExceeded("MCP media bytes".into()));
+            }
             STANDARD.decode(data).map_err(|_| invalid("media base64"))?;
         }
         if let Some(blob) = block.get("resource").and_then(|r| r.get("blob")) {
@@ -331,13 +348,17 @@ fn project_blocks(blocks: &[Value], media: &mut super::media::Projection) -> Res
             content.extend(media.image(&block["data"], &block["mimeType"])?);
             continue;
         }
-        if block["type"] == "resource" && block["resource"]["blob"].is_string()
+        if block["type"] == "resource"
+            && block["resource"]["blob"].is_string()
             && !block["resource"]["text"].is_string()
             && block["resource"]["uri"].is_string()
-            && block["resource"]["mimeType"].as_str().is_some_and(|m| m.starts_with("image/"))
+            && block["resource"]["mimeType"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("image/"))
         {
             content.push(json!({"type":"text","text":format!("MCP embedded image resource {} (retained bytes; no URI fetched):",block["resource"]["uri"])}));
-            content.extend(media.image(&block["resource"]["blob"], &block["resource"]["mimeType"])?);
+            content
+                .extend(media.image(&block["resource"]["blob"], &block["resource"]["mimeType"])?);
             continue;
         }
         let text = match block["type"].as_str() {

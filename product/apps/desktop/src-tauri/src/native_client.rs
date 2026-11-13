@@ -1,7 +1,7 @@
 //! Native startup binds to durable workspace authority. The P12 environment
 //! configuration still explicitly selects isolated native clients.
-#[cfg(feature="visual-test")]
-#[path="mcp_directory_fixture.rs"]
+#[cfg(feature = "visual-test")]
+#[path = "mcp_directory_fixture.rs"]
 mod mcp_directory_fixture;
 use ag1_platform::client::{Config, Host};
 use serde_json::Value;
@@ -12,9 +12,9 @@ use std::{
 };
 pub struct NativeClient {
     #[cfg(target_os = "linux")]
-    mcp_oauth_entry:std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::manager::OAuthEntry>>>,
-    mcp_input_entry:std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::input::Entry>>>,
-    mcp_private_entry:std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::manager::PrivateEntry>>>,
+    mcp_oauth_entry: std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::manager::OAuthEntry>>>,
+    mcp_input_entry: std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::input::Entry>>>,
+    mcp_private_entry: std::sync::Mutex<Option<Arc<dyn ag1_platform::mcp::manager::PrivateEntry>>>,
     active: std::sync::atomic::AtomicBool,
     preview: std::sync::Mutex<Option<crate::project_preview::ProjectPreview>>,
     config: Option<Config>,
@@ -53,9 +53,9 @@ impl NativeClient {
         let selected = config.is_some();
         Ok(Self {
             #[cfg(target_os = "linux")]
-            mcp_oauth_entry:std::sync::Mutex::new(None),
-            mcp_input_entry:std::sync::Mutex::new(None),
-            mcp_private_entry:std::sync::Mutex::new(None),
+            mcp_oauth_entry: std::sync::Mutex::new(None),
+            mcp_input_entry: std::sync::Mutex::new(None),
+            mcp_private_entry: std::sync::Mutex::new(None),
             active: std::sync::atomic::AtomicBool::new(selected),
             config,
             legacy_default,
@@ -175,7 +175,10 @@ impl NativeClient {
             }
         };
         refresh_default_prompt(&mut config);
-        refresh_packaged_tool_helper(&mut config, &std::env::current_exe().map_err(|e| e.to_string())?)?;
+        refresh_packaged_tool_helper(
+            &mut config,
+            &std::env::current_exe().map_err(|e| e.to_string())?,
+        )?;
         if canonical == state.join("general-chat") {
             let note = "This conversation began as a general chat. Until the user chooses a working folder in Chat folders, the default general-chat directory is private chat storage, not a codebase to inspect. The current Chat folder access section is authoritative after the user adds or changes folders. Answer directly when possible; ask for folder access only when files are needed.";
             config.prompt_append = Some(match config.prompt_append.take() {
@@ -188,18 +191,30 @@ impl NativeClient {
                 .and_then(|registry| registry.initialize_native(&canonical))
                 .map_err(|e| format!("{e:?}"))?;
         }
-        let github=ag1_platform::github::service::Service::shared(state).map_err(|e|e.message.to_string())?;
+        let github = ag1_platform::github::service::Service::shared(state)
+            .map_err(|e| e.message.to_string())?;
         #[cfg(feature = "visual-test")]
-        let injected=crate::cancellation_fixture::from_environment(&config)?;
+        let injected = crate::cancellation_fixture::from_environment(&config)?;
         let host = {
             #[cfg(feature = "visual-test")]
-            if let Some(runtime)=injected {
-                let registry=ag1_platform::cutover::Registry::for_user().map_err(|e|format!("{e:?}"))?;
-                Host::open_rehearsal_with_runtime(&canonical,&private,config,&registry,runtime).await
-            } else { let mcp=self.mcp_context(&config,&canonical,state)?; Host::open_with_mcp(&canonical,&private,config,github,mcp,parent.as_deref()).await }
+            if let Some(runtime) = injected {
+                let registry =
+                    ag1_platform::cutover::Registry::for_user().map_err(|e| format!("{e:?}"))?;
+                Host::open_rehearsal_with_runtime(&canonical, &private, config, &registry, runtime)
+                    .await
+            } else {
+                let mcp = self.mcp_context(&config, &canonical, state)?;
+                Host::open_with_mcp(&canonical, &private, config, github, mcp, parent.as_deref())
+                    .await
+            }
             #[cfg(not(feature = "visual-test"))]
-            { let mcp=self.mcp_context(&config,&canonical,state)?; Host::open_with_mcp(&canonical,&private,config,github,mcp,parent.as_deref()).await }
-        }.map_err(|e|format!("{e:?}"))?;
+            {
+                let mcp = self.mcp_context(&config, &canonical, state)?;
+                Host::open_with_mcp(&canonical, &private, config, github, mcp, parent.as_deref())
+                    .await
+            }
+        }
+        .map_err(|e| format!("{e:?}"))?;
         let value = serde_json::to_value(host.view().map_err(|e| format!("{e:?}"))?)
             .map_err(|e| e.to_string())?;
         if let Err(error) = self.close_preview() {
@@ -213,25 +228,90 @@ impl NativeClient {
         Ok(value)
     }
     #[cfg(target_os = "linux")]
-    pub fn set_mcp_oauth_entry(&self,entry:Arc<dyn ag1_platform::mcp::manager::OAuthEntry>)->Result<(),String> {
-        *self.mcp_oauth_entry.lock().map_err(|_|"MCP OAuth entry lock")?=Some(entry);Ok(())
+    pub fn set_mcp_oauth_entry(
+        &self,
+        entry: Arc<dyn ag1_platform::mcp::manager::OAuthEntry>,
+    ) -> Result<(), String> {
+        *self
+            .mcp_oauth_entry
+            .lock()
+            .map_err(|_| "MCP OAuth entry lock")? = Some(entry);
+        Ok(())
     }
-    pub fn set_mcp_input_entry(&self,entry:Arc<dyn ag1_platform::mcp::input::Entry>)->Result<(),String> {
-        *self.mcp_input_entry.lock().map_err(|_|"MCP input entry lock")?=Some(entry);Ok(())
+    pub fn set_mcp_input_entry(
+        &self,
+        entry: Arc<dyn ag1_platform::mcp::input::Entry>,
+    ) -> Result<(), String> {
+        *self
+            .mcp_input_entry
+            .lock()
+            .map_err(|_| "MCP input entry lock")? = Some(entry);
+        Ok(())
     }
-    pub fn set_mcp_private_entry(&self,entry:Arc<dyn ag1_platform::mcp::manager::PrivateEntry>)->Result<(),String> {
-        *self.mcp_private_entry.lock().map_err(|_|"MCP private entry lock")?=Some(entry);Ok(())
+    pub fn set_mcp_private_entry(
+        &self,
+        entry: Arc<dyn ag1_platform::mcp::manager::PrivateEntry>,
+    ) -> Result<(), String> {
+        *self
+            .mcp_private_entry
+            .lock()
+            .map_err(|_| "MCP private entry lock")? = Some(entry);
+        Ok(())
     }
-    fn mcp_context(&self,config:&Config,canonical:&Path,state:&Path)->Result<ag1_platform::client::McpServices,String> {
-        let helper=config.tooling.as_ref().map(|t|t.process_host.clone()).unwrap_or(std::env::current_exe().map_err(|e|e.to_string())?.with_file_name("ag1-process-host"));
-        let service=ag1_platform::mcp::service::Service::shared(state,&helper).map_err(|e|format!("{e:?}"))?;
-        #[cfg(feature="visual-test")]
-        let service=mcp_directory_fixture::mcp_directory(service)?;
+    fn mcp_context(
+        &self,
+        config: &Config,
+        canonical: &Path,
+        state: &Path,
+    ) -> Result<ag1_platform::client::McpServices, String> {
+        let helper = config
+            .tooling
+            .as_ref()
+            .map(|t| t.process_host.clone())
+            .unwrap_or(
+                std::env::current_exe()
+                    .map_err(|e| e.to_string())?
+                    .with_file_name("ag1-process-host"),
+            );
+        let service = ag1_platform::mcp::service::Service::shared(state, &helper)
+            .map_err(|e| format!("{e:?}"))?;
+        #[cfg(feature = "visual-test")]
+        let service = mcp_directory_fixture::mcp_directory(service)?;
         #[cfg(target_os = "linux")]
-        if let Some(entry)=self.mcp_oauth_entry.lock().map_err(|_|"MCP OAuth entry lock")?.clone(){service.set_oauth_entry(entry).map_err(|e|format!("{e:?}"))?;}
-        if let Some(entry)=self.mcp_input_entry.lock().map_err(|_|"MCP input entry lock")?.clone(){service.set_input_entry(entry).map_err(|e|format!("{e:?}"))?;}
-        if let Some(entry)=self.mcp_private_entry.lock().map_err(|_|"MCP private entry lock")?.clone(){service.set_private_entry(entry).map_err(|e|format!("{e:?}"))?;}
-        Ok(ag1_platform::mcp::service::Context {service,general_chat:canonical==state.join("general-chat")})
+        if let Some(entry) = self
+            .mcp_oauth_entry
+            .lock()
+            .map_err(|_| "MCP OAuth entry lock")?
+            .clone()
+        {
+            service
+                .set_oauth_entry(entry)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        if let Some(entry) = self
+            .mcp_input_entry
+            .lock()
+            .map_err(|_| "MCP input entry lock")?
+            .clone()
+        {
+            service
+                .set_input_entry(entry)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        if let Some(entry) = self
+            .mcp_private_entry
+            .lock()
+            .map_err(|_| "MCP private entry lock")?
+            .clone()
+        {
+            service
+                .set_private_entry(entry)
+                .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(ag1_platform::mcp::service::Context {
+            service,
+            general_chat: canonical == state.join("general-chat"),
+        })
     }
     pub fn close_preview(&self) -> Result<(), String> {
         let mut preview = self.preview.lock().map_err(|_| "Preview lock")?;
@@ -438,16 +518,25 @@ fn refresh_packaged_tool_helper(config: &mut Config, executable: &Path) -> Resul
             return None;
         }
         let releases = path.parent()?.parent()?.parent()?;
-        (releases.file_name()? == "releases").then(|| releases.parent().map(Path::to_path_buf)).flatten()
+        (releases.file_name()? == "releases")
+            .then(|| releases.parent().map(Path::to_path_buf))
+            .flatten()
     }
-    let Some(tooling) = &mut config.tooling else { return Ok(()); };
-    let Some(root) = installation(executable, "ag1-desktop") else { return Ok(()); };
+    let Some(tooling) = &mut config.tooling else {
+        return Ok(());
+    };
+    let Some(root) = installation(executable, "ag1-desktop") else {
+        return Ok(());
+    };
     if installation(&tooling.process_host, "ag1-process-host").as_ref() != Some(&root) {
         return Ok(());
     }
     let helper = executable.with_file_name("ag1-process-host");
     if !helper.is_file() {
-        return Err("The installed AG1 process helper is missing. Reinstall the complete AG1 package.".into());
+        return Err(
+            "The installed AG1 process helper is missing. Reinstall the complete AG1 package."
+                .into(),
+        );
     }
     tooling.process_host = helper;
     Ok(())
@@ -500,27 +589,56 @@ mod packaged_helper_tests {
         std::fs::copy("/usr/bin/true", &helper).unwrap();
         let old = dir.path().join("app/releases/removed/bin/ag1-process-host");
         let mut config = config(&old);
-        let state = dir.path().join("state");std::fs::create_dir(&state).unwrap();
-        assert!(matches!(ag1_platform::mcp::service::Service::shared(&state,&old),Err(ag1_core::DomainError::NotFound)));
-        refresh_packaged_tool_helper(&mut config,&executable).unwrap();
-        assert_eq!(config.tooling.as_ref().unwrap().process_host,helper);
-        assert_eq!(config.system_prompt,"custom");
-        let service = ag1_platform::mcp::service::Service::shared(&state,&config.tooling.unwrap().process_host).unwrap();
-        let scope = ag1_core::tools::registry::Scope {workspace:"fixture".into(),session:"session".into(),epoch:1,revision:0};
-        let session = service.session(ag1_platform::mcp::catalog::CatalogScope::GeneralChat,scope.clone(),None).unwrap();
-        let list = session.dispatch(&scope,&serde_json::json!({"action":"list"})).unwrap();
-        assert_eq!(list["servers"],serde_json::json!([]));
-        assert_eq!(list["scope"]["kind"],"generalChat");
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        assert!(matches!(
+            ag1_platform::mcp::service::Service::shared(&state, &old),
+            Err(ag1_core::DomainError::NotFound)
+        ));
+        refresh_packaged_tool_helper(&mut config, &executable).unwrap();
+        assert_eq!(config.tooling.as_ref().unwrap().process_host, helper);
+        assert_eq!(config.system_prompt, "custom");
+        let service = ag1_platform::mcp::service::Service::shared(
+            &state,
+            &config.tooling.unwrap().process_host,
+        )
+        .unwrap();
+        let scope = ag1_core::tools::registry::Scope {
+            workspace: "fixture".into(),
+            session: "session".into(),
+            epoch: 1,
+            revision: 0,
+        };
+        let session = service
+            .session(
+                ag1_platform::mcp::catalog::CatalogScope::GeneralChat,
+                scope.clone(),
+                None,
+            )
+            .unwrap();
+        let list = session
+            .dispatch(&scope, &serde_json::json!({"action":"list"}))
+            .unwrap();
+        assert_eq!(list["servers"], serde_json::json!([]));
+        assert_eq!(list["scope"]["kind"], "generalChat");
     }
     #[test]
     fn explicit_helpers_other_installations_and_missing_current_payload_are_not_replaced() {
         let dir = tempfile::tempdir().unwrap();
         let executable = dir.path().join("app/releases/current/bin/ag1-desktop");
-        for custom in [dir.path().join("custom/ag1-process-host"),dir.path().join("other/releases/old/bin/ag1-process-host")] {
-            let mut config=config(&custom);refresh_packaged_tool_helper(&mut config,&executable).unwrap();
-            assert_eq!(config.tooling.unwrap().process_host,custom);
+        for custom in [
+            dir.path().join("custom/ag1-process-host"),
+            dir.path().join("other/releases/old/bin/ag1-process-host"),
+        ] {
+            let mut config = config(&custom);
+            refresh_packaged_tool_helper(&mut config, &executable).unwrap();
+            assert_eq!(config.tooling.unwrap().process_host, custom);
         }
-        let mut config=config(&dir.path().join("app/releases/old/bin/ag1-process-host"));
-        assert!(refresh_packaged_tool_helper(&mut config,&executable).unwrap_err().contains("Reinstall"));
+        let mut config = config(&dir.path().join("app/releases/old/bin/ag1-process-host"));
+        assert!(
+            refresh_packaged_tool_helper(&mut config, &executable)
+                .unwrap_err()
+                .contains("Reinstall")
+        );
     }
 }

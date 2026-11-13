@@ -124,11 +124,23 @@ fn parse<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, w::ProtocolE
 impl RuntimeCommands {
     /// Host serializes this with admission. Selection publication retires old capabilities.
     pub(crate) async fn refresh_capabilities(self: &Arc<Self>) -> Result<(), DomainError> {
-        if !self.current(false)?.snapshot()?.queued.is_empty() || self.client_transition_pending()? { return Err(DomainError::Conflict); }
+        if !self.current(false)?.snapshot()?.queued.is_empty()
+            || self.client_transition_pending()?
+        {
+            return Err(DomainError::Conflict);
+        }
         let selected = self.registry.refresh(self.factory.as_ref()).await?;
-        let current = SessionCommands::new(selected, self.instance.clone(), self.clock.clone(), self.settings.clone())?;
-        self.book.lock().map_err(|_|DomainError::Conflict)?.current = current;
-        *self.initialization.lock().map_err(|_|DomainError::Conflict)? = StartState::default();
+        let current = SessionCommands::new(
+            selected,
+            self.instance.clone(),
+            self.clock.clone(),
+            self.settings.clone(),
+        )?;
+        self.book.lock().map_err(|_| DomainError::Conflict)?.current = current;
+        *self
+            .initialization
+            .lock()
+            .map_err(|_| DomainError::Conflict)? = StartState::default();
         self.initialize().await
     }
     pub async fn reconcile_terminal(

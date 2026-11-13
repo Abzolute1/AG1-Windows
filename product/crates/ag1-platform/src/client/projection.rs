@@ -63,30 +63,63 @@ pub fn message(entry: &Value) -> Option<w::ClientMessage> {
             })
             .collect()
     };
-    let sources=super::website_icons::sources(entry);
+    let sources = super::website_icons::sources(entry);
     if !sources.is_empty() {
-        blocks.insert(0,w::MessageBlock::Unknown {value:json!({"kind":"web_result","sources":sources})});
+        blocks.insert(
+            0,
+            w::MessageBlock::Unknown {
+                value: json!({"kind":"web_result","sources":sources}),
+            },
+        );
     }
-    if m["role"] == "toolResult" && m["toolName"].as_str().is_some_and(|n| n.starts_with("mcp_")) {
+    if m["role"] == "toolResult"
+        && m["toolName"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("mcp_"))
+    {
         let details = &m["details"]["mcp"];
-        if let Ok(identity) = serde_json::from_value::<ag1_core::tools::mcp::Identity>(details["source"].clone()) {
+        if let Ok(identity) =
+            serde_json::from_value::<ag1_core::tools::mcp::Identity>(details["source"].clone())
+        {
             if identity.wire_name() == m["toolName"].as_str().unwrap_or("") {
-                let original = serde_json::from_value::<ag1_core::context::ContextArtifact>(details["originalResponse"].clone()).ok();
+                let original = serde_json::from_value::<ag1_core::context::ContextArtifact>(
+                    details["originalResponse"].clone(),
+                )
+                .ok();
                 blocks.insert(0,w::MessageBlock::Unknown { value:json!({"kind":"mcp_result","server":identity.binding.server_id,"capability":clipped(&identity.original_name,256),"outcome":clipped(details["outcome"].as_str().unwrap_or("unknown"),64),"complete":details["completeResponseRetained"]==true,"original":original,"references":bounded(details["references"].clone(),2048)}) });
             }
         }
         // A mixed result may place its first image after the eight preview rows.
         // One authenticated journal reference loads all bounded native rasters.
-        if !blocks.iter().any(|b|matches!(b,w::MessageBlock::Attachment{..})) {
-            if let Some(image) = m["content"].as_array().into_iter().flatten().take(1024).find(|b|b["type"]=="image") {
-                blocks.insert(0,w::MessageBlock::Attachment{media_type:clipped(image["mimeType"].as_str().unwrap_or("image/unknown"),128),reference:entry["id"].as_str().unwrap_or("").into()});
+        if !blocks
+            .iter()
+            .any(|b| matches!(b, w::MessageBlock::Attachment { .. }))
+        {
+            if let Some(image) = m["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .take(1024)
+                .find(|b| b["type"] == "image")
+            {
+                blocks.insert(
+                    0,
+                    w::MessageBlock::Attachment {
+                        media_type: clipped(
+                            image["mimeType"].as_str().unwrap_or("image/unknown"),
+                            128,
+                        ),
+                        reference: entry["id"].as_str().unwrap_or("").into(),
+                    },
+                );
             }
         }
     }
     // Terminal provider failures must remain visible after polling/reopening.
     // This is a display projection only; the durable model transcript is untouched.
     if m["role"] == "assistant" && matches!(m["stopReason"].as_str(), Some("error" | "aborted")) {
-        blocks.retain(|b| !matches!(b, w::MessageBlock::Thinking { text } if text.trim().is_empty()));
+        blocks
+            .retain(|b| !matches!(b, w::MessageBlock::Thinking { text } if text.trim().is_empty()));
         blocks.insert(0, w::MessageBlock::Unknown { value: json!({"kind":"provider_error","cancelled":m["stopReason"]=="aborted","message":clipped(m["errorMessage"].as_str().filter(|s| !s.is_empty()).unwrap_or(if m["stopReason"]=="aborted" {"The response was stopped."} else {"The model response ended with an error."}),512)}) });
     }
     let mut message = w::ClientMessage {
@@ -120,12 +153,17 @@ pub fn message(entry: &Value) -> Option<w::ClientMessage> {
 // Full history stays in the journal. Count its message entries without building
 // display blocks for all of them; project only the recent bounded preview.
 fn recent_messages(records: &[Value]) -> Result<(usize, Vec<w::ClientMessage>)> {
-    let count = records.iter().filter(|entry| entry["type"] == "message").count();
+    let count = records
+        .iter()
+        .filter(|entry| entry["type"] == "message")
+        .count();
     let mut messages = Vec::new();
     let mut budget = 8000;
     for item in records.iter().rev().filter_map(message).take(100) {
         let bytes = serde_json::to_vec(&item).map_err(json_error)?.len();
-        if bytes > budget { break; }
+        if bytes > budget {
+            break;
+        }
         budget -= bytes;
         messages.push(item);
     }
@@ -383,13 +421,15 @@ mod provider_failure_tests {
     #[test]
     fn provider_errors_and_cancellations_survive_display_projection() {
         for reason in ["error", "aborted"] {
-            let entry=json!({"id":"failed","type":"message","message":{"role":"assistant","stopReason":reason,"errorMessage":"unknown Responses stream event","content":[{"type":"thinking","thinking":""}]}});
-            let projected=message(&entry).unwrap();
-            assert_eq!(projected.blocks.len(),1);
-            let w::MessageBlock::Unknown{value}=&projected.blocks[0] else {panic!("failure missing")};
-            assert_eq!(value["kind"],"provider_error");
-            assert_eq!(value["cancelled"],reason=="aborted");
-            assert_eq!(entry["message"]["content"][0]["type"],"thinking");
+            let entry = json!({"id":"failed","type":"message","message":{"role":"assistant","stopReason":reason,"errorMessage":"unknown Responses stream event","content":[{"type":"thinking","thinking":""}]}});
+            let projected = message(&entry).unwrap();
+            assert_eq!(projected.blocks.len(), 1);
+            let w::MessageBlock::Unknown { value } = &projected.blocks[0] else {
+                panic!("failure missing")
+            };
+            assert_eq!(value["kind"], "provider_error");
+            assert_eq!(value["cancelled"], reason == "aborted");
+            assert_eq!(entry["message"]["content"][0]["type"], "thinking");
         }
     }
 }
@@ -405,7 +445,9 @@ mod recent_preview_tests {
         let mut budget = 8000;
         for item in all.iter().rev().take(100) {
             let bytes = serde_json::to_vec(item).unwrap().len();
-            if bytes > budget { break; }
+            if bytes > budget {
+                break;
+            }
             budget -= bytes;
             selected.push(item.clone());
         }
@@ -429,9 +471,14 @@ mod recent_preview_tests {
         ];
         for index in 0..1000 {
             records.push(json!({"type":"message","id":format!("entry-{index}"),"message":variants[index % variants.len()]}));
-            if index % 3 == 0 { records.push(json!({"type":"custom","customType":"task_state"})); }
-            if [0,1,7,99,100,101,999].contains(&index) {
-                assert_eq!(serde_json::to_vec(&recent_messages(&records).unwrap()).unwrap(), serde_json::to_vec(&full_projection(&records)).unwrap());
+            if index % 3 == 0 {
+                records.push(json!({"type":"custom","customType":"task_state"}));
+            }
+            if [0, 1, 7, 99, 100, 101, 999].contains(&index) {
+                assert_eq!(
+                    serde_json::to_vec(&recent_messages(&records).unwrap()).unwrap(),
+                    serde_json::to_vec(&full_projection(&records)).unwrap()
+                );
             }
         }
         assert_eq!(recent_messages(&[]).unwrap(), (0, vec![]));

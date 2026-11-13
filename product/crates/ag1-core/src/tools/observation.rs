@@ -44,7 +44,11 @@ pub fn prepare(
 ) -> Result<JournalToolPlan, DomainError> {
     let current = latest_task(branch);
     if let Some(objective) = args.get("taskObjective") {
-        if objective.as_str().is_none_or(str::is_empty) || current.as_ref().is_none_or(|task| task.value()["objective"] != *objective) {
+        if objective.as_str().is_none_or(str::is_empty)
+            || current
+                .as_ref()
+                .is_none_or(|task| task.value()["objective"] != *objective)
+        {
             return Err(DomainError::InvalidInput("Runtime observation taskObjective does not match the current task. Inspect taskState show before associating this event.".into()));
         }
     }
@@ -76,8 +80,7 @@ pub fn prepare(
         records.push(json!({"type":"custom","customType":"task_state","data":next.value()}));
         task_entry = Some(id);
     }
-    let mut details =
-        json!({"id":ids.observation,"entryId":ids.entry,"result":result,"feature":feature,"verification":"recorded_claim","sourceReference":format!("session-entry:{}",ids.entry)});
+    let mut details = json!({"id":ids.observation,"entryId":ids.entry,"result":result,"feature":feature,"verification":"recorded_claim","sourceReference":format!("session-entry:{}",ids.entry)});
     let suffix = if let Some(id) = task_entry {
         details["taskStateEntryId"] = json!(id);
         format!(" (task state {id} updated)")

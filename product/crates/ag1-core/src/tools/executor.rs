@@ -139,7 +139,9 @@ fn identity(call: &ValidatedCall, scope: &Scope) -> String {
 }
 fn source(call: &ValidatedCall) -> Value {
     let mut source = json!({"type":"tool","name":call.name(),"callId":call.call_id()});
-    if let Some(identity) = call.mcp_identity() { source["mcp"] = json!(identity); }
+    if let Some(identity) = call.mcp_identity() {
+        source["mcp"] = json!(identity);
+    }
     source
 }
 fn event(record: &Record, stage: &str) -> ToolEvent {

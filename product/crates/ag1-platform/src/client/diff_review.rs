@@ -23,7 +23,8 @@ impl Host {
             })?;
             let spools = self.state.join("diff");
             fs::create_dir_all(&spools).map_err(crate::io_error)?;
-            let diff = crate::git::GitService::new(&tooling.process_host, &tooling.git, &spools)?.with_bubblewrap(&tooling.bubblewrap)
+            let diff = crate::git::GitService::new(&tooling.process_host, &tooling.git, &spools)?
+                .with_bubblewrap(&tooling.bubblewrap)
                 .status_diff(&workspace, None)?;
             let bytes = format!(
                 "HEAD {}\n{}\n{}",

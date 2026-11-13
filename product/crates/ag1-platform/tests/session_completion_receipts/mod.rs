@@ -18,11 +18,16 @@ fn verifier(f: &Fixture, extra: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn custom_canonical_receipt_recovers_false_completion_without_requiring_a_test_command_name() {
+async fn custom_canonical_receipt_recovers_false_completion_without_requiring_a_test_command_name()
+{
     let (origin, server) = server(vec![
         stop(),
         write_value(),
-        calls(vec![("check", "bash", json!({"command":"node verify.mjs"}))]),
+        calls(vec![(
+            "check",
+            "bash",
+            json!({"command":"node verify.mjs"}),
+        )]),
         stop(),
     ]);
     let f = fixture(&origin, "disabled");
@@ -31,20 +36,40 @@ async fn custom_canonical_receipt_recovers_false_completion_without_requiring_a_
     let mut input = prompt();
     input.max_generations = Some(4);
     let result = print::run(
-        &f.host, input, &Resolver::new(false), runner, &ignore,
-        Options { recommended_verifier: Some("node verify.mjs".into()), ..Default::default() },
-    ).await.unwrap();
+        &f.host,
+        input,
+        &Resolver::new(false),
+        runner,
+        &ignore,
+        Options {
+            recommended_verifier: Some("node verify.mjs".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(result.exit_code, 0);
     assert_eq!(result.completion_recoveries, 1);
     assert_eq!(result.turn.generations, 4);
     let assessment = result.assessment.unwrap();
     assert!(assessment.passed);
     assert_eq!(assessment.passing_verification_count, 1);
-    assert_eq!(std::fs::read_to_string(f.root.join("value.txt")).unwrap(), "42");
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("value.txt")).unwrap(),
+        "42"
+    );
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 4);
-    assert!(requests[2]["messages"].to_string().contains("status: verification_required"));
-    assert!(requests[3]["messages"].to_string().contains("status: passed_after_latest_observed_mutation"));
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("status: verification_required")
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("status: passed_after_latest_observed_mutation")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -81,7 +106,11 @@ async fn ordinary_print_rejects_echoed_verifier_and_zero_test_success() {
         assert_eq!(result.assessment.unwrap().passing_verification_count, 0);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 6);
-        assert!(!requests[2]["messages"].to_string().contains("status: passed_after_latest_observed_mutation"));
+        assert!(
+            !requests[2]["messages"]
+                .to_string()
+                .contains("status: passed_after_latest_observed_mutation")
+        );
     }
 }
 
@@ -166,9 +195,21 @@ async fn ordinary_print_invalidates_verification_after_later_shell_mutation() {
     assert_eq!(result.assessment.unwrap().passing_verification_count, 0);
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 7);
-    assert!(requests[2]["messages"].to_string().contains("status: passed_after_latest_observed_mutation"));
-    assert!(requests[3]["messages"].to_string().contains("status: verification_required"));
-    assert!(!requests[3]["messages"].to_string().contains("status: passed_after_latest_observed_mutation"));
+    assert!(
+        requests[2]["messages"]
+            .to_string()
+            .contains("status: passed_after_latest_observed_mutation")
+    );
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("status: verification_required")
+    );
+    assert!(
+        !requests[3]["messages"]
+            .to_string()
+            .contains("status: passed_after_latest_observed_mutation")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -230,11 +271,28 @@ impl ag1_platform::session::ToolRunner for ReturnedReceipts {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn npm_version_header_does_not_reject_an_actual_passing_native_test() {
-    let (origin, server) = server(vec![write_value(), calls(vec![("check", "bash", json!({"command":"node --test verifier.test.js"}))]), stop()]);
+    let (origin, server) = server(vec![
+        write_value(),
+        calls(vec![(
+            "check",
+            "bash",
+            json!({"command":"node --test verifier.test.js"}),
+        )]),
+        stop(),
+    ]);
     let f = fixture(&origin, "disabled");
     verifier(&f, "console.log('> fixture@1.0.0 test');");
     let runner = native_adapters_configured(&f, &["write", "bash"], None, None).await;
-    let result = print::run(&f.host, prompt(), &Resolver::new(false), runner, &ignore, Options::default()).await.unwrap();
+    let result = print::run(
+        &f.host,
+        prompt(),
+        &Resolver::new(false),
+        runner,
+        &ignore,
+        Options::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(result.exit_code, 0);
     assert!(result.assessment.unwrap().passed);
     assert_eq!(server.join().unwrap().len(), 3);

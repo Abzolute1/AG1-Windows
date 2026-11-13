@@ -204,7 +204,9 @@ fn transform(input: &RequestContext<'_>, family: ApiFamily) -> Result<Vec<Value>
                 return Err(invalid("tool call"));
             }
         }
-        if image_replaced { m["content"] = json!(content); }
+        if image_replaced {
+            m["content"] = json!(content);
+        }
         if role == "assistant" {
             let same_model = same(&m, input.model);
             let mut out = vec![];

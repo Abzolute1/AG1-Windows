@@ -135,8 +135,13 @@ pub fn read(
 
 // Classify only the desktop projection. The generic issues.list response stays intact.
 fn project_items(action: &str, data: Value, has_more: bool) -> Result<Value> {
-    let rows = data.as_array().ok_or_else(|| ApiError::new("response", "Invalid GitHub item list."))?;
-    let items: Vec<_> = rows.iter().filter(|r| action != "issues" || r.get("pull_request").is_none()).collect();
+    let rows = data
+        .as_array()
+        .ok_or_else(|| ApiError::new("response", "Invalid GitHub item list."))?;
+    let items: Vec<_> = rows
+        .iter()
+        .filter(|r| action != "issues" || r.get("pull_request").is_none())
+        .collect();
     Ok(json!({"items":items,"has_more":has_more}))
 }
 
@@ -356,18 +361,27 @@ mod tests {
                 status: 200,
                 next: Some("next".into()),
                 rate_remaining: Some(20),
-                rate_reset: None, rate_resource: None, rate_limit: None,
+                rate_reset: None,
+                rate_resource: None,
+                rate_limit: None,
                 outcome: Outcome::Read,
             })
         }
     }
     #[test]
     fn mixed_issue_pages_keep_server_pagination_even_when_all_rows_are_pulls() {
-        let mixed = json!([{"number":1,"title":"Issue"},{"number":2,"pull_request":{"url":"fixture"}}]);
+        let mixed =
+            json!([{"number":1,"title":"Issue"},{"number":2,"pull_request":{"url":"fixture"}}]);
         let value = project_items("issues", mixed.clone(), true).unwrap();
         assert_eq!(value["items"], json!([{"number":1,"title":"Issue"}]));
         assert_eq!(value["has_more"], true);
-        assert_eq!(project_items("pulls", mixed, false).unwrap()["items"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            project_items("pulls", mixed, false).unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         let empty = project_items("issues", json!([{"pull_request":{}}]), true).unwrap();
         assert_eq!(empty["items"], json!([]));
         assert_eq!(empty["has_more"], true);

@@ -4,7 +4,9 @@ use crate::web_http::{SystemResolver, WebPolicy, WebResolver};
 use std::net::SocketAddr;
 
 pub(super) fn get(url: reqwest::Url) -> Result<(Vec<u8>, u64), DomainError> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|_| invalid("registry network runtime"))?;
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(12), async {

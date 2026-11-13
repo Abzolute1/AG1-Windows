@@ -94,13 +94,31 @@ impl Clock for SystemClock {
     }
 }
 
+#[cfg(target_os = "linux")]
 struct WriterLease(File);
+#[cfg(windows)]
+struct WriterLease(isize);
+
+#[cfg(target_os = "linux")]
 impl Drop for WriterLease {
     fn drop(&mut self) {
         // Closing alone leaves flock held by an unrelated fork's inherited
         // open description until it execs. Release this owner's lease explicitly.
         #[cfg(target_os = "linux")]
         let _ = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WriterLease {
+    fn drop(&mut self) {
+        // This process owns the mutex until the Store closes. Releasing first
+        // makes another writer eligible before the handle is destroyed.
+        unsafe {
+            let handle = self.0 as windows_sys::Win32::Foundation::HANDLE;
+            let _ = windows_sys::Win32::System::Threading::ReleaseMutex(handle);
+            let _ = windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
     }
 }
 pub struct Store {
@@ -162,9 +180,69 @@ pub(crate) fn safe_relative(path: &str) -> StorageResult<&Path> {
     }
     Ok(p)
 }
+#[cfg(target_os = "linux")]
 pub(crate) fn sync_dir(path: &Path) -> StorageResult<()> {
     File::open(path)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(windows)]
+pub(crate) fn sync_dir(path: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, GetLastError, INVALID_HANDLE_VALUE},
+        Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, FlushFileBuffers, OPEN_EXISTING,
+        },
+    };
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StorageError::Io(std::io::Error::other(format!(
+            "CreateFileW for directory {} failed: {}",
+            path.display(),
+            std::io::Error::last_os_error(),
+        ))));
+    }
+    let flushed = unsafe { FlushFileBuffers(handle) } != 0;
+    let error = if flushed {
+        0
+    } else {
+        unsafe { GetLastError() }
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if flushed || error == 1 || error == 5 {
+        // Some Windows filesystems reject directory FlushFileBuffers. Every
+        // preceding file write is synced and publication uses WRITE_THROUGH, so
+        // those documented unsupported results do not weaken file durability.
+        Ok(())
+    } else {
+        Err(StorageError::Io(std::io::Error::from_raw_os_error(
+            error as i32,
+        )))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) fn sync_dir(_path: &Path) -> StorageResult<()> {
+    Err(StorageError::Unsupported(
+        "Directory sync platform not validated".into(),
+    ))
 }
 pub(crate) fn publish_directory(source: &Path, destination: &Path) -> StorageResult<()> {
     #[cfg(target_os = "linux")]
@@ -181,11 +259,71 @@ pub(crate) fn publish_directory(source: &Path, destination: &Path) -> StorageRes
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (source, destination);
-        Err(StorageError::Unsupported(
-            "Atomic directory publication is not validated on this platform".into(),
-        ))
+        #[cfg(windows)]
+        {
+            // The staging directory is created beside its destination, so this
+            // is an in-volume rename. Do not set COPY_ALLOWED: a copy/delete
+            // fallback would weaken publication into a partially visible tree.
+            if destination.exists() {
+                return Err(StorageError::Conflict(
+                    "Archive destination already exists".into(),
+                ));
+            }
+            return move_directory_noreplace(source, destination);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (source, destination);
+            return Err(StorageError::Unsupported(
+                "Atomic directory publication is not validated on this platform".into(),
+            ));
+        }
     }
+}
+
+#[cfg(windows)]
+fn move_directory_noreplace(source: &Path, destination: &Path) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, GetLastError},
+        Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    };
+
+    if !fs::symlink_metadata(source)?.file_type().is_dir() {
+        return Err(StorageError::Invalid(
+            "Archive publication source is not a directory".into(),
+        ));
+    }
+
+    let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
+    source_wide.push(0);
+    let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    destination_wide.push(0);
+
+    // Without REPLACE_EXISTING, Windows rejects an already-created target even
+    // if another writer wins the race after the exists check above.
+    let moved = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved != 0 {
+        return Ok(());
+    }
+
+    let error = unsafe { GetLastError() };
+    if error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS {
+        return Err(StorageError::Conflict(
+            "Archive destination already exists".into(),
+        ));
+    }
+    Err(StorageError::Io(std::io::Error::other(format!(
+        "MoveFileExW archive publication {} -> {} failed with Windows error {error}",
+        source.display(),
+        destination.display(),
+    ))))
 }
 pub(crate) fn private_dir(path: &Path) -> StorageResult<()> {
     fs::create_dir_all(path)?;
@@ -208,8 +346,126 @@ pub(crate) fn no_symlink(path: &Path) -> StorageResult<()> {
                 "Symlink in storage/source path".into(),
             ));
         }
+        #[cfg(windows)]
+        if reparse_point(p)? {
+            return Err(StorageError::Invalid(
+                "Reparse point in storage/source path".into(),
+            ));
+        }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn reparse_point(path: &Path) -> StorageResult<bool> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    };
+
+    let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(StorageError::Io(std::io::Error::last_os_error()));
+    }
+    Ok(attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+#[cfg(windows)]
+fn move_file(
+    source: &Path,
+    destination: &Path,
+    replace: bool,
+    write_through: bool,
+) -> StorageResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+    };
+
+    let mut source_wide = source.as_os_str().encode_wide().collect::<Vec<_>>();
+    source_wide.push(0);
+    let mut destination_wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
+    destination_wide.push(0);
+    let mut flags = if write_through {
+        MOVEFILE_WRITE_THROUGH
+    } else {
+        0
+    };
+    if replace {
+        flags |= MOVEFILE_REPLACE_EXISTING;
+    }
+    let moved = unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), flags) };
+    if moved == 0 {
+        let error = unsafe { GetLastError() };
+        return Err(StorageError::Io(std::io::Error::other(format!(
+            "MoveFileExW {} -> {} failed with Windows error {error}",
+            source.display(),
+            destination.display(),
+        ))));
+    }
+    Ok(())
+}
+
+fn writer_lease(root: &Path, lock: &Path) -> StorageResult<WriterLease> {
+    #[cfg(target_os = "linux")]
+    {
+        let writer = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock)?;
+        rustix::fs::flock(
+            &writer,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|_| StorageError::Conflict("Destination already has a writer".into()))?;
+        return Ok(WriterLease(writer));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError},
+            System::Threading::CreateMutexW,
+        };
+
+        // The canonical private directory contributes to the mutex name. This
+        // gives independent stores independent writers without trusting a user
+        // supplied textual path as a Windows object name.
+        let name = format!(
+            "Local\\AG1-storage-{}",
+            digest(root.to_string_lossy().as_bytes())
+        );
+        let mut wide = std::ffi::OsStr::new(&name)
+            .encode_wide()
+            .collect::<Vec<_>>();
+        wide.push(0);
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 1, wide.as_ptr()) };
+        if handle.is_null() {
+            return Err(StorageError::Io(std::io::Error::last_os_error()));
+        }
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Err(StorageError::Conflict(
+                "Destination already has a writer".into(),
+            ));
+        }
+        let _ = lock;
+        return Ok(WriterLease(handle as isize));
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = (root, lock);
+        Err(StorageError::Unsupported(
+            "Storage writer platform not validated".into(),
+        ))
+    }
 }
 pub(crate) fn read_bounded(path: &Path, max: u64) -> StorageResult<Vec<u8>> {
     no_symlink(path)?;
@@ -260,7 +516,7 @@ impl Store {
         path: &Path,
         session: &str,
     ) -> StorageResult<(Health, crate::JournalSnapshot)> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", windows)) {
             return Err(StorageError::Unsupported(
                 "Storage inspection platform not validated".into(),
             ));
@@ -281,14 +537,12 @@ impl Store {
                 no_symlink(&root.join(name))?;
             }
         }
-        let writer = File::open(root.join("writer.lock"))?;
-        #[cfg(target_os = "linux")]
-        rustix::fs::flock(
-            &writer,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-        .map_err(|_| StorageError::Conflict("Destination already has a writer".into()))?;
-        let writer = WriterLease(writer);
+        let lock = root.join("writer.lock");
+        if !lock.exists() {
+            return Err(StorageError::Corrupt("Missing storage writer lock".into()));
+        }
+        no_symlink(&lock)?;
+        let writer = writer_lease(&root, &lock)?;
         let db = Connection::open_with_flags(
             root.join("storage.sqlite"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -331,7 +585,7 @@ impl Store {
         clock: Arc<dyn Clock>,
         faults: Arc<dyn FaultInjector>,
     ) -> StorageResult<Self> {
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", windows)) {
             return Err(StorageError::Unsupported(
                 "Storage writer/dir-sync platform not validated".into(),
             ));
@@ -377,19 +631,16 @@ impl Store {
         if lock.exists() {
             no_symlink(&lock)?;
         }
-        let writer = OpenOptions::new()
+        // Keep a normal file marker alongside the Windows mutex. It makes a
+        // copied/incomplete store detectable by inspection and lets Linux keep
+        // its file-lock implementation when the same store moves platforms.
+        OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(&lock)?;
-        #[cfg(target_os = "linux")]
-        rustix::fs::flock(
-            &writer,
-            rustix::fs::FlockOperation::NonBlockingLockExclusive,
-        )
-        .map_err(|_| StorageError::Conflict("Destination already has a writer".into()))?;
-        let writer = WriterLease(writer);
+        let writer = writer_lease(&root, &lock)?;
         for name in ["blobs", "staging", "quarantine"] {
             let p = root.join(name);
             if p.exists() {
@@ -527,6 +778,16 @@ impl Store {
         tmp.as_file().sync_all()?;
         self.hit(Boundary::AfterBlobSync)?;
         self.hit(Boundary::BeforeRename)?;
+        #[cfg(windows)]
+        {
+            let temporary = tmp.into_temp_path();
+            move_file(temporary.as_ref(), path, false, true)?;
+            // TempPath still names the old staging location. Dropping it only
+            // attempts to remove that now-missing source, never the published
+            // destination chosen by MoveFileExW.
+            drop(temporary);
+        }
+        #[cfg(not(windows))]
         tmp.persist_noclobber(&path)
             .map_err(|e| StorageError::Io(e.error))?;
         self.hit(Boundary::AfterRename)?;
@@ -598,13 +859,18 @@ impl Store {
         let referenced = Self::referenced_blobs(&db)?;
         for hash in &referenced {
             if schema < 2 && self.physical_blob(hash)?.1 {
-                return Err(StorageError::Corrupt("Compressed reference requires storage schema 2".into()));
+                return Err(StorageError::Corrupt(
+                    "Compressed reference requires storage schema 2".into(),
+                ));
             }
             self.verify_blob(hash)?;
         }
         let orphan_blobs = fs::read_dir(self.root.join("blobs"))?
             .filter_map(Result::ok)
-            .filter(|e| crate::blob_codec::physical_hash(&e.file_name().to_string_lossy()).is_none_or(|hash| !referenced.contains(hash)))
+            .filter(|e| {
+                crate::blob_codec::physical_hash(&e.file_name().to_string_lossy())
+                    .is_none_or(|hash| !referenced.contains(hash))
+            })
             .count();
         let staged_files = fs::read_dir(self.root.join("staging"))?.count();
         let sequence = db.query_row(

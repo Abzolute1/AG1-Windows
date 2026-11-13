@@ -484,7 +484,6 @@ fn shadow_transaction_rejects_orphans_and_revision_changes_during_reduction() {
     assert!(matches!(changed, Err(DomainError::Conflict)));
 }
 
-
 #[test]
 fn shadow_revision_guard_retains_archived_session_and_import_fences() {
     use ag1_core::context::compiler::Compilation;
@@ -506,7 +505,9 @@ fn shadow_revision_guard_retains_archived_session_and_import_fences() {
         if archive {
             assert!(matches!(result, Err(DomainError::NotFound)));
         } else {
-            assert!(matches!(result, Err(DomainError::Io(message)) if message == "ImportIncomplete"));
+            assert!(
+                matches!(result, Err(DomainError::Io(message)) if message == "ImportIncomplete")
+            );
         }
     }
 }

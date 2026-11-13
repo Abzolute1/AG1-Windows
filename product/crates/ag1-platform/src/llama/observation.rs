@@ -127,11 +127,14 @@ pub fn blocking_observer()
 }
 
 fn idle_from_slots(value: &Value) -> Result<bool, DomainError> {
-    let slots = value.as_array().filter(|slots| !slots.is_empty() && slots.len() <= 128)
+    let slots = value
+        .as_array()
+        .filter(|slots| !slots.is_empty() && slots.len() <= 128)
         .ok_or_else(|| DomainError::InvalidInput("runtime slots JSON".into()))?;
     let mut idle = true;
     for slot in slots {
-        let processing = slot["is_processing"].as_bool()
+        let processing = slot["is_processing"]
+            .as_bool()
             .ok_or_else(|| DomainError::InvalidInput("runtime slot state".into()))?;
         idle &= !processing;
     }
@@ -141,7 +144,9 @@ fn idle_from_slots(value: &Value) -> Result<bool, DomainError> {
 pub(crate) async fn generation_idle(http: &ProviderHttp, base: &str) -> Result<bool, DomainError> {
     let (status, bytes) = get(http, format!("{}/slots", base.trim_end_matches('/'))).await?;
     if !(200..300).contains(&status) {
-        return Err(DomainError::Unavailable("Owned generation status unavailable".into()));
+        return Err(DomainError::Unavailable(
+            "Owned generation status unavailable".into(),
+        ));
     }
     let value = serde_json::from_slice(&bytes)
         .map_err(|_| DomainError::InvalidInput("runtime slots JSON".into()))?;
@@ -150,7 +155,9 @@ pub(crate) async fn generation_idle(http: &ProviderHttp, base: &str) -> Result<b
 
 /// Invoked only on the bounded blocking executor, never an async UI worker.
 pub(crate) fn blocking_generation_idle(plan: &LaunchPlan) -> Result<bool, DomainError> {
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|_| DomainError::Unavailable("runtime observation executor".into()))?;
     let base = origin(plan)?;
     let http = ProviderHttp::new(std::slice::from_ref(&base), Duration::from_secs(2))?;
@@ -165,8 +172,16 @@ mod cancellation_tests {
     #[test]
     fn cancellation_requires_every_slot_to_be_explicitly_idle() {
         assert_eq!(idle_from_slots(&json!([{"is_processing":false}])), Ok(true));
-        assert_eq!(idle_from_slots(&json!([{"is_processing":false},{"is_processing":true}])), Ok(false));
-        for value in [json!([]), json!({}), json!([{}]), json!([{"is_processing":"false"}])] {
+        assert_eq!(
+            idle_from_slots(&json!([{"is_processing":false},{"is_processing":true}])),
+            Ok(false)
+        );
+        for value in [
+            json!([]),
+            json!({}),
+            json!([{}]),
+            json!([{"is_processing":"false"}]),
+        ] {
             assert!(idle_from_slots(&value).is_err());
         }
     }
@@ -178,17 +193,28 @@ mod cancellation_tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             assert_eq!(line, "GET /slots HTTP/1.1\r\n");
             loop {
-                line.clear(); reader.read_line(&mut line).unwrap();
-                if line == "\r\n" { break; }
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
             }
             let body = r#"[{"id":0,"is_processing":false}]"#;
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
         });
         let http = ProviderHttp::new(std::slice::from_ref(&base), Duration::from_secs(2)).unwrap();
         assert_eq!(generation_idle(&http, &base).await, Ok(true));

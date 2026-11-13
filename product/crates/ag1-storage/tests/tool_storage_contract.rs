@@ -79,7 +79,13 @@ fn selected_large_original_and_artifact_page_keep_complete_evidence_without_recu
 
 fn check_ticket(registry: &Registry, scope: &Scope, operation: &str) -> AuthorizedCall {
     let call = registry
-        .prepare(operation, "check-call", "check", &json!({"verificationScope":"owned-check"}), true)
+        .prepare(
+            operation,
+            "check-call",
+            "check",
+            &json!({"verificationScope":"owned-check"}),
+            true,
+        )
         .unwrap();
     let policy: Policy =
         serde_json::from_value(json!({"mode":"disabled","cwd":"/fixture"})).unwrap();
@@ -159,7 +165,13 @@ fn native_check_releases_only_verification_leases_atomically_with_completion_and
             .unwrap();
         store
             .scoped_lease_record(
-                "session", "origin", &evidence.id, "through verification", 60000, true, Some("owned-check"),
+                "session",
+                "origin",
+                &evidence.id,
+                "through verification",
+                60000,
+                true,
+                Some("owned-check"),
             )
             .unwrap();
         store
@@ -231,7 +243,13 @@ fn native_check_releases_only_verification_leases_atomically_with_completion_and
         // A later lease must survive recovery of the previous completion.
         store
             .scoped_lease_record(
-                "session", "origin", &evidence.id, "new verification", 60000, true, Some("owned-check"),
+                "session",
+                "origin",
+                &evidence.id,
+                "new verification",
+                60000,
+                true,
+                Some("owned-check"),
             )
             .unwrap();
         let replay = executor::execute(

@@ -83,7 +83,7 @@ impl Host {
         let (_, root) = self.undo_receipt(args, true)?;
         self.ensure_folder_idle(root.root()).await
     }
-    pub(super) async fn ensure_folder_idle(&self,root:&Path)->Result<()> {
+    pub(super) async fn ensure_folder_idle(&self, root: &Path) -> Result<()> {
         for host in self
             .shared_hosts
             .lock()

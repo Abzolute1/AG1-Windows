@@ -23,12 +23,12 @@ use ag1_storage::{
     Boundary, FaultInjector, StorageError, StorageResult, Store, context::ContextStore,
 };
 use serde_json::{Value, json};
+#[path = "mcp_input_execution/mod.rs"]
+mod input_execution;
 #[path = "mcp_private_execution/mod.rs"]
 mod private_execution;
 #[path = "mcp_trust_execution/mod.rs"]
 mod trust_execution;
-#[path = "mcp_input_execution/mod.rs"]
-mod input_execution;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -89,9 +89,14 @@ fn until(mut check: impl FnMut() -> bool) {
 }
 impl Case {
     fn new(transport: &str, revision: Revision, mode: &str) -> Self {
-        Self::new_with_input(transport,revision,mode,None)
+        Self::new_with_input(transport, revision, mode, None)
     }
-    fn new_with_input(transport:&str,revision:Revision,mode:&str,entry:Option<Arc<dyn ag1_platform::mcp::input::Entry>>)->Self {
+    fn new_with_input(
+        transport: &str,
+        revision: Revision,
+        mode: &str,
+        entry: Option<Arc<dyn ag1_platform::mcp::input::Entry>>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         std::fs::write(
@@ -152,7 +157,9 @@ impl Case {
             DiscoveryLimits::new(Duration::from_millis(800)).unwrap(),
         )
         .unwrap();
-        if let Some(entry)=entry {manager.set_input_entry(entry).unwrap();}
+        if let Some(entry) = entry {
+            manager.set_input_entry(entry).unwrap();
+        }
         let server = manager
             .add_drafts(vec![Draft {
                 name: "owned fixture".into(),
@@ -733,28 +740,52 @@ mod mcp_runtime;
 #[test]
 fn mcp_media_uses_bounded_native_rasters_and_retains_originals() {
     for transport in ["stdio", "http"] {
-        for mode in ["media_valid", "media_resource", "media_many", "media_mismatch", "media_broken", "media_pixels"] {
+        for mode in [
+            "media_valid",
+            "media_resource",
+            "media_many",
+            "media_mismatch",
+            "media_broken",
+            "media_pixels",
+        ] {
             let case = Case::new(transport, Revision::Current20260728, mode);
-            let result = case.run("operation", 10000, &json!({"value":7}), |_| {}).unwrap();
-            assert_eq!(result.result["isError"], false, "{transport}/{mode}: {}", result.result);
+            let result = case
+                .run("operation", 10000, &json!({"value":7}), |_| {})
+                .unwrap();
+            assert_eq!(
+                result.result["isError"], false,
+                "{transport}/{mode}: {}",
+                result.result
+            );
             let original = case.original(&result);
             assert!(original["result"]["content"].is_array());
             let blocks = result.result["content"].as_array().unwrap();
-            let images: Vec<_> = blocks.iter().filter(|b|b["type"]=="image").collect();
-            let expected = match mode { "media_valid"|"media_resource"=>1,"media_many"=>8,_=>0 };
+            let images: Vec<_> = blocks.iter().filter(|b| b["type"] == "image").collect();
+            let expected = match mode {
+                "media_valid" | "media_resource" => 1,
+                "media_many" => 8,
+                _ => 0,
+            };
             assert_eq!(images.len(), expected, "{transport}/{mode}");
             for image in images {
                 use base64::Engine;
                 assert_eq!(image["mimeType"], "image/png");
-                let bytes = base64::engine::general_purpose::STANDARD.decode(image["data"].as_str().unwrap()).unwrap();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(image["data"].as_str().unwrap())
+                    .unwrap();
                 assert_eq!(image::load_from_memory(&bytes).unwrap().width(), 1);
             }
-            if expected==0 || mode=="media_many" { assert!(result.result.to_string().contains("preview unavailable")); }
-            if mode!="media_resource" {
-                assert_eq!(blocks.first().unwrap()["text"],"before");
-                assert_eq!(blocks.last().unwrap()["text"],"after");
+            if expected == 0 || mode == "media_many" {
+                assert!(result.result.to_string().contains("preview unavailable"));
             }
-            assert_eq!(result.result["details"]["mcp"]["source"]["binding"]["serverId"], case.server);
+            if mode != "media_resource" {
+                assert_eq!(blocks.first().unwrap()["text"], "before");
+                assert_eq!(blocks.last().unwrap()["text"], "after");
+            }
+            assert_eq!(
+                result.result["details"]["mcp"]["source"]["binding"]["serverId"],
+                case.server
+            );
         }
     }
 }

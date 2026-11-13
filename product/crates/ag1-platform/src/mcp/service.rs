@@ -77,7 +77,12 @@ impl Service {
             return Ok(service);
         }
         let service = Arc::new(Self {
-            directory: Arc::new(Store::open(&state.join("mcp-discovery-cache")).map_err(DomainError::from).and_then(super::registry::Directory::open).unwrap_or_else(|_|super::registry::Directory::memory())),
+            directory: Arc::new(
+                Store::open(&state.join("mcp-discovery-cache"))
+                    .map_err(DomainError::from)
+                    .and_then(super::registry::Directory::open)
+                    .unwrap_or_else(|_| super::registry::Directory::memory()),
+            ),
             manager: Arc::new(
                 Manager::open(
                     Store::open(&state.join("mcp-store"))?,
@@ -107,16 +112,32 @@ impl Service {
             oauth_entry: Arc::new(Mutex::new(None)),
         })
     }
-    pub fn from_manager_with_directory(manager: Arc<Manager>, helper: PathBuf, directory: Arc<super::registry::Directory>) -> Arc<Self> {
-        Arc::new(Self { manager, helper, directory, private_entry: Arc::new(Mutex::new(None)),
-            #[cfg(target_os = "linux")] oauth_entry: Arc::new(Mutex::new(None)), })
+    pub fn from_manager_with_directory(
+        manager: Arc<Manager>,
+        helper: PathBuf,
+        directory: Arc<super::registry::Directory>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            manager,
+            helper,
+            directory,
+            private_entry: Arc::new(Mutex::new(None)),
+            #[cfg(target_os = "linux")]
+            oauth_entry: Arc::new(Mutex::new(None)),
+        })
     }
     #[cfg(feature = "mcp-fixtures")]
     pub fn with_fixture_directory(&self, directory: Arc<super::registry::Directory>) -> Arc<Self> {
-        Arc::new(Self { directory, manager:self.manager.clone(), helper:self.helper.clone(), private_entry:self.private_entry.clone(),
-            #[cfg(target_os="linux")] oauth_entry:self.oauth_entry.clone() })
+        Arc::new(Self {
+            directory,
+            manager: self.manager.clone(),
+            helper: self.helper.clone(),
+            private_entry: self.private_entry.clone(),
+            #[cfg(target_os = "linux")]
+            oauth_entry: self.oauth_entry.clone(),
+        })
     }
-    pub fn set_input_entry(&self, entry: Arc<dyn super::input::Entry>) -> Result<(),DomainError> {
+    pub fn set_input_entry(&self, entry: Arc<dyn super::input::Entry>) -> Result<(), DomainError> {
         self.manager.set_input_entry(entry)
     }
     pub fn set_private_entry(
@@ -147,7 +168,9 @@ impl Service {
     }
     /// Native folder capability only. Renderer paths cannot select an import root.
     pub fn session_with_project(
-        &self, catalog_scope: CatalogScope, scope: Scope,
+        &self,
+        catalog_scope: CatalogScope,
+        scope: Scope,
         policy: Option<Arc<crate::client::approval_policy::ApprovalPolicy>>,
         project: Option<Arc<crate::workspace::Workspace>>,
     ) -> Result<Arc<Session>, DomainError> {
@@ -218,16 +241,46 @@ pub struct Session {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     List,
-    Discover { #[serde(default)] query: String, #[serde(default)] cursor: String, #[serde(default)] fetch: bool, #[serde(default)] refresh: bool },
-    DiscoverDetail { key: String },
-    DiscoverIcon { key: String },
-    DiscoverReview { key: String, sha256: String, index: usize },
-    DiscoverLocalReview { key: String, sha256: String, index: usize, configuration: Configuration },
-    DiscoverConfirm { review: String },
-    DiscoverDismiss { review: String },
+    Discover {
+        #[serde(default)]
+        query: String,
+        #[serde(default)]
+        cursor: String,
+        #[serde(default)]
+        fetch: bool,
+        #[serde(default)]
+        refresh: bool,
+    },
+    DiscoverDetail {
+        key: String,
+    },
+    DiscoverIcon {
+        key: String,
+    },
+    DiscoverReview {
+        key: String,
+        sha256: String,
+        index: usize,
+    },
+    DiscoverLocalReview {
+        key: String,
+        sha256: String,
+        index: usize,
+        configuration: Configuration,
+    },
+    DiscoverConfirm {
+        review: String,
+    },
+    DiscoverDismiss {
+        review: String,
+    },
     ImportReview {},
-    ImportConfirm { review: String },
-    ImportDismiss { review: String },
+    ImportConfirm {
+        review: String,
+    },
+    ImportDismiss {
+        review: String,
+    },
     TrustMode {
         id: String,
         revision: u64,
@@ -328,8 +381,14 @@ impl Session {
         &self.discovery
     }
     pub fn close(&self) -> Result<(), DomainError> {
-        self.setup_pending.lock().map_err(|_| DomainError::Conflict)?.clear();
-        self.import_pending.lock().map_err(|_| DomainError::Conflict)?.clear();
+        self.setup_pending
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .clear();
+        self.import_pending
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .clear();
         self.trust_pending
             .lock()
             .map_err(|_| DomainError::Conflict)?
@@ -380,68 +439,164 @@ impl Session {
             .map_err(|_| DomainError::InvalidInput("MCP management fields".into()))?;
         let manager = self.lease.manager();
         match action {
-            Action::Discover { query, cursor, fetch, refresh } => self.directory.search(&query,&cursor,fetch,refresh),
+            Action::Discover {
+                query,
+                cursor,
+                fetch,
+                refresh,
+            } => self.directory.search(&query, &cursor, fetch, refresh),
             Action::DiscoverIcon { key } => self.directory.icon(&key),
             Action::DiscoverDetail { key } => {
-                let mut value=self.directory.detail(&key)?;
-                value["suggestedDirectory"]=self.project.as_ref().map(|p|json!(p.root())).unwrap_or(Value::Null);
+                let mut value = self.directory.detail(&key)?;
+                value["suggestedDirectory"] = self
+                    .project
+                    .as_ref()
+                    .map(|p| json!(p.root()))
+                    .unwrap_or(Value::Null);
                 Ok(value)
-            },
-            Action::DiscoverReview { key, sha256, index } => {
-                let draft=self.directory.remote_draft(&key,&sha256,index)?;
-                self.directory.revalidate(&draft.provenance)?;
-                let id=format!("mcp-setup-{}",super::manager::new_id()?);
-                let display=json!({"review":id,"draft":draft,"scope":scope_value(self.lease.scope()),"expiresInSeconds":60,"message":"This exact registry endpoint will be saved inactive. Authentication, connection and scope activation remain separate reviewed steps. No server endpoint is contacted by saving."});
-                let mut pending=self.setup_pending.lock().map_err(|_|DomainError::Conflict)?;
-                pending.retain(|_,p|Instant::now()<p.expires);
-                if pending.len()>=16{return Err(DomainError::LimitExceeded("MCP setup reviews".into()));}
-                pending.insert(id,PendingSetup{draft,expires:Instant::now()+Duration::from_secs(60)});Ok(display)
             }
-            Action::DiscoverLocalReview { key, sha256, index, configuration } => {
-                let draft=self.directory.local_draft(&key,&sha256,index,configuration)?;
+            Action::DiscoverReview { key, sha256, index } => {
+                let draft = self.directory.remote_draft(&key, &sha256, index)?;
                 self.directory.revalidate(&draft.provenance)?;
-                let id=format!("mcp-setup-{}",super::manager::new_id()?);
-                let display=json!({"review":id,"draft":draft,"localAccess":"readOnlyDirectory","scope":scope_value(self.lease.scope()),"expiresInSeconds":60,"message":"Save this existing local installation inactive, with read-only directory access and no networking. AG1 has not installed or verified the advertised package/version on disk. Review the executable and arguments; dependencies are mutable. Supply private environment values after saving."});
-                let mut pending=self.setup_pending.lock().map_err(|_|DomainError::Conflict)?;
-                pending.retain(|_,p|Instant::now()<p.expires);
-                if pending.len()>=16{return Err(DomainError::LimitExceeded("MCP setup reviews".into()));}
-                pending.insert(id,PendingSetup{draft,expires:Instant::now()+Duration::from_secs(60)});Ok(display)
+                let id = format!("mcp-setup-{}", super::manager::new_id()?);
+                let display = json!({"review":id,"draft":draft,"scope":scope_value(self.lease.scope()),"expiresInSeconds":60,"message":"This exact registry endpoint will be saved inactive. Authentication, connection and scope activation remain separate reviewed steps. No server endpoint is contacted by saving."});
+                let mut pending = self
+                    .setup_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?;
+                pending.retain(|_, p| Instant::now() < p.expires);
+                if pending.len() >= 16 {
+                    return Err(DomainError::LimitExceeded("MCP setup reviews".into()));
+                }
+                pending.insert(
+                    id,
+                    PendingSetup {
+                        draft,
+                        expires: Instant::now() + Duration::from_secs(60),
+                    },
+                );
+                Ok(display)
+            }
+            Action::DiscoverLocalReview {
+                key,
+                sha256,
+                index,
+                configuration,
+            } => {
+                let draft = self
+                    .directory
+                    .local_draft(&key, &sha256, index, configuration)?;
+                self.directory.revalidate(&draft.provenance)?;
+                let id = format!("mcp-setup-{}", super::manager::new_id()?);
+                let display = json!({"review":id,"draft":draft,"localAccess":"readOnlyDirectory","scope":scope_value(self.lease.scope()),"expiresInSeconds":60,"message":"Save this existing local installation inactive, with read-only directory access and no networking. AG1 has not installed or verified the advertised package/version on disk. Review the executable and arguments; dependencies are mutable. Supply private environment values after saving."});
+                let mut pending = self
+                    .setup_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?;
+                pending.retain(|_, p| Instant::now() < p.expires);
+                if pending.len() >= 16 {
+                    return Err(DomainError::LimitExceeded("MCP setup reviews".into()));
+                }
+                pending.insert(
+                    id,
+                    PendingSetup {
+                        draft,
+                        expires: Instant::now() + Duration::from_secs(60),
+                    },
+                );
+                Ok(display)
             }
             Action::DiscoverConfirm { review } => {
-                let pending=self.setup_pending.lock().map_err(|_|DomainError::Conflict)?.remove(&review).ok_or(DomainError::PermissionDenied)?;
-                if Instant::now()>=pending.expires{return Err(DomainError::TimedOut);}
+                let pending = self
+                    .setup_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?
+                    .remove(&review)
+                    .ok_or(DomainError::PermissionDenied)?;
+                if Instant::now() >= pending.expires {
+                    return Err(DomainError::TimedOut);
+                }
                 self.lease.check()?;
-                let access=if matches!(pending.draft.configuration,Configuration::Local{..}) {super::definitions::LocalAccess::ReadOnlyDirectory}else{super::definitions::LocalAccess::HostAccount};
-                Ok(json!({"ids":manager.add_drafts_with_access(vec![pending.draft],access)?,"active":false,"message":"Server saved inactive. Configure authentication, test the connection and enable it in the desired scope."}))
+                let access = if matches!(pending.draft.configuration, Configuration::Local { .. }) {
+                    super::definitions::LocalAccess::ReadOnlyDirectory
+                } else {
+                    super::definitions::LocalAccess::HostAccount
+                };
+                Ok(
+                    json!({"ids":manager.add_drafts_with_access(vec![pending.draft],access)?,"active":false,"message":"Server saved inactive. Configure authentication, test the connection and enable it in the desired scope."}),
+                )
             }
-            Action::DiscoverDismiss { review } => { self.setup_pending.lock().map_err(|_|DomainError::Conflict)?.remove(&review);Ok(json!({"dismissed":true})) }
+            Action::DiscoverDismiss { review } => {
+                self.setup_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?
+                    .remove(&review);
+                Ok(json!({"dismissed":true}))
+            }
 
             Action::ImportReview {} => {
-                let project = self.project.as_ref().ok_or_else(|| DomainError::Unavailable("Open a project folder to import its .mcp.json configuration.".into()))?;
+                let project = self.project.as_ref().ok_or_else(|| {
+                    DomainError::Unavailable(
+                        "Open a project folder to import its .mcp.json configuration.".into(),
+                    )
+                })?;
                 let snapshot = project.snapshot(".mcp.json", 256 * 1024)?;
                 let source = project.root().join(".mcp.json");
-                let drafts = super::definitions::import_project(&snapshot.bytes, &source.to_string_lossy(), &project.root().to_string_lossy())?;
-                for draft in &drafts { super::definitions::LocalAccess::ReadOnlyDirectory.validate(&draft.configuration)?; }
+                let drafts = super::definitions::import_project(
+                    &snapshot.bytes,
+                    &source.to_string_lossy(),
+                    &project.root().to_string_lossy(),
+                )?;
+                for draft in &drafts {
+                    super::definitions::LocalAccess::ReadOnlyDirectory
+                        .validate(&draft.configuration)?;
+                }
                 let digest = ag1_storage::digest(&snapshot.bytes);
                 let id = format!("mcp-import-{}", super::manager::new_id()?);
                 let display = json!({"review":id,"source":source,"sha256":digest,"drafts":drafts,"localAccess":"readOnlyDirectory","expiresInSeconds":300,"message":"These untrusted project definitions will be saved inactive with read-only directory access and no network. Review each command and working directory. Nothing is installed, launched, connected, authenticated or enabled by import."});
-                let mut pending = self.import_pending.lock().map_err(|_| DomainError::Conflict)?;
+                let mut pending = self
+                    .import_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?;
                 pending.retain(|_, p| Instant::now() < p.expires);
-                if pending.len() >= 4 { return Err(DomainError::LimitExceeded("MCP import reviews".into())); }
-                pending.insert(id, PendingImport { drafts, digest, expires: Instant::now() + Duration::from_secs(300) });
+                if pending.len() >= 4 {
+                    return Err(DomainError::LimitExceeded("MCP import reviews".into()));
+                }
+                pending.insert(
+                    id,
+                    PendingImport {
+                        drafts,
+                        digest,
+                        expires: Instant::now() + Duration::from_secs(300),
+                    },
+                );
                 Ok(display)
             }
             Action::ImportConfirm { review } => {
-                let pending = self.import_pending.lock().map_err(|_| DomainError::Conflict)?.remove(&review).ok_or(DomainError::PermissionDenied)?;
-                if Instant::now() >= pending.expires { return Err(DomainError::TimedOut); }
+                let pending = self
+                    .import_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?
+                    .remove(&review)
+                    .ok_or(DomainError::PermissionDenied)?;
+                if Instant::now() >= pending.expires {
+                    return Err(DomainError::TimedOut);
+                }
                 let project = self.project.as_ref().ok_or(DomainError::PermissionDenied)?;
                 let snapshot = project.snapshot(".mcp.json", 256 * 1024)?;
-                if ag1_storage::digest(&snapshot.bytes) != pending.digest { return Err(DomainError::Conflict); }
+                if ag1_storage::digest(&snapshot.bytes) != pending.digest {
+                    return Err(DomainError::Conflict);
+                }
                 self.lease.check()?;
-                Ok(json!({"ids":manager.add_drafts_with_access(pending.drafts, super::definitions::LocalAccess::ReadOnlyDirectory)?,"active":false,"message":"Project servers saved inactive. Configure authentication and review a connection separately."}))
+                Ok(
+                    json!({"ids":manager.add_drafts_with_access(pending.drafts, super::definitions::LocalAccess::ReadOnlyDirectory)?,"active":false,"message":"Project servers saved inactive. Configure authentication and review a connection separately."}),
+                )
             }
             Action::ImportDismiss { review } => {
-                self.import_pending.lock().map_err(|_| DomainError::Conflict)?.remove(&review);
+                self.import_pending
+                    .lock()
+                    .map_err(|_| DomainError::Conflict)?
+                    .remove(&review);
                 Ok(json!({"dismissed":true}))
             }
             Action::TrustMode { id, revision, mode } => {
@@ -562,11 +717,16 @@ impl Session {
                     json!({"loggedOutLocally":true,"upstreamRevocation":"not requested or confirmed","message":"Local credentials removed and affected connections retired. Revoke remotely in the server account settings if needed."}),
                 )
             }
-            Action::Add { draft, local_access } => {
+            Action::Add {
+                draft,
+                local_access,
+            } => {
                 if draft.provenance != Provenance::Manual {
                     return Err(DomainError::PermissionDenied);
                 }
-                Ok(json!({"ids":manager.add_drafts_with_access(vec![draft], local_access)?,"active":false}))
+                Ok(
+                    json!({"ids":manager.add_drafts_with_access(vec![draft], local_access)?,"active":false}),
+                )
             }
             Action::Edit {
                 id,
@@ -634,7 +794,15 @@ impl Session {
                 self.directory.revalidate(&record.draft.provenance)?;
                 let review = self.lease.review(&id, test)?;
                 let consent = match &review.record().draft.configuration {
-                    Configuration::Local { .. } => if review.record().local_access == super::definitions::LocalAccess::ReadOnlyDirectory { ConnectionConsent::LocalReadOnlyDirectory } else { ConnectionConsent::LocalHostAccountExecution },
+                    Configuration::Local { .. } => {
+                        if review.record().local_access
+                            == super::definitions::LocalAccess::ReadOnlyDirectory
+                        {
+                            ConnectionConsent::LocalReadOnlyDirectory
+                        } else {
+                            ConnectionConsent::LocalHostAccountExecution
+                        }
+                    }
                     Configuration::Http {
                         loopback_development: true,
                         ..

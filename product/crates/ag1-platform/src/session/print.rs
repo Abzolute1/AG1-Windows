@@ -371,13 +371,19 @@ pub(super) async fn run_selected(
             gate.no_tests_collected_count = empty;
             if mutation && !evidence.verified() {
                 if passed == 0 {
-                    gate.reasons.push("no successful test command was recorded after the latest mutation".into());
+                    gate.reasons.push(
+                        "no successful test command was recorded after the latest mutation".into(),
+                    );
                 }
                 if failed > 0 {
-                    gate.reasons.push(format!("{failed} test command(s) still fail after the latest mutation"));
+                    gate.reasons.push(format!(
+                        "{failed} test command(s) still fail after the latest mutation"
+                    ));
                 }
                 if empty > 0 {
-                    gate.reasons.push(format!("{empty} command(s) collected no tests after the latest mutation"));
+                    gate.reasons.push(format!(
+                        "{empty} command(s) collected no tests after the latest mutation"
+                    ));
                 }
                 if gate.reasons.is_empty() {
                     gate.reasons.push("no successful native verifier receipt remains after the latest mutation or uncertain effect".into());

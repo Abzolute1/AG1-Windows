@@ -158,29 +158,38 @@ where
         let state = self.state.clone();
         let plans = self.plans.clone();
         let timeout = self.load_timeout.min(Duration::from_secs(30));
-        self.pool.submit(move || {
-            let mut s = state.lock().map_err(|_| DomainError::DurabilityUnknown)?;
-            let Some(model) = s.active.clone() else { return Ok(()); };
-            let plan = &plans[&model];
-            let started = Instant::now();
-            loop {
-                // Closing the response cancels llama.cpp's request. Retain the
-                // model and lease, and acknowledge only verified slot settlement.
-                if s.controller.poll_generation_idle(plan)? {
-                    s.events.push(Event {
-                        model, plan_sha256: plan.plan_sha256.clone(),
-                        action: "owned_generation_cancelled".into(),
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                    });
-                    if s.events.len() > 1024 { s.events.remove(0); }
+        self.pool
+            .submit(move || {
+                let mut s = state.lock().map_err(|_| DomainError::DurabilityUnknown)?;
+                let Some(model) = s.active.clone() else {
                     return Ok(());
+                };
+                let plan = &plans[&model];
+                let started = Instant::now();
+                loop {
+                    // Closing the response cancels llama.cpp's request. Retain the
+                    // model and lease, and acknowledge only verified slot settlement.
+                    if s.controller.poll_generation_idle(plan)? {
+                        s.events.push(Event {
+                            model,
+                            plan_sha256: plan.plan_sha256.clone(),
+                            action: "owned_generation_cancelled".into(),
+                            elapsed_ms: started.elapsed().as_millis() as u64,
+                        });
+                        if s.events.len() > 1024 {
+                            s.events.remove(0);
+                        }
+                        return Ok(());
+                    }
+                    if started.elapsed() >= timeout {
+                        return Err(DomainError::TimedOut);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
                 }
-                if started.elapsed() >= timeout { return Err(DomainError::TimedOut); }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            // An unavailable/uncertain observation keeps the model alive and
-            // leaves the caller's generation permit quarantined for recovery.
-        }).await
+                // An unavailable/uncertain observation keeps the model alive and
+                // leaves the caller's generation permit quarantined for recovery.
+            })
+            .await
     }
     async fn ensure(&self, model: String) -> Result<()> {
         if !self.plans.contains_key(&model) {
@@ -323,8 +332,10 @@ where
     fn progress(&self) -> Option<serde_json::Value> {
         // Never wait behind weight verification/loading on a UI polling thread.
         if let Ok(mut state) = self.state.try_lock()
-            && state.active.is_some() && !state.controller.owned_alive().unwrap_or(false)
-            && let Ok(mut value) = self.progress.lock() {
+            && state.active.is_some()
+            && !state.controller.owned_alive().unwrap_or(false)
+            && let Ok(mut value) = self.progress.lock()
+        {
             *value = None;
         }
         self.progress.lock().ok().and_then(|value| value.clone())

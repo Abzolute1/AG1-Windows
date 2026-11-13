@@ -158,11 +158,7 @@ async fn missing_warning_receipt_blocks_next_request_without_publishing_warning_
         ag1_storage::Boundary::BeforeCommit,
         ag1_storage::Boundary::BeforeAck,
     ] {
-        let (origin, server) = server(vec![
-            missing("one"),
-            missing("two"),
-            missing("three"),
-        ]);
+        let (origin, server) = server(vec![missing("one"), missing("two"), missing("three")]);
         let fixture = fixture_seeded_with_fault(
             &origin,
             "disabled",

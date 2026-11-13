@@ -559,8 +559,16 @@ fn lease_ttl_caps_release_and_binary_bounds_use_injected_clock() {
     let id = format!("art_{:032x}", 16);
     s.lease("parent", "origin", &id, "again", u64::MAX, true)
         .unwrap();
-    assert_eq!(s.release_verified_leases("parent", "unrelated", u64::MAX).unwrap(), 0);
-    assert_eq!(s.leases("parent").unwrap().len(), 1, "unscoped historical lease remains retained");
+    assert_eq!(
+        s.release_verified_leases("parent", "unrelated", u64::MAX)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        s.leases("parent").unwrap().len(),
+        1,
+        "unscoped historical lease remains retained"
+    );
     for i in 100..132 {
         s.put_artifact(&artifact(i, "binary")).unwrap();
     }
@@ -1593,30 +1601,102 @@ fn writer_release_is_explicit_even_if_a_spawn_inherits_the_open_description() {
 fn scoped_leases_isolate_obligations_late_evidence_and_forked_sessions() {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(TestClock(AtomicU64::new(1000)));
-    let store = Store::open_with(&dir.path().join("store"), clock.clone(), Arc::new(Fault {
-        point: Boundary::BeforeAck, armed: AtomicBool::new(false),
-    })).unwrap();
+    let store = Store::open_with(
+        &dir.path().join("store"),
+        clock.clone(),
+        Arc::new(Fault {
+            point: Boundary::BeforeAck,
+            armed: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
     seed(&store);
-    let ids: Vec<_> = (0..5).map(|i| store.put_artifact(&artifact(i, "utf8")).unwrap()).collect();
-    for (i, scope, automatic) in [(0, Some("compile"), true), (1, Some("runtime"), true), (2, None, true), (3, Some("compile"), false)] {
-        store.scoped_lease_record("parent", "origin", &ids[i], "review", 60000, automatic, scope).unwrap();
+    let ids: Vec<_> = (0..5)
+        .map(|i| store.put_artifact(&artifact(i, "utf8")).unwrap())
+        .collect();
+    for (i, scope, automatic) in [
+        (0, Some("compile"), true),
+        (1, Some("runtime"), true),
+        (2, None, true),
+        (3, Some("compile"), false),
+    ] {
+        store
+            .scoped_lease_record(
+                "parent", "origin", &ids[i], "review", 60000, automatic, scope,
+            )
+            .unwrap();
     }
     store.fork("parent", "child", None).unwrap();
-    assert_eq!(store.evidence_lease_records("child").unwrap(), store.evidence_lease_records("parent").unwrap());
+    assert_eq!(
+        store.evidence_lease_records("child").unwrap(),
+        store.evidence_lease_records("parent").unwrap()
+    );
     clock.0.store(1002, Ordering::SeqCst);
-    store.scoped_lease_record("parent", "origin", &ids[4], "later obligation", 60000, true, Some("compile")).unwrap();
-    assert_eq!(store.release_verified_leases("parent", "unrelated", 1000).unwrap(), 0);
-    assert_eq!(store.release_verified_leases("parent", "compile", 1000).unwrap(), 0, "timestamp ties retain evidence conservatively");
-    assert_eq!(store.release_verified_leases("parent", "compile", 1001).unwrap(), 1);
+    store
+        .scoped_lease_record(
+            "parent",
+            "origin",
+            &ids[4],
+            "later obligation",
+            60000,
+            true,
+            Some("compile"),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .release_verified_leases("parent", "unrelated", 1000)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .release_verified_leases("parent", "compile", 1000)
+            .unwrap(),
+        0,
+        "timestamp ties retain evidence conservatively"
+    );
+    assert_eq!(
+        store
+            .release_verified_leases("parent", "compile", 1001)
+            .unwrap(),
+        1
+    );
     let retained = store.leases("parent").unwrap();
     assert_eq!(retained.len(), 4);
     assert!(retained.iter().all(|lease| lease.artifact != ids[0]));
-    assert_eq!(store.leases("child").unwrap().len(), 4, "parent completion cannot release a child's obligations");
-    assert_eq!(store.release_verified_leases("child", "compile", 1001).unwrap(), 1);
-    assert_eq!(store.release_verified_leases("parent", "compile", 1003).unwrap(), 1);
+    assert_eq!(
+        store.leases("child").unwrap().len(),
+        4,
+        "parent completion cannot release a child's obligations"
+    );
+    assert_eq!(
+        store
+            .release_verified_leases("child", "compile", 1001)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .release_verified_leases("parent", "compile", 1003)
+            .unwrap(),
+        1
+    );
     assert_eq!(store.leases("parent").unwrap().len(), 3);
     for invalid in ["", " leading", "trailing ", "line\nbreak"] {
-        assert!(store.scoped_lease_record("parent", "origin", &ids[0], "invalid", 60000, true, Some(invalid)).is_err());
+        assert!(
+            store
+                .scoped_lease_record(
+                    "parent",
+                    "origin",
+                    &ids[0],
+                    "invalid",
+                    60000,
+                    true,
+                    Some(invalid)
+                )
+                .is_err()
+        );
     }
 }
 
@@ -1631,17 +1711,44 @@ fn scoped_lease_import_preserves_scope_and_legacy_records() {
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::copy(fixture().join("source").join(&file.path), target).unwrap();
     }
-    let file = manifest.files.iter_mut().find(|f| f.kind == FileKind::Leases).unwrap();
-    let mut value: Value = serde_json::from_slice(&std::fs::read(source.join(&file.path)).unwrap()).unwrap();
+    let file = manifest
+        .files
+        .iter_mut()
+        .find(|f| f.kind == FileKind::Leases)
+        .unwrap();
+    let mut value: Value =
+        serde_json::from_slice(&std::fs::read(source.join(&file.path)).unwrap()).unwrap();
     let session = file.session.clone().unwrap();
     assert!(!value["leases"].as_array().unwrap().is_empty());
     value["leases"][0]["verificationScope"] = json!("imported-runtime");
     let raw = serde_json::to_vec(&value).unwrap();
-    file.sha256 = digest(&raw); file.bytes = raw.len() as u64;
+    file.sha256 = digest(&raw);
+    file.bytes = raw.len() as u64;
     std::fs::write(source.join(&file.path), raw).unwrap();
-    let store = Store::open_with(&dir.path().join("store"), Arc::new(TestClock(AtomicU64::new(0))), Arc::new(Fault {point:Boundary::BeforeAck,armed:AtomicBool::new(false)})).unwrap();
+    let store = Store::open_with(
+        &dir.path().join("store"),
+        Arc::new(TestClock(AtomicU64::new(0))),
+        Arc::new(Fault {
+            point: Boundary::BeforeAck,
+            armed: AtomicBool::new(false),
+        }),
+    )
+    .unwrap();
     store.import_frozen(&source, &manifest).unwrap();
-    assert_eq!(store.evidence_lease_records(&session).unwrap()[0]["verificationScope"], "imported-runtime");
-    assert_eq!(store.release_verified_leases(&session, "compile", u64::MAX).unwrap(), 0);
-    assert_eq!(store.release_verified_leases(&session, "imported-runtime", u64::MAX).unwrap(), 1);
+    assert_eq!(
+        store.evidence_lease_records(&session).unwrap()[0]["verificationScope"],
+        "imported-runtime"
+    );
+    assert_eq!(
+        store
+            .release_verified_leases(&session, "compile", u64::MAX)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .release_verified_leases(&session, "imported-runtime", u64::MAX)
+            .unwrap(),
+        1
+    );
 }

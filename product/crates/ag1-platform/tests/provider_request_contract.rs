@@ -13,16 +13,39 @@ fn text_only_models_can_continue_after_tool_images_without_losing_journal_images
     let original = context.clone();
     for vision in [false, true] {
         let model = json!({"id":"fixture","provider":"fixture","api":"openai-completions","input":if vision {json!(["text","image"])} else {json!(["text"])},"maxTokens":1024});
-        let result = build_payload(&RequestContext { model: &model, context: &context, options: &json!({}), anthropic_oauth: false, google_project: None, request_id: "image-preview" }).unwrap();
+        let result = build_payload(&RequestContext {
+            model: &model,
+            context: &context,
+            options: &json!({}),
+            anthropic_oauth: false,
+            google_project: None,
+            request_id: "image-preview",
+        })
+        .unwrap();
         let encoded = result.to_string();
         assert!(encoded.contains("SVG source retained"));
         assert_eq!(encoded.contains("has not visually inspected"), !vision);
         assert_eq!(encoded.contains("aW1hZ2UtYnl0ZXM="), vision);
-        assert_eq!(context, original, "provider projection must not mutate journal content");
+        assert_eq!(
+            context, original,
+            "provider projection must not mutate journal content"
+        );
     }
-    let model = json!({"id":"fixture","provider":"fixture","api":"openai-completions","input":["text"]});
+    let model =
+        json!({"id":"fixture","provider":"fixture","api":"openai-completions","input":["text"]});
     let user_image = json!({"messages":[{"role":"user","content":[{"type":"image","mimeType":"image/png","data":"aW1hZ2U="}]}]});
-    assert!(build_payload(&RequestContext { model: &model, context: &user_image, options: &json!({}), anthropic_oauth: false, google_project: None, request_id: "user-image" }).is_err(), "user image input still requires vision support");
+    assert!(
+        build_payload(&RequestContext {
+            model: &model,
+            context: &user_image,
+            options: &json!({}),
+            anthropic_oauth: false,
+            google_project: None,
+            request_id: "user-image"
+        })
+        .is_err(),
+        "user image input still requires vision support"
+    );
 }
 fn transport_body(mut v: Value, api: &str) -> Value {
     // Original Bedrock capture is the SDK command. HTTP serialization places modelId

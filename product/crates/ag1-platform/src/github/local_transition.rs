@@ -192,7 +192,8 @@ impl LocalGit {
             dir.verify_identity()?;
             for entry in std::fs::read_dir(dir.process_cwd()).map_err(io_error)? {
                 c.check()?;
-                self.authority(true)?;self.storage_check(c)?;
+                self.authority(true)?;
+                self.storage_check(c)?;
                 count += 1;
                 if count > 20000 {
                     return Err(DomainError::LimitExceeded(
@@ -292,7 +293,8 @@ impl LocalGit {
         let mut blocked_parents = BTreeSet::new();
         for path in &changed {
             c.check()?;
-            self.authority(true)?;self.storage_check(c)?;
+            self.authority(true)?;
+            self.storage_check(c)?;
             let old = before.get(path);
             let new = after.get(path);
             // Updating a gitlink never traverses or initializes its checkout.
@@ -400,7 +402,8 @@ impl LocalGit {
         };
         let recheck = || -> Result<()> {
             c.check()?;
-            self.authority(true)?;self.storage_check(c)?;
+            self.authority(true)?;
+            self.storage_check(c)?;
             self.workspace.verify_root()?;
             lock.verify()?;
             self.transition_idle()?;
@@ -419,10 +422,8 @@ impl LocalGit {
             }
             if self.state(c)? != (plan.head.clone(), plan.branch.clone())
                 || self.index()?.as_ref().map(|(_, r)| r) != plan.index.as_ref().map(|(_, r)| r)
-                || Some(
-                    self.metadata_snapshot(".git/config", 1024 * 1024)?
-                        .revision,
-                ) != plan.config_revision
+                || Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision)
+                    != plan.config_revision
                 || self.reference(&t.branch, c)? != t.branch_before
             {
                 return Err(DomainError::Conflict);
@@ -525,7 +526,8 @@ impl LocalGit {
             let root = self.workspace.pin_directory("")?;
             let check = || -> Result<()> {
                 c.check()?;
-                self.authority(true)?;self.storage_check(c)?;
+                self.authority(true)?;
+                self.storage_check(c)?;
                 self.workspace.verify_root()?;
                 root.verify_identity()?;
                 lock.verify()?;
@@ -724,10 +726,8 @@ impl LocalGit {
                 hook("after_index", "");
             }
             check()?;
-            if Some(
-                self.metadata_snapshot(".git/config", 1024 * 1024)?
-                    .revision,
-            ) != plan.config_revision
+            if Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision)
+                != plan.config_revision
             {
                 return Err(DomainError::Conflict);
             }
@@ -799,7 +799,8 @@ impl LocalGit {
                 hook("after_refs", "");
             }
             c.check()?;
-            self.authority(true)?;self.storage_check(c)?;
+            self.authority(true)?;
+            self.storage_check(c)?;
             lock.verify()?;
             if self.state(c)? != (t.target.clone(), t.branch.clone()) {
                 return Err(DomainError::Conflict);

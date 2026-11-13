@@ -223,8 +223,18 @@ fn empty_discovered_sessions_are_not_saved_as_chats() {
     for id in ["draft1", "draft2", "draft3"] {
         desktop.save_chat(json!({"session":id,"workspace":"/fixture","title":"New chat","empty":true,"discovered":true})).unwrap();
     }
-    assert!(desktop.catalog().unwrap()["chats"].as_array().is_none_or(|c| c.is_empty()));
+    assert!(
+        desktop.catalog().unwrap()["chats"]
+            .as_array()
+            .is_none_or(|c| c.is_empty())
+    );
     // A real conversation titled New chat must not be mistaken for a draft.
     desktop.save_chat(json!({"session":"real","workspace":"/fixture","title":"New chat","empty":false,"discovered":true})).unwrap();
-    assert_eq!(desktop.catalog().unwrap()["chats"].as_array().unwrap().len(),1);
+    assert_eq!(
+        desktop.catalog().unwrap()["chats"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 }

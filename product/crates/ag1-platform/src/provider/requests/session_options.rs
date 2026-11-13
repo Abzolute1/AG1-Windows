@@ -23,13 +23,20 @@ pub fn session_options(
     }
     // Account/provider-declared capabilities outrank legacy name heuristics.
     // A model with a known effort menu must never silently downgrade a choice.
-    if matches!(family, ApiFamily::Responses | ApiFamily::AzureResponses | ApiFamily::CodexResponses)
-        && let Some(modes) = model["thinking"]["modes"].as_array()
+    if matches!(
+        family,
+        ApiFamily::Responses | ApiFamily::AzureResponses | ApiFamily::CodexResponses
+    ) && let Some(modes) = model["thinking"]["modes"].as_array()
     {
-        let selected = modes.iter().find(|m| m.as_str().or_else(|| m["id"].as_str()) == Some(thinking))
+        let selected = modes
+            .iter()
+            .find(|m| m.as_str().or_else(|| m["id"].as_str()) == Some(thinking))
             .ok_or_else(|| invalid("Requested reasoning level is not supported by this model"))?;
-        let native = selected.get("nativeValue").and_then(Value::as_str).unwrap_or(if thinking == "off" { "none" } else { thinking });
-        if !["none","minimal","low","medium","high","xhigh","max"].contains(&native) {
+        let native = selected
+            .get("nativeValue")
+            .and_then(Value::as_str)
+            .unwrap_or(if thinking == "off" { "none" } else { thinking });
+        if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&native) {
             return Err(invalid("Unsupported native reasoning effort"));
         }
         out["reasoningEffort"] = json!(native);

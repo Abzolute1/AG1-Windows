@@ -489,7 +489,12 @@ async fn print_verifier_contract_is_request_local_and_expires_with_the_mode() {
         .unwrap();
     for request in &requests[..4] {
         assert!(
-            request["messages"].as_array().unwrap().last().map(|message| ag1_core::context::hygiene::content(message, "\n")).unwrap()
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .last()
+                .map(|message| ag1_core::context::hygiene::content(message, "\n"))
+                .unwrap()
                 .contains(&contract)
         );
     }

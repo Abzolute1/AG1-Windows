@@ -417,8 +417,11 @@ mod tests {
         assert!(store.blob_bytes(&hash).is_err());
         fs::remove_file(path.join("blobs").join(&hash)).unwrap();
         fs::remove_file(&file).unwrap();
-        std::os::unix::fs::symlink(temp.path().join("missing"), &file).unwrap();
-        assert!(store.blob_bytes(&hash).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(temp.path().join("missing"), &file).unwrap();
+            assert!(store.blob_bytes(&hash).is_err());
+        }
     }
     struct FixedClock;
     impl Clock for FixedClock {

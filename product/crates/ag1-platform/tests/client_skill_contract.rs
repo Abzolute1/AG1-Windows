@@ -114,34 +114,113 @@ async fn skills_reach_native_provider_requests_for_auto_and_explicit_use() {
         }
     });
     let config:Config=serde_json::from_value(json!({"models":[{"id":"Qwen-fixture","provider":"llamacpp","api":"openai-completions","baseUrl":format!("http://{address}/v1"),"compat":{"thinkingFormat":"qwen-chat-template"},"contextWindow":32768,"maxTokens":1024,"reasoning":true,"input":["text","image"]}],"selected":"Qwen-fixture","credential_env":null,"system_prompt":"","prompt_append":"Host conversation boundary.","fixture":true,"policy_mode":"disabled"})).unwrap();
-    let dir = workspace.join(".ag1/skills/svg-art"); std::fs::create_dir_all(&dir).unwrap();
+    let dir = workspace.join(".ag1/skills/svg-art");
+    std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("SKILL.md"), "---\nname: svg-art\ndescription: SVG artwork\ntriggers: [pelican]\n---\nTARGETED_EDITS_MARKER: preserve geometry and preview.").unwrap();
-    let host = Host::open_with_registry(&workspace, &state, config, &registry).await.unwrap();
-    for (index, text) in ["Draw a pelican", "/skill:svg-art Draw a bird", "Hello unrelated"].iter().enumerate() {
-        let cmd = if index == 1 { w::Command::Runtime { action:"client_action".into(),args:json!({"text":text}) } }
-            else {w::Command::Prompt {input:w::PromptInput::Inline {text:(*text).into()}}};
-        command(&host,&format!("skill-{index}"),cmd).await;
+    let host = Host::open_with_registry(&workspace, &state, config, &registry)
+        .await
+        .unwrap();
+    for (index, text) in [
+        "Draw a pelican",
+        "/skill:svg-art Draw a bird",
+        "Hello unrelated",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cmd = if index == 1 {
+            w::Command::Runtime {
+                action: "client_action".into(),
+                args: json!({"text":text}),
+            }
+        } else {
+            w::Command::Prompt {
+                input: w::PromptInput::Inline {
+                    text: (*text).into(),
+                },
+            }
+        };
+        command(&host, &format!("skill-{index}"), cmd).await;
     }
     // Same upload/message-artifact route used by the desktop attachment composer.
     use base64::Engine;
     async fn upload_call(host: &Arc<Host>, id: &str, action: &str, args: Value) -> Value {
-        let snapshot=host.commands.snapshot().unwrap();
-        let reply=host.dispatch(w::CommandEnvelope {version:Default::default(),id:id.to_owned().try_into().unwrap(),scope:snapshot.scope,expected_revision:snapshot.revision,command:w::Command::Artifacts {action:action.into(),args},extension:None}).await.unwrap();
-        let w::BridgeFrame::Reply {data,..}=reply else {panic!("missing upload reply")}; data
+        let snapshot = host.commands.snapshot().unwrap();
+        let reply = host
+            .dispatch(w::CommandEnvelope {
+                version: Default::default(),
+                id: id.to_owned().try_into().unwrap(),
+                scope: snapshot.scope,
+                expected_revision: snapshot.revision,
+                command: w::Command::Artifacts {
+                    action: action.into(),
+                    args,
+                },
+                extension: None,
+            })
+            .await
+            .unwrap();
+        let w::BridgeFrame::Reply { data, .. } = reply else {
+            panic!("missing upload reply")
+        };
+        data
     }
-    let mut png=std::io::Cursor::new(Vec::new());
-    image::DynamicImage::new_rgb8(2,2).write_to(&mut png,image::ImageFormat::Png).unwrap();
-    let message=json!({"role":"user","content":[{"type":"text","text":"Draw a pelican from this image"},{"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}]});
-    let bytes=serde_json::to_vec(&message).unwrap();
-    let upload=upload_call(&host,"upload-start","upload_begin",json!({})).await;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let message = json!({"role":"user","content":[{"type":"text","text":"Draw a pelican from this image"},{"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(png.into_inner())}]});
+    let bytes = serde_json::to_vec(&message).unwrap();
+    let upload = upload_call(&host, "upload-start", "upload_begin", json!({})).await;
     upload_call(&host,"upload-data","upload_append",json!({"upload":upload["upload"],"offset":"0","base64":base64::engine::general_purpose::STANDARD.encode(&bytes)})).await;
-    let result=upload_call(&host,"upload-end","upload_finish",json!({"upload":upload["upload"],"sha256":ag1_storage::digest(&bytes)})).await;
-    command(&host,"skill-image",w::Command::Prompt {input:w::PromptInput::MessageArtifact {artifact:result["artifact"].as_str().unwrap().to_owned().try_into().unwrap()}}).await;
-    host.shutdown().await.unwrap();server.join().unwrap();
-    for (index,request) in wire.lock().unwrap().iter().enumerate() {
-        let last=request["messages"].as_array().unwrap().iter().rev().find(|m| m["role"]=="user" && !m["content"].to_string().contains("AG1 REQUEST-LOCAL WORKING STATE")).unwrap()["content"].to_string();
-        assert_eq!(last.contains("TARGETED_EDITS_MARKER"),index!=2,"{last}");
-        assert_eq!(last.matches("TARGETED_EDITS_MARKER").count(),usize::from(index!=2));
-        if index==3 { assert!(last.contains("data:image/png;base64,"),"image lost: {last}"); }
+    let result = upload_call(
+        &host,
+        "upload-end",
+        "upload_finish",
+        json!({"upload":upload["upload"],"sha256":ag1_storage::digest(&bytes)}),
+    )
+    .await;
+    command(
+        &host,
+        "skill-image",
+        w::Command::Prompt {
+            input: w::PromptInput::MessageArtifact {
+                artifact: result["artifact"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+                    .try_into()
+                    .unwrap(),
+            },
+        },
+    )
+    .await;
+    host.shutdown().await.unwrap();
+    server.join().unwrap();
+    for (index, request) in wire.lock().unwrap().iter().enumerate() {
+        let last = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|m| {
+                m["role"] == "user"
+                    && !m["content"]
+                        .to_string()
+                        .contains("AG1 REQUEST-LOCAL WORKING STATE")
+            })
+            .unwrap()["content"]
+            .to_string();
+        assert_eq!(last.contains("TARGETED_EDITS_MARKER"), index != 2, "{last}");
+        assert_eq!(
+            last.matches("TARGETED_EDITS_MARKER").count(),
+            usize::from(index != 2)
+        );
+        if index == 3 {
+            assert!(
+                last.contains("data:image/png;base64,"),
+                "image lost: {last}"
+            );
+        }
     }
 }

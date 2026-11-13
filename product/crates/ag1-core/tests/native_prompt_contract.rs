@@ -21,19 +21,50 @@ fn activate(registry: &mut Registry, names: &[&str]) {
 fn local_image_guidance_uses_read_without_claiming_general_browser_access() {
     let mut registry = Registry::builtins().unwrap();
     ag1_core::tools::targets::register_visual_tools(&mut registry).unwrap();
-    activate(&mut registry, &["read", "screenshot_url", "interact_then_screenshot", "verify_ui"]);
-    let prompt = format!("{} {}", registry.build_native_prompt(&input(), &json!({"id":"fixture","provider":"api"})).unwrap(), json!(registry.native_tools()));
+    activate(
+        &mut registry,
+        &[
+            "read",
+            "screenshot_url",
+            "interact_then_screenshot",
+            "verify_ui",
+        ],
+    );
+    let prompt = format!(
+        "{} {}",
+        registry
+            .build_native_prompt(&input(), &json!({"id":"fixture","provider":"api"}))
+            .unwrap(),
+        json!(registry.native_tools())
+    );
     assert!(prompt.contains("PNG preview automatically"));
     assert!(prompt.contains("Image results are displayed inline"));
     assert!(prompt.contains("Not a general website or local file screenshot tool"));
     assert!(!prompt.contains("screenshot_url (HTML path"));
     assert!(!prompt.contains("Inspect a page or local HTML directly"));
-    assert!(ag1_core::tools::shell::static_guard("python -m http.server 8000").unwrap().contains("Use read to preview local images"));
+    assert!(
+        ag1_core::tools::shell::static_guard("python -m http.server 8000")
+            .unwrap()
+            .contains("Use read to preview local images")
+    );
     let tools = registry.native_tools();
     let read = tools.iter().find(|t| t["name"] == "read").unwrap();
-    assert!(read["description"].as_str().unwrap().contains("PNG preview automatically"));
-    let screenshot = tools.iter().find(|t| t["name"] == "screenshot_url").unwrap();
-    assert!(screenshot["parameters"]["properties"]["url"]["description"].as_str().unwrap().contains("Not a local file"));
+    assert!(
+        read["description"]
+            .as_str()
+            .unwrap()
+            .contains("PNG preview automatically")
+    );
+    let screenshot = tools
+        .iter()
+        .find(|t| t["name"] == "screenshot_url")
+        .unwrap();
+    assert!(
+        screenshot["parameters"]["properties"]["url"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Not a local file")
+    );
 }
 #[test]
 fn default_prompt_is_current_bounded_and_tracks_active_tools_and_model() {
@@ -115,7 +146,11 @@ fn evidence_recovery_and_verification_rules_remain_explicit() {
             "runtimeObservation",
         ],
     );
-    let p = format!("{} {}", registry.build_native_prompt(&input(), &json!({})).unwrap(), json!(registry.native_tools()));
+    let p = format!(
+        "{} {}",
+        registry.build_native_prompt(&input(), &json!({})).unwrap(),
+        json!(registry.native_tools())
+    );
     for rule in [
         "readCall/nextCall exactly",
         "action=retrieve",
@@ -139,25 +174,70 @@ fn evidence_recovery_and_verification_rules_remain_explicit() {
 fn native_interface_keeps_contracts_and_removes_conflicting_or_duplicate_instructions() {
     let mut registry = Registry::builtins().unwrap();
     ag1_core::tools::targets::register_visual_tools(&mut registry).unwrap();
-    activate(&mut registry, &["read", "edit", "editApply", "editPreview", "todo", "explore", "runtimeObservation", "artifact", "screenshot_url"]);
+    activate(
+        &mut registry,
+        &[
+            "read",
+            "edit",
+            "editApply",
+            "editPreview",
+            "todo",
+            "explore",
+            "runtimeObservation",
+            "artifact",
+            "screenshot_url",
+        ],
+    );
     let original = registry.public_tools();
     let native = registry.native_tools();
     for tool in &native {
         let public = original.iter().find(|t| t["name"] == tool["name"]).unwrap();
         let mut parameters = tool["parameters"].clone();
         // Effect annotations describe operations without changing argument validation.
-        assert!(parameters["$comment"].as_str().unwrap().contains("ag1Effects"));
+        assert!(
+            parameters["$comment"]
+                .as_str()
+                .unwrap()
+                .contains("ag1Effects")
+        );
         parameters.as_object_mut().unwrap().remove("$comment");
-        if tool["name"] == "artifact" { parameters["properties"]["releaseOnVerification"]["description"] = public["parameters"]["properties"]["releaseOnVerification"]["description"].clone(); }
-        if matches!(tool["name"].as_str().unwrap(), "check" | "artifact") { parameters["properties"].as_object_mut().unwrap().remove("verificationScope"); }
-        if matches!(tool["name"].as_str().unwrap(), "screenshot_url" | "interact_then_screenshot" | "verify_ui") {
-            parameters["properties"]["url"]["description"] = public["parameters"]["properties"]["url"]["description"].clone();
+        if tool["name"] == "artifact" {
+            parameters["properties"]["releaseOnVerification"]["description"] =
+                public["parameters"]["properties"]["releaseOnVerification"]["description"].clone();
         }
-        assert_eq!(parameters, public["parameters"], "Argument contract changed for {}", tool["name"]);
+        if matches!(tool["name"].as_str().unwrap(), "check" | "artifact") {
+            parameters["properties"]
+                .as_object_mut()
+                .unwrap()
+                .remove("verificationScope");
+        }
+        if matches!(
+            tool["name"].as_str().unwrap(),
+            "screenshot_url" | "interact_then_screenshot" | "verify_ui"
+        ) {
+            parameters["properties"]["url"]["description"] =
+                public["parameters"]["properties"]["url"]["description"].clone();
+        }
+        assert_eq!(
+            parameters, public["parameters"],
+            "Argument contract changed for {}",
+            tool["name"]
+        );
     }
-    let system = registry.build_native_prompt(&input(), &json!({"id":"fixture"})).unwrap();
-    let description = |name: &str| native.iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap();
-    assert_eq!(description("screenshot_url").matches("Inspect only the ready URL").count(), 1);
+    let system = registry
+        .build_native_prompt(&input(), &json!({"id":"fixture"}))
+        .unwrap();
+    let description = |name: &str| {
+        native.iter().find(|t| t["name"] == name).unwrap()["description"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(
+        description("screenshot_url")
+            .matches("Inspect only the ready URL")
+            .count(),
+        1
+    );
     assert!(description("screenshot_url").contains("preview status/start"));
     assert!(!system.contains("PNG preview automatically"));
     assert!(description("read").contains("PNG preview automatically"));
@@ -182,14 +262,28 @@ fn only_the_exact_legacy_desktop_default_migrates_to_current_guidance() {
     let mut configured = input();
     configured.custom_prompt = Some(legacy.into());
     let migrated = registry.build_native_prompt(&configured, &model).unwrap();
-    assert_eq!(migrated, registry.build_native_prompt(&input(), &model).unwrap());
+    assert_eq!(
+        migrated,
+        registry.build_native_prompt(&input(), &model).unwrap()
+    );
     assert!(migrated.contains("gpt-5.6-luna"));
     assert!(!migrated.contains("never repeat"));
     configured.custom_prompt = Some(format!("{legacy}\nMy deliberate custom rule."));
-    assert_eq!(registry.build_native_prompt(&configured, &model).unwrap(), registry.build_prompt(&configured).unwrap());
+    assert_eq!(
+        registry.build_native_prompt(&configured, &model).unwrap(),
+        registry.build_prompt(&configured).unwrap()
+    );
     // Measured rendered text, excluding unchanged argument schemas and source metadata.
     let names = registry.active_names();
-    let descriptions: usize = registry.native_tools().iter().filter(|t| names.iter().any(|n| t["name"] == *n))
-        .map(|t| t["description"].as_str().unwrap().len()).sum();
-    eprintln!("legacy_system_bytes={} current_system_bytes={} current_selected_description_bytes={descriptions}", legacy.len(), migrated.len());
+    let descriptions: usize = registry
+        .native_tools()
+        .iter()
+        .filter(|t| names.iter().any(|n| t["name"] == *n))
+        .map(|t| t["description"].as_str().unwrap().len())
+        .sum();
+    eprintln!(
+        "legacy_system_bytes={} current_system_bytes={} current_selected_description_bytes={descriptions}",
+        legacy.len(),
+        migrated.len()
+    );
 }

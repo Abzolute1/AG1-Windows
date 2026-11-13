@@ -13,18 +13,30 @@ unsafe extern "C" {
 /// overrides remain available; prefer the compositor's native Wayland clock.
 pub fn configure_environment() {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
-    let nvidia = std::fs::read_dir("/sys/class/drm").ok().into_iter().flatten().flatten()
-        .take(64).any(|entry| std::fs::read_to_string(entry.path().join("device/vendor")).is_ok_and(|v| v.trim() == "0x10de"));
+    let nvidia = std::fs::read_dir("/sys/class/drm")
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .take(64)
+        .any(|entry| {
+            std::fs::read_to_string(entry.path().join("device/vendor"))
+                .is_ok_and(|v| v.trim() == "0x10de")
+        });
     unsafe {
         if wayland && std::env::var_os("GDK_BACKEND").is_none() {
             std::env::set_var("GDK_BACKEND", "wayland,x11");
         }
-        if nvidia && std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none() && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        if nvidia
+            && std::env::var_os("WEBKIT_DMABUF_RENDERER_FORCE_SHM").is_none()
+            && std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none()
+        {
             // NVIDIA's DMA-BUF import path can disconnect the Wayland display.
             // Shared buffers retain WebKit compositing without that import path.
             std::env::set_var("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1");
         }
-        let candidate = wayland && std::env::var("GDK_BACKEND").is_ok_and(|v| v.split(',').next() == Some("wayland"))
+        let candidate = wayland
+            && std::env::var("GDK_BACKEND").is_ok_and(|v| v.split(',').next() == Some("wayland"))
             && std::env::var("AG1_DISABLE_DISPLAY_CLOCK_FALLBACK").as_deref() != Ok("1");
         ag1_frame_clock_initialize(i32::from(candidate));
     }
@@ -83,8 +95,11 @@ pub fn setup(app: &tauri::App) -> tauri::Result<()> {
         // Hyprland users manage window chrome in the compositor (e.g. hyprbars).
         // Tao adds a GTK header on Wayland, which otherwise duplicates that bar.
         // Keep native decorations elsewhere and allow an explicit local override.
-        let compositor_chrome = std::env::var("XDG_CURRENT_DESKTOP")
-            .is_ok_and(|value| value.split(':').any(|name| name.eq_ignore_ascii_case("Hyprland")));
+        let compositor_chrome = std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| {
+            value
+                .split(':')
+                .any(|name| name.eq_ignore_ascii_case("Hyprland"))
+        });
         let decorations = match std::env::var("AG1_NATIVE_TITLEBAR").as_deref() {
             Ok("1") => Some(true),
             Ok("0") => Some(false),

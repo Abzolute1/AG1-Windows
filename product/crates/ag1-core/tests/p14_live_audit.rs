@@ -197,7 +197,7 @@ fn programming_years_do_not_create_current_events_intent() {
         "intent":"current_events","status":"rich","authoritative":true,
         "coverage":{"kind":"docs","present":["signature"],"missing":["parameters"],"score":1}
     })).unwrap();
-    let text=ag1_core::tools::research::fetch_transcript(&input);
+    let text = ag1_core::tools::research::fetch_transcript(&input);
     assert!(!text.contains("Answer from it now"));
     assert!(text.contains("does not establish completion of the active task"));
 }

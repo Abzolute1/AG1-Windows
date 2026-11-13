@@ -17,11 +17,17 @@ fn changing_working_state_preserves_all_earlier_messages_across_tool_rounds() {
     let first = context::append_working_state(&journal, Some("working-state: current")).unwrap();
     let first_provider = messages::to_provider(&first).unwrap();
     assert_eq!(journal, first_journal);
-    assert_eq!(&first_provider[..journal.len() - 1], &journal[..journal.len() - 1]);
+    assert_eq!(
+        &first_provider[..journal.len() - 1],
+        &journal[..journal.len() - 1]
+    );
     assert_eq!(first_provider.len(), journal.len());
     assert_eq!(first_provider.last().unwrap()["role"], "toolResult");
     assert_eq!(first_provider.last().unwrap()["toolCallId"], "read-1");
-    assert_eq!(first_provider.last().unwrap()["content"][0], journal.last().unwrap()["content"][0]);
+    assert_eq!(
+        first_provider.last().unwrap()["content"][0],
+        journal.last().unwrap()["content"][0]
+    );
 
     journal.extend(tool_round("read-2"));
     let second_journal = journal.clone();
@@ -36,9 +42,18 @@ fn changing_working_state_preserves_all_earlier_messages_across_tool_rounds() {
         &second_provider[..first_journal.len() - 1],
         &first_provider[..first_journal.len() - 1]
     );
-    assert_eq!(&second_provider[..journal.len() - 1], &journal[..journal.len() - 1]);
+    assert_eq!(
+        &second_provider[..journal.len() - 1],
+        &journal[..journal.len() - 1]
+    );
     assert_eq!(second_provider.len(), journal.len());
-    assert_eq!(second_provider.iter().filter(|m| m["role"] == "user").count(), 1);
+    assert_eq!(
+        second_provider
+            .iter()
+            .filter(|m| m["role"] == "user")
+            .count(),
+        1
+    );
     assert_eq!(second_provider.last().unwrap()["toolCallId"], "read-2");
     assert!(ag1_core::context::retry::complete_pairs(&second_provider));
     for at in [1, 3] {

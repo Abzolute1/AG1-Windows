@@ -3,7 +3,10 @@
 use super::*;
 pub(super) fn is_effect(command: &w::Command) -> bool {
     match command {
-        w::Command::Files { action, .. } => matches!(action.as_str(), "save" | "change_undo" | "change_undo_recover" | "git_confirm"),
+        w::Command::Files { action, .. } => matches!(
+            action.as_str(),
+            "save" | "change_undo" | "change_undo_recover" | "git_confirm"
+        ),
         w::Command::Session { action, .. } => action == "export",
         w::Command::Project { action, .. } => {
             matches!(action.as_str(), "start" | "stop" | "discover")
@@ -44,18 +47,25 @@ impl Host {
             };
         }
         let result = (match &envelope.command {
-            w::Command::Files {action,args} if action=="git_confirm"=>self.local_git_confirm(args).map(Some),
-            w::Command::Files {action,args} if action == "change_undo" || action == "change_undo_recover" => self.change_undo(args, action == "change_undo_recover").map(Some),
+            w::Command::Files { action, args } if action == "git_confirm" => {
+                self.local_git_confirm(args).map(Some)
+            }
+            w::Command::Files { action, args }
+                if action == "change_undo" || action == "change_undo_recover" =>
+            {
+                self.change_undo(args, action == "change_undo_recover")
+                    .map(Some)
+            }
             _ => self.query(&envelope.command),
         })
-            .and_then(|v| v.ok_or(DomainError::NotFound))
-            .and_then(|data| {
-                if serde_json::to_vec(&data).map_err(json_error)?.len() > 48000 {
-                    Err(DomainError::LimitExceeded("Client effect receipt".into()))
-                } else {
-                    Ok(data)
-                }
-            });
+        .and_then(|v| v.ok_or(DomainError::NotFound))
+        .and_then(|data| {
+            if serde_json::to_vec(&data).map_err(json_error)?.len() > 48000 {
+                Err(DomainError::LimitExceeded("Client effect receipt".into()))
+            } else {
+                Ok(data)
+            }
+        });
         let (status, data) = match result {
             Ok(data) => ("completed", data),
             Err(error) => ("rejected", json!({"error":format!("{error:?}")})),

@@ -20,11 +20,15 @@ impl Host {
                 let resources = self.resources()?;
                 if text.starts_with("/skill:") {
                     let prompt = crate::session::NativeSession::client_prompt(
-                        self.working_workspace()?.as_ref(), &timestamp(), &resources,
+                        self.working_workspace()?.as_ref(),
+                        &timestamp(),
+                        &resources,
                         ag1_core::tools::registry::Registry::builtins()?,
                     )?;
                     return Ok(w::Command::Prompt {
-                        input: w::PromptInput::Inline { text: prompt.expand_skill(text)? },
+                        input: w::PromptInput::Inline {
+                            text: prompt.expand_skill(text)?,
+                        },
                     });
                 }
                 let (name, arguments) = text

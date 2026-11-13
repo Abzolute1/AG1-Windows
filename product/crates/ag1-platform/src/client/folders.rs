@@ -67,8 +67,15 @@ impl Host {
             .folder_access()
             .ok_or(DomainError::NotFound)?;
         if args.get("action").is_some() {
-            if self.terminal.lock().map_err(|_|DomainError::Conflict)?.is_some() {
-                return Err(DomainError::Unavailable("Close this chat's terminal before changing folders".into()));
+            if self
+                .terminal
+                .lock()
+                .map_err(|_| DomainError::Conflict)?
+                .is_some()
+            {
+                return Err(DomainError::Unavailable(
+                    "Close this chat's terminal before changing folders".into(),
+                ));
             }
             if !self.commands.snapshot()?.queued.is_empty()
                 || !selected.services.runtime().settled()?

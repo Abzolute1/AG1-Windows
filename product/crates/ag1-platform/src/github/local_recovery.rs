@@ -133,7 +133,9 @@ impl LocalGit {
         preview["repository"] = args["repo"].clone();
         let mut preview = preview;
         preview["metadata"] = self.metadata()?.identity();
-        if action=="recover" {preview["storage"]=self.storage_admit(action,c)?;}
+        if action == "recover" {
+            preview["storage"] = self.storage_admit(action, c)?;
+        }
         let mut plan = LocalPlan {
             action: action.into(),
             args: args.clone(),
@@ -189,8 +191,7 @@ impl LocalGit {
         {
             return Err(DomainError::Conflict);
         }
-        let config = self.metadata_snapshot(".git/config", 1024 * 1024)?
-            .revision;
+        let config = self.metadata_snapshot(".git/config", 1024 * 1024)?.revision;
         if config != revision(&record.value["config_before"])? {
             return Err(DomainError::Conflict);
         }
@@ -289,7 +290,8 @@ impl LocalGit {
         let mut unmodified = Vec::new();
         for (path, (i, row, before, after)) in &versions {
             c.check()?;
-            self.authority(true)?;self.storage_check(c)?;
+            self.authority(true)?;
+            self.storage_check(c)?;
             let wanted = if restore { before } else { after };
             let parent = Path::new(path)
                 .ancestors()
@@ -470,14 +472,13 @@ impl LocalGit {
         c: &ScanControl<'_>,
     ) -> Result<Value> {
         c.check()?;
-        self.authority(true)?;self.storage_check(c)?;
+        self.authority(true)?;
+        self.storage_check(c)?;
         self.transition_idle()?;
         if self.state(c)? != (plan.head.clone(), plan.branch.clone())
             || self.index()?.as_ref().map(|(_, r)| r) != plan.index.as_ref().map(|(_, r)| r)
-            || Some(
-                self.metadata_snapshot(".git/config", 1024 * 1024)?
-                    .revision,
-            ) != plan.config_revision
+            || Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision)
+                != plan.config_revision
         {
             return Err(DomainError::Conflict);
         }
@@ -504,7 +505,8 @@ impl LocalGit {
         let lease = Arc::new(repair.record.acquire(self)?);
         let check = || -> Result<()> {
             c.check()?;
-            self.authority(true)?;self.storage_check(c)?;
+            self.authority(true)?;
+            self.storage_check(c)?;
             self.workspace.verify_root()?;
             lease.verify()?;
             repair.record.verify(self)

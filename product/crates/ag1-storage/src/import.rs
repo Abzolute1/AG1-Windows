@@ -13,8 +13,31 @@ use std::{
     collections::BTreeSet,
     fs::{self, File},
     io::{Read, Write},
-    path::Path,
+    path::{Component, Path},
 };
+
+fn frozen_relative(source: &Path, path: &Path) -> StorageResult<String> {
+    let relative = path
+        .strip_prefix(source)
+        .map_err(|_| StorageError::Invalid("Frozen source root".into()))?;
+    // Frozen manifests deliberately use '/' on every platform. `Path::to_str`
+    // would turn the same Windows directory into backslash-separated names and
+    // make an otherwise complete manifest look incomplete.
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(StorageError::Invalid("Unsafe frozen source path".into()));
+        };
+        parts.push(
+            name.to_str()
+                .ok_or_else(|| StorageError::Invalid("Non-UTF8 source path".into()))?,
+        );
+    }
+    if parts.is_empty() {
+        return Err(StorageError::Invalid("Frozen source path".into()));
+    }
+    Ok(parts.join("/"))
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -260,12 +283,7 @@ impl FrozenManifest {
                         return Err(StorageError::Invalid("Non-file frozen input".into()));
                     }
                     let path = item.path();
-                    let relative = path
-                        .strip_prefix(source)
-                        .map_err(|_| StorageError::Invalid("Frozen source root".into()))?
-                        .to_str()
-                        .ok_or_else(|| StorageError::Invalid("Non-UTF8 source path".into()))?
-                        .to_owned();
+                    let relative = frozen_relative(source, &path)?;
                     actual.insert(relative);
                     if actual.len() > 100_000 {
                         return Err(StorageError::Limit("Frozen source file count".into()));
@@ -537,7 +555,8 @@ impl Store {
                 return Err(StorageError::Corrupt("Lease scope/version".into()));
             }
             for lease in leases {
-                ag1_core::tools::verification::scope(lease).map_err(|_| StorageError::Corrupt("Lease verification scope".into()))?;
+                ag1_core::tools::verification::scope(lease)
+                    .map_err(|_| StorageError::Corrupt("Lease verification scope".into()))?;
                 let stamp = |key: &str| -> StorageResult<u64> {
                     let s = lease[key]
                         .as_str()
@@ -918,14 +937,39 @@ impl Store {
             }
             write("bridge/metadata.json", &serde_json::to_vec(&index)?)?;
         }
-        let sqlite = fs::read(temp.path().join("storage.sqlite"))?;
-        File::open(temp.path().join("storage.sqlite"))?.sync_all()?;
+        let sqlite_path = temp.path().join("storage.sqlite");
+        let sqlite = fs::read(&sqlite_path).map_err(|error| {
+            StorageError::Io(std::io::Error::other(format!(
+                "Read exported SQLite database {}: {error}",
+                sqlite_path.display(),
+            )))
+        })?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&sqlite_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                StorageError::Io(std::io::Error::other(format!(
+                    "Sync exported SQLite database {}: {error}",
+                    sqlite_path.display(),
+                )))
+            })?;
         files.push(json!({"path":"storage.sqlite","sha256":digest(&sqlite),"bytes":sqlite.len()}));
         let schema: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let manifest = json!({"version":1,"kind":"ag1-shadow-lossless-export","schema":schema,"compatible_resume":safe,"bridge_compatible_resume":structural,"runtime_authority":"historical-only","files":files});
-        let mut f = File::create(temp.path().join("export.json"))?;
+        let manifest_path = temp.path().join("export.json");
+        let mut f = File::create(&manifest_path)?;
         f.write_all(&serde_json::to_vec_pretty(&manifest)?)?;
-        f.sync_all()?;
+        f.sync_all().map_err(|error| {
+            StorageError::Io(std::io::Error::other(format!(
+                "Sync export manifest {}: {error}",
+                manifest_path.display(),
+            )))
+        })?;
+        // Windows cannot rename the staging directory while this child file is
+        // still open without delete sharing. Close it after the durable write.
+        drop(f);
         sync_tree(temp.path())?;
         self.hit(Boundary::BeforeRename)?;
         crate::persistence::publish_directory(temp.path(), destination)?;

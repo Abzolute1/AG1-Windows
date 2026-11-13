@@ -115,7 +115,11 @@ pub trait GenerationRuntime: Send + Sync {
     /// Explicit host request: prepare resident weights without generating a message.
     /// The caller must hold the shared local endpoint scheduler permit.
     fn load_model<'a>(&'a self, _model: &'a str) -> ag1_core::PortFuture<'a, ()> {
-        Box::pin(async { Err(DomainError::Unavailable("Manual model loading is unavailable".into())) })
+        Box::pin(async {
+            Err(DomainError::Unavailable(
+                "Manual model loading is unavailable".into(),
+            ))
+        })
     }
     /// Advisory UI phase, independent of the blocking model-loading lock.
     fn progress(&self) -> Option<serde_json::Value> {

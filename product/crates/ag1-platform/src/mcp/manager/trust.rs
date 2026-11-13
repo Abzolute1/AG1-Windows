@@ -40,9 +40,11 @@ pub(super) fn target_digest(
     // The definition contains the exact public endpoint/launch/provenance. The
     // executable and cwd pins distinguish same-path replacement on reconnect.
     // Dependencies are mutable host-account code, explicitly disclosed at launch.
-    digest(&json!({"draft":record.draft,"localAccess":record.local_access,"local":local.map(|p|json!({
-        "executableSha256":p.executable_hash,"executableIdentity":p.executable_identity,"cwdIdentity":p.cwd_identity
-    }))}))
+    digest(
+        &json!({"draft":record.draft,"localAccess":record.local_access,"local":local.map(|p|json!({
+            "executableSha256":p.executable_hash,"executableIdentity":p.executable_identity,"cwdIdentity":p.cwd_identity
+        }))}),
+    )
 }
 fn scope(scope: &CatalogScope) -> CoreScope {
     match scope {

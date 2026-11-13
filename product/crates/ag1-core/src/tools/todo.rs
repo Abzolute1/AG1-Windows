@@ -117,8 +117,14 @@ pub fn prepare(
         (Some(next), text, details)
     } else {
         let state = current.as_ref().unwrap_or(&empty);
-        (None, format!("Current todo list (reuse these IDs when updating): {}", state["items"]),
-            json!({"todos":state["items"],"planId":state["planId"],"phase":state["phase"]}))
+        (
+            None,
+            format!(
+                "Current todo list (reuse these IDs when updating): {}",
+                state["items"]
+            ),
+            json!({"todos":state["items"],"planId":state["planId"],"phase":state["phase"]}),
+        )
     };
     let mut records = vec![];
     if archive

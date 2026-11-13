@@ -55,7 +55,11 @@ fn crash(path: &Path, point: Boundary, operation: &str) -> StorageResult<()> {
     }
     if point == Boundary::AfterAck {
         fs::write(path.join("delivered-ack"), b"accepted durable API return\n")?;
-        fs::File::open(path.join("delivered-ack"))?.sync_all()?;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.join("delivered-ack"))?
+            .sync_all()?;
         std::process::exit(91);
     }
     Err(StorageError::Invalid(

@@ -97,12 +97,19 @@ impl StoragePort for Store {
         {
             return Err(DomainError::PermissionDenied);
         }
-        let origin = self.artifact_origin(session, &record.arguments.id).map_err(domain_error)?;
-        let arguments = self.execution_artifact_bytes(session, &origin, &record.arguments.id, 8 * 1024 * 1024).map_err(domain_error)?;
-        if crate::digest(&arguments) != record.arguments.sha256 || arguments.len() as u64 != record.arguments.bytes {
+        let origin = self
+            .artifact_origin(session, &record.arguments.id)
+            .map_err(domain_error)?;
+        let arguments = self
+            .execution_artifact_bytes(session, &origin, &record.arguments.id, 8 * 1024 * 1024)
+            .map_err(domain_error)?;
+        if crate::digest(&arguments) != record.arguments.sha256
+            || arguments.len() as u64 != record.arguments.bytes
+        {
             return Err(DomainError::Conflict);
         }
-        let args: serde_json::Value = serde_json::from_slice(&arguments).map_err(|_| DomainError::InvalidInput("verified check arguments".into()))?;
+        let args: serde_json::Value = serde_json::from_slice(&arguments)
+            .map_err(|_| DomainError::InvalidInput("verified check arguments".into()))?;
         let scope = ag1_core::tools::verification::scope(&args)?;
         self.save_metadata_with_verification(
             "tool-operation",

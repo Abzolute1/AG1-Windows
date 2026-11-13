@@ -44,7 +44,10 @@ impl Toolchains {
                 "CARGO_HOME".into(),
                 workspace.join("target/ag1-cargo").display().to_string(),
             ),
-            ("CARGO_TARGET_DIR".into(), workspace.join("target").display().to_string()),
+            (
+                "CARGO_TARGET_DIR".into(),
+                workspace.join("target").display().to_string(),
+            ),
             ("RUSTUP_AUTO_INSTALL".into(), "0".into()),
             ("RUSTUP_NO_UPDATE_CHECK".into(), "1".into()),
         ]);

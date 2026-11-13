@@ -157,7 +157,10 @@ impl Workspace {
                     .starts_with(".ag1-git-recovery-")
             });
         let same_root = self.directory_identity() == backup_workspace.directory_identity();
-        if (same_root && name == recovery) || !(central || (same_root && sibling)) || self.directory_identity().0 != backup_workspace.directory_identity().0 {
+        if (same_root && name == recovery)
+            || !(central || (same_root && sibling))
+            || self.directory_identity().0 != backup_workspace.directory_identity().0
+        {
             return Err(DomainError::PermissionDenied);
         }
         if let Some(next) = replacement {
@@ -172,7 +175,11 @@ impl Workspace {
             }
         }
         let _claim = self.claim()?;
-        let _backup_claim = if same_root { None } else { Some(backup_workspace.claim()?) };
+        let _backup_claim = if same_root {
+            None
+        } else {
+            Some(backup_workspace.claim()?)
+        };
         if self.git_snapshot(name)?.as_ref() != expected || backup_workspace.exists(recovery)? {
             return Err(DomainError::Conflict);
         }
@@ -290,7 +297,9 @@ impl Workspace {
                     check(UndoStage::AfterMove)?;
                     parent.verify_identity()?;
                     recovery_parent.verify_identity()?;
-                    backup_workspace.git_snapshot(recovery)?.ok_or(DomainError::Conflict)
+                    backup_workspace
+                        .git_snapshot(recovery)?
+                        .ok_or(DomainError::Conflict)
                 })()
                 .map_err(|_| DomainError::DurabilityUnknown)?;
                 let mut comparable = moved.clone();
@@ -391,19 +400,78 @@ mod tests {
     }
     #[test]
     fn git_metadata_publication_retains_exact_inode_in_separately_bound_worktree_root() {
-        let temp=tempfile::tempdir().unwrap();
-        for name in ["metadata","worktree"] { std::fs::create_dir(temp.path().join(name)).unwrap(); }
-        let service=WorkspaceService::new().unwrap();let metadata=service.register(&temp.path().join("metadata")).unwrap();let worktree=service.register(&temp.path().join("worktree")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["metadata", "worktree"] {
+            std::fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let service = WorkspaceService::new().unwrap();
+        let metadata = service.register(&temp.path().join("metadata")).unwrap();
+        let worktree = service.register(&temp.path().join("worktree")).unwrap();
         std::fs::create_dir(worktree.root().join(".ag1-git-recovery-owned")).unwrap();
-        std::fs::write(metadata.root().join("index"),b"original index").unwrap();let before=metadata.git_snapshot("index").unwrap().unwrap();
-        let after=GitEntry{bytes:b"reviewed index".to_vec(),mode:0o100644};
-        metadata.publish_git_entry_to_checked("index",Some(&before),Some(&after),&worktree,".ag1-git-recovery-owned/index",|_|Ok(())).unwrap();
-        let retained=worktree.git_snapshot(".ag1-git-recovery-owned/index").unwrap().unwrap();assert_eq!(retained.entry,before.entry);assert_eq!(retained.revision.inode,before.revision.inode);assert_eq!(metadata.git_snapshot("index").unwrap().unwrap().entry,after);
-        let current=metadata.git_snapshot("index").unwrap().unwrap();
-        assert!(metadata.publish_git_entry_to_checked("index",Some(&current),None,&worktree,".ag1-git-recovery-owned/index",|_|Ok(())).is_err());
-        assert_eq!(metadata.git_snapshot("index").unwrap().unwrap(),current);
-        let result=metadata.publish_git_entry_to_checked("index",Some(&current),None,&worktree,".ag1-git-recovery-owned/later",|stage| {if stage==UndoStage::BeforeMove {std::fs::write(metadata.root().join("index"),b"later writer").unwrap();}Ok(())});
-        assert_eq!(result,Err(DomainError::Conflict));assert_eq!(std::fs::read(metadata.root().join("index")).unwrap(),b"later writer");assert!(!worktree.root().join(".ag1-git-recovery-owned/later").exists());
+        std::fs::write(metadata.root().join("index"), b"original index").unwrap();
+        let before = metadata.git_snapshot("index").unwrap().unwrap();
+        let after = GitEntry {
+            bytes: b"reviewed index".to_vec(),
+            mode: 0o100644,
+        };
+        metadata
+            .publish_git_entry_to_checked(
+                "index",
+                Some(&before),
+                Some(&after),
+                &worktree,
+                ".ag1-git-recovery-owned/index",
+                |_| Ok(()),
+            )
+            .unwrap();
+        let retained = worktree
+            .git_snapshot(".ag1-git-recovery-owned/index")
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.entry, before.entry);
+        assert_eq!(retained.revision.inode, before.revision.inode);
+        assert_eq!(
+            metadata.git_snapshot("index").unwrap().unwrap().entry,
+            after
+        );
+        let current = metadata.git_snapshot("index").unwrap().unwrap();
+        assert!(
+            metadata
+                .publish_git_entry_to_checked(
+                    "index",
+                    Some(&current),
+                    None,
+                    &worktree,
+                    ".ag1-git-recovery-owned/index",
+                    |_| Ok(())
+                )
+                .is_err()
+        );
+        assert_eq!(metadata.git_snapshot("index").unwrap().unwrap(), current);
+        let result = metadata.publish_git_entry_to_checked(
+            "index",
+            Some(&current),
+            None,
+            &worktree,
+            ".ag1-git-recovery-owned/later",
+            |stage| {
+                if stage == UndoStage::BeforeMove {
+                    std::fs::write(metadata.root().join("index"), b"later writer").unwrap();
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(DomainError::Conflict));
+        assert_eq!(
+            std::fs::read(metadata.root().join("index")).unwrap(),
+            b"later writer"
+        );
+        assert!(
+            !worktree
+                .root()
+                .join(".ag1-git-recovery-owned/later")
+                .exists()
+        );
     }
     #[test]
     fn checked_git_chmod_retains_owned_postimage_and_rejects_later_writers() {

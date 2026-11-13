@@ -71,7 +71,10 @@ pub fn validate_lifecycle(current: &[Value], next: &[Value]) -> Result<(), Domai
         if new["title"] != old["title"]
             || old["status"] == "completed" && new["status"] != "completed"
         {
-            return Err(invalid(&format!("Todo {} must retain its title and completed status. Query todo with no arguments and update only the intended statuses; use an explicit new-plan for new work.", old["id"])));
+            return Err(invalid(&format!(
+                "Todo {} must retain its title and completed status. Query todo with no arguments and update only the intended statuses; use an explicit new-plan for new work.",
+                old["id"]
+            )));
         }
     }
     if next

@@ -190,6 +190,13 @@ impl Store {
                 header["parentSession"] = parent.into();
                 header["version"] = 3.into();
                 header["timestamp"] = timestamp.into();
+                // AG1W records its context-artifact owner in the header. A
+                // fork has its own origin row, so keeping the parent's value
+                // would make a later Windows resume ask for an owner that
+                // belongs to another session.
+                if header["ag1wOrigin"].is_string() {
+                    header["ag1wOrigin"] = input.origin.into();
+                }
                 let closure = (!branch.is_empty()).then_some(parent);
                 (serde_json::to_vec(&header)?, branch, closure)
             }

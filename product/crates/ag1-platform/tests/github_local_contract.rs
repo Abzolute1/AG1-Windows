@@ -41,73 +41,225 @@ struct Fixture {
 
 #[test]
 fn reviewed_checkout_preserves_unrelated_dirty_and_staged_bytes_and_retains_recovery() {
-    use std::os::unix::fs::{symlink,PermissionsExt};
-    let f=Fixture::new();let root=f.root();let original_branch=git(&root,&["branch","--show-current"]).trim().to_string();
-    std::fs::write(root.join("keep.txt"),b"baseline keep\n").unwrap();git(&root,&["add","keep.txt"]);git(&root,&["commit","--quiet","-m","unrelated baseline"]);
-    let original=git(&root,&["rev-parse","HEAD"]).trim().to_string();
-    git(&root,&["checkout","--quiet","-b","reviewed"]);
-    std::fs::write(root.join("notes.txt"),b"target\r\n\0\xff").unwrap();
-    std::fs::write(root.join("run.sh"),b"#!/bin/sh\nexit 0\n").unwrap();std::fs::set_permissions(root.join("run.sh"),std::fs::Permissions::from_mode(0o755)).unwrap();
-    symlink("notes.txt",root.join("link")).unwrap();git(&root,&["add","--all"]);git(&root,&["commit","--quiet","-m","target"]);
-    let target=git(&root,&["rev-parse","HEAD"]).trim().to_string();git(&root,&["checkout","--quiet",&original_branch]);
-    std::fs::write(root.join("keep.txt"),b"unrelated staged\n").unwrap();git(&root,&["add","keep.txt"]);std::fs::write(root.join("keep.txt"),b"later unrelated work\r\n").unwrap();
-    std::fs::write(root.join("untracked.txt"),b"untracked preserved").unwrap();
-    let config=std::fs::read(root.join(".git/config")).unwrap();let index=std::fs::read(root.join(".git/index")).unwrap();
-    let plan=f.local.prepare("checkout",&json!({"repo":"owned/repo","branch":"reviewed","target_sha":target}),"scope",&f.control()).unwrap();
-    let recovery=std::path::PathBuf::from(plan.preview()["recovery_path"].as_str().unwrap());
-    assert!(!recovery.exists());assert_eq!(git(&root,&["rev-parse","HEAD"]).trim(),original);assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),index);
-    let result=f.local.execute(plan,"scope",&f.control()).unwrap();assert_eq!(result["outcome"],"applied");
-    assert_eq!(git(&root,&["branch","--show-current"]).trim(),"reviewed");assert_eq!(git(&root,&["rev-parse","HEAD"]).trim(),target);
-    assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(),b"target\r\n\0\xff");assert_eq!(std::fs::read_link(root.join("link")).unwrap(),Path::new("notes.txt"));
-    assert_ne!(std::fs::metadata(root.join("run.sh")).unwrap().permissions().mode()&0o111,0);
-    assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(),b"later unrelated work\r\n");assert_eq!(git(&root,&["show",":keep.txt"]),"unrelated staged\n");
-    assert_eq!(std::fs::read(root.join("untracked.txt")).unwrap(),b"untracked preserved");assert_eq!(std::fs::read(root.join(".git/config")).unwrap(),config);
-    assert_eq!(std::fs::read(recovery.join("index-before")).unwrap(),index);assert!(recovery.join("completed.json").exists());
-    assert!(!root.join(".git/index.lock").exists());assert!(!root.join(".git/HEAD.lock").exists());
-    let back=f.local.prepare("checkout",&json!({"repo":"owned/repo","branch":original_branch,"target_sha":original}),"scope",&f.control()).unwrap();
-    f.local.execute(back,"scope",&f.control()).unwrap();assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(),b"original\n");assert!(!root.join("link").exists());
-    assert_eq!(std::fs::read(root.join("keep.txt")).unwrap(),b"later unrelated work\r\n");assert_eq!(git(&root,&["show",":keep.txt"]),"unrelated staged\n");
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let f = Fixture::new();
+    let root = f.root();
+    let original_branch = git(&root, &["branch", "--show-current"]).trim().to_string();
+    std::fs::write(root.join("keep.txt"), b"baseline keep\n").unwrap();
+    git(&root, &["add", "keep.txt"]);
+    git(&root, &["commit", "--quiet", "-m", "unrelated baseline"]);
+    let original = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&root, &["checkout", "--quiet", "-b", "reviewed"]);
+    std::fs::write(root.join("notes.txt"), b"target\r\n\0\xff").unwrap();
+    std::fs::write(root.join("run.sh"), b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(root.join("run.sh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink("notes.txt", root.join("link")).unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "--quiet", "-m", "target"]);
+    let target = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&root, &["checkout", "--quiet", &original_branch]);
+    std::fs::write(root.join("keep.txt"), b"unrelated staged\n").unwrap();
+    git(&root, &["add", "keep.txt"]);
+    std::fs::write(root.join("keep.txt"), b"later unrelated work\r\n").unwrap();
+    std::fs::write(root.join("untracked.txt"), b"untracked preserved").unwrap();
+    let config = std::fs::read(root.join(".git/config")).unwrap();
+    let index = std::fs::read(root.join(".git/index")).unwrap();
+    let plan = f
+        .local
+        .prepare(
+            "checkout",
+            &json!({"repo":"owned/repo","branch":"reviewed","target_sha":target}),
+            "scope",
+            &f.control(),
+        )
+        .unwrap();
+    let recovery = std::path::PathBuf::from(plan.preview()["recovery_path"].as_str().unwrap());
+    assert!(!recovery.exists());
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]).trim(), original);
+    assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+    let result = f.local.execute(plan, "scope", &f.control()).unwrap();
+    assert_eq!(result["outcome"], "applied");
+    assert_eq!(git(&root, &["branch", "--show-current"]).trim(), "reviewed");
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]).trim(), target);
+    assert_eq!(
+        std::fs::read(root.join("notes.txt")).unwrap(),
+        b"target\r\n\0\xff"
+    );
+    assert_eq!(
+        std::fs::read_link(root.join("link")).unwrap(),
+        Path::new("notes.txt")
+    );
+    assert_ne!(
+        std::fs::metadata(root.join("run.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.join("keep.txt")).unwrap(),
+        b"later unrelated work\r\n"
+    );
+    assert_eq!(git(&root, &["show", ":keep.txt"]), "unrelated staged\n");
+    assert_eq!(
+        std::fs::read(root.join("untracked.txt")).unwrap(),
+        b"untracked preserved"
+    );
+    assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+    assert_eq!(std::fs::read(recovery.join("index-before")).unwrap(), index);
+    assert!(recovery.join("completed.json").exists());
+    assert!(!root.join(".git/index.lock").exists());
+    assert!(!root.join(".git/HEAD.lock").exists());
+    let back = f
+        .local
+        .prepare(
+            "checkout",
+            &json!({"repo":"owned/repo","branch":original_branch,"target_sha":original}),
+            "scope",
+            &f.control(),
+        )
+        .unwrap();
+    f.local.execute(back, "scope", &f.control()).unwrap();
+    assert_eq!(
+        std::fs::read(root.join("notes.txt")).unwrap(),
+        b"original\n"
+    );
+    assert!(!root.join("link").exists());
+    assert_eq!(
+        std::fs::read(root.join("keep.txt")).unwrap(),
+        b"later unrelated work\r\n"
+    );
+    assert_eq!(git(&root, &["show", ":keep.txt"]), "unrelated staged\n");
 }
 
 #[test]
 fn checkout_handles_directory_transitions_without_discarding_untracked_collisions() {
-    let f=Fixture::new();let root=f.root();let branch=git(&root,&["branch","--show-current"]).trim().to_string();
-    std::fs::create_dir_all(root.join("folder/nested")).unwrap();std::fs::write(root.join("folder/nested/old"),b"old nested").unwrap();std::fs::write(root.join("plain"),b"old plain").unwrap();
-    git(&root,&["add","--all"]);git(&root,&["commit","--quiet","-m","directory baseline"]);let from=git(&root,&["rev-parse","HEAD"]).trim().to_string();
-    git(&root,&["checkout","--quiet","-b","shape"]);git(&root,&["rm","-r","--quiet","folder","plain"]);
-    std::fs::write(root.join("folder"),b"new file").unwrap();std::fs::create_dir(root.join("plain")).unwrap();std::fs::write(root.join("plain/new"),b"new nested").unwrap();
-    git(&root,&["add","--all"]);git(&root,&["commit","--quiet","-m","shape target"]);let target=git(&root,&["rev-parse","HEAD"]).trim().to_string();git(&root,&["checkout","--quiet",&branch]);
-    let args=json!({"repo":"owned/repo","branch":"shape","target_sha":target});
-    std::fs::write(root.join("folder/ignored-user"),b"keep me").unwrap();
-    assert!(f.local.prepare("checkout",&args,"scope",&f.control()).is_err());assert_eq!(git(&root,&["rev-parse","HEAD"]).trim(),from);
-    assert_eq!(std::fs::read(root.join("folder/nested/old")).unwrap(),b"old nested");
+    let f = Fixture::new();
+    let root = f.root();
+    let branch = git(&root, &["branch", "--show-current"]).trim().to_string();
+    std::fs::create_dir_all(root.join("folder/nested")).unwrap();
+    std::fs::write(root.join("folder/nested/old"), b"old nested").unwrap();
+    std::fs::write(root.join("plain"), b"old plain").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "--quiet", "-m", "directory baseline"]);
+    let from = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&root, &["checkout", "--quiet", "-b", "shape"]);
+    git(&root, &["rm", "-r", "--quiet", "folder", "plain"]);
+    std::fs::write(root.join("folder"), b"new file").unwrap();
+    std::fs::create_dir(root.join("plain")).unwrap();
+    std::fs::write(root.join("plain/new"), b"new nested").unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "--quiet", "-m", "shape target"]);
+    let target = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+    git(&root, &["checkout", "--quiet", &branch]);
+    let args = json!({"repo":"owned/repo","branch":"shape","target_sha":target});
+    std::fs::write(root.join("folder/ignored-user"), b"keep me").unwrap();
+    assert!(
+        f.local
+            .prepare("checkout", &args, "scope", &f.control())
+            .is_err()
+    );
+    assert_eq!(git(&root, &["rev-parse", "HEAD"]).trim(), from);
+    assert_eq!(
+        std::fs::read(root.join("folder/nested/old")).unwrap(),
+        b"old nested"
+    );
     std::fs::remove_file(root.join("folder/ignored-user")).unwrap();
-    let plan=f.local.prepare("checkout",&args,"scope",&f.control()).unwrap();f.local.execute(plan,"scope",&f.control()).unwrap();
-    assert_eq!(std::fs::read(root.join("folder")).unwrap(),b"new file");assert_eq!(std::fs::read(root.join("plain/new")).unwrap(),b"new nested");
+    let plan = f
+        .local
+        .prepare("checkout", &args, "scope", &f.control())
+        .unwrap();
+    f.local.execute(plan, "scope", &f.control()).unwrap();
+    assert_eq!(std::fs::read(root.join("folder")).unwrap(), b"new file");
+    assert_eq!(
+        std::fs::read(root.join("plain/new")).unwrap(),
+        b"new nested"
+    );
 }
 
 #[test]
 fn checkout_rechecks_files_index_target_scope_cancellation_worktrees_and_foreign_locks() {
     use std::sync::atomic::Ordering;
-    for changed in ["file","index","target","scope","cancel","worktree","head_lock"] {
-        let f=Fixture::new();let root=f.root();let branch=git(&root,&["branch","--show-current"]).trim().to_string();let from=git(&root,&["rev-parse","HEAD"]).trim().to_string();
-        git(&root,&["checkout","--quiet","-b","target"]);std::fs::write(root.join("notes.txt"),b"target\n").unwrap();git(&root,&["add","notes.txt"]);git(&root,&["commit","--quiet","-m","target"]);
-        let target=git(&root,&["rev-parse","HEAD"]).trim().to_string();git(&root,&["checkout","--quiet",&branch]);
-        let plan=f.local.prepare("checkout",&json!({"repo":"owned/repo","branch":"target","target_sha":target}),"scope",&f.control()).unwrap();
-        let recovery=std::path::PathBuf::from(plan.preview()["recovery_path"].as_str().unwrap());
+    for changed in [
+        "file",
+        "index",
+        "target",
+        "scope",
+        "cancel",
+        "worktree",
+        "head_lock",
+    ] {
+        let f = Fixture::new();
+        let root = f.root();
+        let branch = git(&root, &["branch", "--show-current"]).trim().to_string();
+        let from = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+        git(&root, &["checkout", "--quiet", "-b", "target"]);
+        std::fs::write(root.join("notes.txt"), b"target\n").unwrap();
+        git(&root, &["add", "notes.txt"]);
+        git(&root, &["commit", "--quiet", "-m", "target"]);
+        let target = git(&root, &["rev-parse", "HEAD"]).trim().to_string();
+        git(&root, &["checkout", "--quiet", &branch]);
+        let plan = f
+            .local
+            .prepare(
+                "checkout",
+                &json!({"repo":"owned/repo","branch":"target","target_sha":target}),
+                "scope",
+                &f.control(),
+            )
+            .unwrap();
+        let recovery = std::path::PathBuf::from(plan.preview()["recovery_path"].as_str().unwrap());
         match changed {
-            "file"=>std::fs::write(root.join("notes.txt"),b"later writer").unwrap(),
-            "index"=>{std::fs::write(root.join("other"),b"later staged").unwrap();git(&root,&["add","other"]);},
-            "target"=>{git(&root,&["update-ref","refs/heads/target",&from]);},
-            "cancel"=>f.cancel.store(true,Ordering::Release),
-            "worktree"=>{git(&root,&["worktree","add","--quiet",f.temp.path().join("other-worktree").to_str().unwrap(),"target"]);},
-            "head_lock"=>std::fs::write(root.join(".git/HEAD.lock"),b"foreign writer lock").unwrap(),
-            _=>{},
+            "file" => std::fs::write(root.join("notes.txt"), b"later writer").unwrap(),
+            "index" => {
+                std::fs::write(root.join("other"), b"later staged").unwrap();
+                git(&root, &["add", "other"]);
+            }
+            "target" => {
+                git(&root, &["update-ref", "refs/heads/target", &from]);
+            }
+            "cancel" => f.cancel.store(true, Ordering::Release),
+            "worktree" => {
+                git(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        f.temp.path().join("other-worktree").to_str().unwrap(),
+                        "target",
+                    ],
+                );
+            }
+            "head_lock" => {
+                std::fs::write(root.join(".git/HEAD.lock"), b"foreign writer lock").unwrap()
+            }
+            _ => {}
         }
-        let file=std::fs::read(root.join("notes.txt")).unwrap();let index=std::fs::read(root.join(".git/index")).unwrap();
-        assert!(f.local.execute(plan,if changed=="scope"{"other"}else{"scope"},&f.control()).is_err(),"{changed}");
-        assert!(!recovery.exists(),"{changed}");assert_eq!(git(&root,&["rev-parse","HEAD"]).trim(),from);assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(),file);assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),index);
-        assert!(!root.join(".git/index.lock").exists());if changed=="head_lock"{assert_eq!(std::fs::read(root.join(".git/HEAD.lock")).unwrap(),b"foreign writer lock");}
+        let file = std::fs::read(root.join("notes.txt")).unwrap();
+        let index = std::fs::read(root.join(".git/index")).unwrap();
+        assert!(
+            f.local
+                .execute(
+                    plan,
+                    if changed == "scope" { "other" } else { "scope" },
+                    &f.control()
+                )
+                .is_err(),
+            "{changed}"
+        );
+        assert!(!recovery.exists(), "{changed}");
+        assert_eq!(git(&root, &["rev-parse", "HEAD"]).trim(), from);
+        assert_eq!(std::fs::read(root.join("notes.txt")).unwrap(), file);
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        assert!(!root.join(".git/index.lock").exists());
+        if changed == "head_lock" {
+            assert_eq!(
+                std::fs::read(root.join(".git/HEAD.lock")).unwrap(),
+                b"foreign writer lock"
+            );
+        }
     }
 }
 impl Fixture {
@@ -257,11 +409,17 @@ fn local_scope_rejects_remote_mismatch_symlink_ancestors_and_unbound_linked_meta
             )
             .is_err()
     );
-    let outside=f.temp.path().join("outside-grant");std::fs::create_dir(&outside).unwrap();std::fs::write(outside.join("secret"),b"owned outside bytes must not be read").unwrap();
+    let outside = f.temp.path().join("outside-grant");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(
+        outside.join("secret"),
+        b"owned outside bytes must not be read",
+    )
+    .unwrap();
     std::os::unix::fs::symlink(&outside, root.join("outside")).unwrap();
-    f.apply("stage",json!({"repo":"owned/repo","paths":["outside"]}));
-    assert_eq!(git(&root,&["show",":outside"]),outside.to_str().unwrap());
-    assert!(git(&root,&["ls-files","--stage","outside"]).starts_with("120000 "));
+    f.apply("stage", json!({"repo":"owned/repo","paths":["outside"]}));
+    assert_eq!(git(&root, &["show", ":outside"]), outside.to_str().unwrap());
+    assert!(git(&root, &["ls-files", "--stage", "outside"]).starts_with("120000 "));
     assert!(
         f.local
             .prepare(
@@ -467,51 +625,168 @@ fn unstage_new_file_preserves_untracked_source_and_recovery_index_bytes() {
 
 #[test]
 fn staging_exact_deletions_links_and_modes_never_changes_working_entries() {
-    use std::os::unix::{ffi::OsStringExt,fs::{symlink,PermissionsExt}};
-    let f=Fixture::new();let root=f.root();
-    std::fs::rename(root.join("notes.txt"),f.temp.path().join("retained-deleted-notes")).unwrap();
-    let link_bytes=b"../owned-missing-target-\xff";
-    symlink(std::ffi::OsString::from_vec(link_bytes.to_vec()),root.join("link,with\nnewline")).unwrap();
-    std::fs::write(root.join("run"),b"#!/bin/sh\nexit 0\n").unwrap();std::fs::set_permissions(root.join("run"),std::fs::Permissions::from_mode(0o755)).unwrap();
-    let index=std::fs::read(root.join(".git/index")).unwrap();
-    let args=json!({"repo":"owned/repo","paths":["notes.txt","link,with\nnewline","run"]});
-    let plan=f.local.prepare("stage",&args,"scope-a",&f.control()).unwrap();
-    let files=plan.preview()["files"].as_array().unwrap().clone();assert_eq!(files[0]["operation"],"stage deletion (index only)");assert_eq!(files[1]["mode"],"120000");assert_eq!(files[2]["mode"],"100755");assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),index);
-    f.local.execute(plan,"scope-a",&f.control()).unwrap();
-    assert!(git(&root,&["ls-files","--","notes.txt"]).is_empty());
-    let blob=Command::new("/usr/bin/git").args(["show",":link,with\nnewline"]).current_dir(&root).env_clear().env("PATH","/usr/bin:/bin").env("GIT_CONFIG_NOSYSTEM","1").env("GIT_CONFIG_GLOBAL","/dev/null").output().unwrap();assert!(blob.status.success());assert_eq!(blob.stdout,link_bytes);
-    assert!(git(&root,&["ls-files","--stage","--","run"]).starts_with("100755 "));
-    assert_eq!(std::fs::read_link(root.join("link,with\nnewline")).unwrap().into_os_string().into_vec(),link_bytes);
-    assert!(!root.join("notes.txt").exists());assert_eq!(std::fs::read(f.temp.path().join("retained-deleted-notes")).unwrap(),b"original\n");
-    f.apply("unstage",args);assert_eq!(git(&root,&["show",":notes.txt"]),"original\n");assert!(git(&root,&["ls-files","--","run"]).is_empty());assert!(std::fs::symlink_metadata(root.join("link,with\nnewline")).unwrap().file_type().is_symlink());assert!(!root.join("notes.txt").exists());
-    assert!(f.local.prepare("stage",&json!({"repo":"owned/repo","paths":["never-tracked"]}),"scope-a",&f.control()).is_err());
+    use std::os::unix::{
+        ffi::OsStringExt,
+        fs::{PermissionsExt, symlink},
+    };
+    let f = Fixture::new();
+    let root = f.root();
+    std::fs::rename(
+        root.join("notes.txt"),
+        f.temp.path().join("retained-deleted-notes"),
+    )
+    .unwrap();
+    let link_bytes = b"../owned-missing-target-\xff";
+    symlink(
+        std::ffi::OsString::from_vec(link_bytes.to_vec()),
+        root.join("link,with\nnewline"),
+    )
+    .unwrap();
+    std::fs::write(root.join("run"), b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(root.join("run"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let index = std::fs::read(root.join(".git/index")).unwrap();
+    let args = json!({"repo":"owned/repo","paths":["notes.txt","link,with\nnewline","run"]});
+    let plan = f
+        .local
+        .prepare("stage", &args, "scope-a", &f.control())
+        .unwrap();
+    let files = plan.preview()["files"].as_array().unwrap().clone();
+    assert_eq!(files[0]["operation"], "stage deletion (index only)");
+    assert_eq!(files[1]["mode"], "120000");
+    assert_eq!(files[2]["mode"], "100755");
+    assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+    f.local.execute(plan, "scope-a", &f.control()).unwrap();
+    assert!(git(&root, &["ls-files", "--", "notes.txt"]).is_empty());
+    let blob = Command::new("/usr/bin/git")
+        .args(["show", ":link,with\nnewline"])
+        .current_dir(&root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(blob.status.success());
+    assert_eq!(blob.stdout, link_bytes);
+    assert!(git(&root, &["ls-files", "--stage", "--", "run"]).starts_with("100755 "));
+    assert_eq!(
+        std::fs::read_link(root.join("link,with\nnewline"))
+            .unwrap()
+            .into_os_string()
+            .into_vec(),
+        link_bytes
+    );
+    assert!(!root.join("notes.txt").exists());
+    assert_eq!(
+        std::fs::read(f.temp.path().join("retained-deleted-notes")).unwrap(),
+        b"original\n"
+    );
+    f.apply("unstage", args);
+    assert_eq!(git(&root, &["show", ":notes.txt"]), "original\n");
+    assert!(git(&root, &["ls-files", "--", "run"]).is_empty());
+    assert!(
+        std::fs::symlink_metadata(root.join("link,with\nnewline"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!root.join("notes.txt").exists());
+    assert!(
+        f.local
+            .prepare(
+                "stage",
+                &json!({"repo":"owned/repo","paths":["never-tracked"]}),
+                "scope-a",
+                &f.control()
+            )
+            .is_err()
+    );
 }
 
 #[test]
 fn staging_refuses_reappearing_deletions_retargeted_links_modes_and_directory_expansion() {
-    use std::os::unix::fs::{symlink,PermissionsExt};
-    for kind in ["deletion","link","mode","parent"] {
-        let f=Fixture::new();let root=f.root();
-        let path=match kind {
-            "deletion"=>{std::fs::rename(root.join("notes.txt"),f.temp.path().join("retained-deletion")).unwrap();"notes.txt"},
-            "link"=>{symlink("notes.txt",root.join("link")).unwrap();"link"},
-            "parent"=>{std::fs::create_dir(root.join("parent")).unwrap();std::fs::write(root.join("parent/file"),b"initial").unwrap();"parent/file"},
-            _=>"notes.txt",
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    for kind in ["deletion", "link", "mode", "parent"] {
+        let f = Fixture::new();
+        let root = f.root();
+        let path = match kind {
+            "deletion" => {
+                std::fs::rename(
+                    root.join("notes.txt"),
+                    f.temp.path().join("retained-deletion"),
+                )
+                .unwrap();
+                "notes.txt"
+            }
+            "link" => {
+                symlink("notes.txt", root.join("link")).unwrap();
+                "link"
+            }
+            "parent" => {
+                std::fs::create_dir(root.join("parent")).unwrap();
+                std::fs::write(root.join("parent/file"), b"initial").unwrap();
+                "parent/file"
+            }
+            _ => "notes.txt",
         };
-        let plan=f.local.prepare("stage",&json!({"repo":"owned/repo","paths":[path]}),"scope-a",&f.control()).unwrap();let index=std::fs::read(root.join(".git/index")).unwrap();
+        let plan = f
+            .local
+            .prepare(
+                "stage",
+                &json!({"repo":"owned/repo","paths":[path]}),
+                "scope-a",
+                &f.control(),
+            )
+            .unwrap();
+        let index = std::fs::read(root.join(".git/index")).unwrap();
         match kind {
-            "deletion"=>std::fs::write(root.join(path),b"later user recreation").unwrap(),
-            "link"=>{std::fs::rename(root.join(path),root.join("retained-link")).unwrap();symlink("later-target",root.join(path)).unwrap();},
-            "parent"=>{std::fs::rename(root.join("parent"),f.temp.path().join("retained-parent")).unwrap();symlink(f.temp.path().join("retained-parent"),root.join("parent")).unwrap();},
-            "mode"=>std::fs::set_permissions(root.join(path),std::fs::Permissions::from_mode(0o755)).unwrap(),
-            _=>unreachable!(),
+            "deletion" => std::fs::write(root.join(path), b"later user recreation").unwrap(),
+            "link" => {
+                std::fs::rename(root.join(path), root.join("retained-link")).unwrap();
+                symlink("later-target", root.join(path)).unwrap();
+            }
+            "parent" => {
+                std::fs::rename(root.join("parent"), f.temp.path().join("retained-parent"))
+                    .unwrap();
+                symlink(f.temp.path().join("retained-parent"), root.join("parent")).unwrap();
+            }
+            "mode" => {
+                std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o755))
+                    .unwrap()
+            }
+            _ => unreachable!(),
         }
-        assert!(f.local.execute(plan,"scope-a",&f.control()).is_err(),"{kind}");assert_eq!(std::fs::read(root.join(".git/index")).unwrap(),index);
-        if kind=="deletion"{assert_eq!(std::fs::read(root.join(path)).unwrap(),b"later user recreation");}
-        if kind=="link"{assert_eq!(std::fs::read_link(root.join(path)).unwrap(),Path::new("later-target"));}
+        assert!(
+            f.local.execute(plan, "scope-a", &f.control()).is_err(),
+            "{kind}"
+        );
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index);
+        if kind == "deletion" {
+            assert_eq!(
+                std::fs::read(root.join(path)).unwrap(),
+                b"later user recreation"
+            );
+        }
+        if kind == "link" {
+            assert_eq!(
+                std::fs::read_link(root.join(path)).unwrap(),
+                Path::new("later-target")
+            );
+        }
     }
-    let f=Fixture::new();std::fs::create_dir(f.root().join("folder")).unwrap();std::fs::write(f.root().join("folder/child"),b"not recursively selected").unwrap();
-    assert!(f.local.prepare("stage",&json!({"repo":"owned/repo","paths":["folder"]}),"scope-a",&f.control()).is_err());
+    let f = Fixture::new();
+    std::fs::create_dir(f.root().join("folder")).unwrap();
+    std::fs::write(f.root().join("folder/child"), b"not recursively selected").unwrap();
+    assert!(
+        f.local
+            .prepare(
+                "stage",
+                &json!({"repo":"owned/repo","paths":["folder"]}),
+                "scope-a",
+                &f.control()
+            )
+            .is_err()
+    );
 }
 
 #[test]

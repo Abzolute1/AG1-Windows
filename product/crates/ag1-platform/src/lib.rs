@@ -1,29 +1,43 @@
 //! Explicit platform capabilities. Linux is implemented; other OS capabilities remain unavailable.
+#[cfg(any(target_os = "linux", windows))]
+pub mod change_receipts;
+#[cfg(any(target_os = "linux", windows))]
+pub mod change_undo;
 pub mod diagnostics;
-pub mod mcp;
-#[cfg(target_os = "linux")]
-pub mod github;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod git;
+#[cfg(target_os = "linux")]
+pub mod github;
 pub mod llama;
+#[cfg(target_os = "linux")]
+pub mod mcp;
 pub mod ports;
 #[cfg(target_os = "linux")]
+pub mod process;
+#[cfg(windows)]
+#[path = "process_windows.rs"]
 pub mod process;
 pub mod provider;
 #[cfg(target_os = "linux")]
 pub mod session;
+#[cfg(windows)]
+#[path = "session_windows.rs"]
+pub mod session;
 pub mod web_http;
 #[cfg(target_os = "linux")]
 pub mod workspace;
-#[cfg(target_os = "linux")]
-pub mod change_receipts;
-pub mod change_undo;
+#[cfg(windows)]
+#[path = "workspace_windows.rs"]
+pub mod workspace;
 #[cfg(target_os = "linux")]
 pub mod workspace_lifecycle;
 
 pub fn native_available() -> bool {
-    cfg!(target_os = "linux")
+    // Windows now has a real local session, workspace and process path. This
+    // flag describes native capability, not whether every Linux feature has
+    // reached parity yet.
+    cfg!(any(target_os = "linux", windows))
 }
 
 pub(crate) fn io_error(error: std::io::Error) -> ag1_core::DomainError {
@@ -36,15 +50,14 @@ pub(crate) fn io_error(error: std::io::Error) -> ag1_core::DomainError {
     }
 }
 
-#[cfg(target_os = "linux")]
 pub mod source;
 
 #[cfg(target_os = "linux")]
 pub mod retrieval;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod file_tools;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod folder_access;
 pub mod image_tools;
 
@@ -96,10 +109,13 @@ pub mod web_tools;
 #[cfg(target_os = "linux")]
 pub mod target_tools;
 
+#[cfg(target_os = "linux")]
 pub mod extension_auth;
 
+#[cfg(target_os = "linux")]
 pub mod extension_auth_bridge;
 
+#[cfg(target_os = "linux")]
 pub mod extension_login;
 
 #[cfg(target_os = "linux")]
@@ -120,6 +136,7 @@ pub mod todo_tools;
 #[cfg(target_os = "linux")]
 pub mod observation_tools;
 
+#[cfg(target_os = "linux")]
 pub mod episode_tools;
 
 #[cfg(target_os = "linux")]
@@ -130,3 +147,9 @@ pub mod client;
 
 #[cfg(target_os = "linux")]
 pub mod cutover;
+#[cfg(windows)]
+#[path = "cutover_windows.rs"]
+pub mod cutover;
+#[cfg(windows)]
+#[path = "local_runtime_windows.rs"]
+pub mod local_runtime;

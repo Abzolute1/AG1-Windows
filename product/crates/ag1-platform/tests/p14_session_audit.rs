@@ -15,21 +15,54 @@ impl Clock for ReviewClock {
 async fn invalid_previews_are_journaled_once_and_explicit_deletion_is_only_a_preview() {
     let (endpoint, server) = server(vec![
         calls(vec![
-            ("missing", "editPreview", json!({"path":"a.txt","oldText":"original"})),
-            ("null", "editPreview", json!({"path":"a.txt","oldText":"original","newText":null})),
-            ("delete", "editPreview", json!({"path":"a.txt","oldText":"original","newText":""})),
-        ]), stop(),
+            (
+                "missing",
+                "editPreview",
+                json!({"path":"a.txt","oldText":"original"}),
+            ),
+            (
+                "null",
+                "editPreview",
+                json!({"path":"a.txt","oldText":"original","newText":null}),
+            ),
+            (
+                "delete",
+                "editPreview",
+                json!({"path":"a.txt","oldText":"original","newText":""}),
+            ),
+        ]),
+        stop(),
     ]);
-    let f=fixture_configured_tools(&endpoint,"disabled",vec![],None,None,2,&["editPreview"]);
-    std::fs::write(f.root.join("a.txt"),"original").unwrap();
-    f.host.run(input(),&Resolver::new(false),f.files.clone(),&ignore).await.unwrap();
-    let records=f.host.client_records().unwrap();
-    let results:Vec<_>=records.iter().filter(|r|r["message"]["role"]=="toolResult").collect();
-    assert_eq!(results.len(),3);
-    for result in &results[..2] { assert_eq!(result["message"]["isError"],true); assert!(result["message"]["content"].to_string().contains("newText")); }
-    assert_ne!(results[2]["message"]["isError"],true);
-    assert_eq!(std::fs::read_to_string(f.root.join("a.txt")).unwrap(),"original");
-    assert_eq!(server.join().unwrap().len(),2);
+    let f = fixture_configured_tools(
+        &endpoint,
+        "disabled",
+        vec![],
+        None,
+        None,
+        2,
+        &["editPreview"],
+    );
+    std::fs::write(f.root.join("a.txt"), "original").unwrap();
+    f.host
+        .run(input(), &Resolver::new(false), f.files.clone(), &ignore)
+        .await
+        .unwrap();
+    let records = f.host.client_records().unwrap();
+    let results: Vec<_> = records
+        .iter()
+        .filter(|r| r["message"]["role"] == "toolResult")
+        .collect();
+    assert_eq!(results.len(), 3);
+    for result in &results[..2] {
+        assert_eq!(result["message"]["isError"], true);
+        assert!(result["message"]["content"].to_string().contains("newText"));
+    }
+    assert_ne!(results[2]["message"]["isError"], true);
+    assert_eq!(
+        std::fs::read_to_string(f.root.join("a.txt")).unwrap(),
+        "original"
+    );
+    assert_eq!(server.join().unwrap().len(), 2);
 }
 struct Review {
     clock: Arc<ReviewClock>,

@@ -112,7 +112,9 @@ impl Observations {
             }
             SessionEvent::Recovery(value) => {
                 if value["type"] == "request_phase" {
-                    if let Some(phase @ ("preparing" | "waiting" | "executing")) = value["phase"].as_str() {
+                    if let Some(phase @ ("preparing" | "waiting" | "executing")) =
+                        value["phase"].as_str()
+                    {
                         self.phase = phase.into();
                     }
                     return None;

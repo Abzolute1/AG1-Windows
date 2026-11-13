@@ -485,9 +485,20 @@ impl SharedProject {
         }
         names
     }
-    fn with_runtime<T>(&self, call: impl FnOnce(&mut Runtime) -> Result<T, DomainError>) -> Result<T, DomainError> {
-        let mut slot = self.check.runtime.try_lock().map_err(|_| DomainError::QueueFull)?;
-        call(slot.as_mut().ok_or_else(|| DomainError::Unavailable("Project runtime is not configured".into()))?)
+    fn with_runtime<T>(
+        &self,
+        call: impl FnOnce(&mut Runtime) -> Result<T, DomainError>,
+    ) -> Result<T, DomainError> {
+        let mut slot = self
+            .check
+            .runtime
+            .try_lock()
+            .map_err(|_| DomainError::QueueFull)?;
+        call(
+            slot.as_mut().ok_or_else(|| {
+                DomainError::Unavailable("Project runtime is not configured".into())
+            })?,
+        )
     }
     fn with_visual<T>(
         &self,
@@ -546,7 +557,8 @@ impl Port for SharedProject {
     type Plan = ProjectPlan;
     fn prepare(&mut self, r: &Request, c: &ScanControl<'_>) -> Result<ProjectPlan, DomainError> {
         if r.name() == "preview" {
-            self.with_runtime(|runtime| runtime.prepare_model_preview(r.arguments(), c)).map(ProjectPlan::Preview)
+            self.with_runtime(|runtime| runtime.prepare_model_preview(r.arguments(), c))
+                .map(ProjectPlan::Preview)
         } else if r.name() == "check" {
             self.check.prepare(r, c).map(ProjectPlan::Check)
         } else {
@@ -572,7 +584,9 @@ impl Port for SharedProject {
     }
     fn revalidate(&mut self, p: &ProjectPlan, c: &ScanControl<'_>) -> Result<(), DomainError> {
         match p {
-            ProjectPlan::Preview(p) => self.with_runtime(|runtime| runtime.revalidate_model_preview(p, c)),
+            ProjectPlan::Preview(p) => {
+                self.with_runtime(|runtime| runtime.revalidate_model_preview(p, c))
+            }
             ProjectPlan::Check(p) => self.check.revalidate(p, c),
             ProjectPlan::Visual(p) => self.with_visual(|port| port.revalidate(p, c)),
         }
@@ -585,7 +599,9 @@ impl Port for SharedProject {
         a: &mut A,
     ) -> Result<AdapterOutcome, DomainError> {
         match p {
-            ProjectPlan::Preview(p) => self.with_runtime(|runtime| runtime.execute_model_preview(p, c)),
+            ProjectPlan::Preview(p) => {
+                self.with_runtime(|runtime| runtime.execute_model_preview(p, c))
+            }
             ProjectPlan::Check(p) => self.check.execute(p, r, c, a),
             ProjectPlan::Visual(p) => self.with_visual(|port| port.execute(p, r, c, a)),
         }

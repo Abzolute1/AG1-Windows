@@ -29,7 +29,12 @@ pub fn task_with_tool(
     verify: impl FnMut(&str) -> bool,
     task_tool_available: bool,
 ) -> Option<String> {
-    task_with_control_tool(state, validate, verify, task_tool_available.then_some(TaskControlTool::Legacy))
+    task_with_control_tool(
+        state,
+        validate,
+        verify,
+        task_tool_available.then_some(TaskControlTool::Legacy),
+    )
 }
 #[derive(Clone, Copy)]
 pub enum TaskControlTool {
@@ -49,9 +54,15 @@ pub fn task_with_control_tool(
         return None;
     }
     let heading = match tool {
-        Some(TaskControlTool::Work) => "Current task control state (claims retain their evidence/confidence; update with work):",
-        Some(TaskControlTool::Legacy) => "Current task control state (claims retain their evidence/confidence; update with taskState):",
-        None => "Recorded task state (read-only in this turn; claims retain their evidence/confidence):\nThe taskState tool is unavailable. Shell output cannot update this state. Its recorded status does not require bookkeeping before answering the latest user instruction.",
+        Some(TaskControlTool::Work) => {
+            "Current task control state (claims retain their evidence/confidence; update with work):"
+        }
+        Some(TaskControlTool::Legacy) => {
+            "Current task control state (claims retain their evidence/confidence; update with taskState):"
+        }
+        None => {
+            "Recorded task state (read-only in this turn; claims retain their evidence/confidence):\nThe taskState tool is unavailable. Shell output cannot update this state. Its recorded status does not require bookkeeping before answering the latest user instruction."
+        }
     };
     let mut lines = vec![
         heading.into(),
@@ -302,7 +313,7 @@ pub struct TurnAddenda<'a> {
     pub finished_jobs: Option<&'a str>,
 }
 pub fn turn(input: TurnAddenda<'_>) -> Option<String> {
-    let contract=input.verification_command.filter(|s|!s.is_empty()).map(|command|format!("<runtime-verification-contract>\n{{\"kind\":\"repository_verifier\",\"version\":1,\"command\":{},\"required_after_mutation\":true}}\nUse this canonical repository verifier after the final mutation. Submit its command string unchanged to bash, which already starts in the workspace; do not add cd, shell composition or redirection. Alternative or focused tests may supplement it, but do not replace it.\n</runtime-verification-contract>",serde_json::to_string(command).unwrap()));
+    let contract=input.verification_command.filter(|s|!s.is_empty()).map(|command|format!("<runtime-verification-contract>\n{{\"kind\":\"repository_verifier\",\"version\":1,\"command\":{},\"required_after_mutation\":true}}\nUse this canonical repository verifier after the final mutation. Alternative or focused tests may supplement it, but do not replace it.\n</runtime-verification-contract>",serde_json::to_string(command).unwrap()));
     let parts: Vec<_> = [
         input.runtime_pending,
         contract.as_deref(),

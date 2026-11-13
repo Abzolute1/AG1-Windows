@@ -1,8 +1,8 @@
 #![allow(dead_code, unused_imports)] // Shared native fixture also supports broader session tests.
 include!("../support/session_fixture.rs");
+mod composition;
 mod discovery;
 mod management;
-mod composition;
 use ag1_core::tools::executor::ExecutionArtifacts;
 use ag1_core::tools::{approval::ApprovalRequest, mcp::Kind, registry::Scope};
 use ag1_platform::{

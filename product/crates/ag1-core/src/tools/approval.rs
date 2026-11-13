@@ -70,7 +70,9 @@ impl AuthorizedCall {
         registry.validate_current(&self.call)?;
         if let Some(identity) = self.call.mcp_identity() {
             identity.check_scope(scope)?;
-            if identity.target_revision() != target_revision { return Err(DomainError::Conflict); }
+            if identity.target_revision() != target_revision {
+                return Err(DomainError::Conflict);
+            }
         }
         if self.scope != *scope
             || self.registry_revision != registry.revision()
@@ -132,10 +134,15 @@ impl Authorizer {
         call: ValidatedCall,
         context: PreflightContext<'_>,
     ) -> Result<Preflight, DomainError> {
-        self.preflight_in_folders(call,context,&[])
+        self.preflight_in_folders(call, context, &[])
     }
     /// Folder grants are host-selected and must share the scope's lifetime fence.
-    pub fn preflight_in_folders(&mut self, call: ValidatedCall, context: PreflightContext<'_>, folders: &[String]) -> Result<Preflight, DomainError> {
+    pub fn preflight_in_folders(
+        &mut self,
+        call: ValidatedCall,
+        context: PreflightContext<'_>,
+        folders: &[String],
+    ) -> Result<Preflight, DomainError> {
         let PreflightContext {
             scope,
             policy,
@@ -152,8 +159,12 @@ impl Authorizer {
         }
         if let Some(identity) = call.mcp_identity() {
             identity.check_scope(scope)?;
-            if identity.target_revision() != target_revision { return Err(DomainError::Conflict); }
-            if let Some(review) = call.mcp_reviewed_policy() { review.check(identity)?; }
+            if identity.target_revision() != target_revision {
+                return Err(DomainError::Conflict);
+            }
+            if let Some(review) = call.mcp_reviewed_policy() {
+                review.check(identity)?;
+            }
         }
         if let Some(old) = self.pending.get(call.operation()) {
             if old.call.args_hash() != call.args_hash()
@@ -172,12 +183,24 @@ impl Authorizer {
         }
         let decision = if call.origin() == super::registry::Origin::Mcp {
             super::mcp::decision(&call, policy)?
-        } else if call.origin() == super::registry::Origin::TrustedHost && call.name() == super::mcp::discovery::NAME {
+        } else if call.origin() == super::registry::Origin::TrustedHost
+            && call.name() == super::mcp::discovery::NAME
+        {
             // This native facade reads cached metadata and changes only the
             // bounded request selection. It cannot connect or execute MCP calls.
-            policy::Decision { allow: true, reason: None, approval_request: None }
+            policy::Decision {
+                allow: true,
+                reason: None,
+                approval_request: None,
+            }
         } else {
-            policy::evaluate_in_folders(call.name(), call.args(), policy, untrusted_extensions, folders)?
+            policy::evaluate_in_folders(
+                call.name(),
+                call.args(),
+                policy,
+                untrusted_extensions,
+                folders,
+            )?
         };
         if !decision.allow {
             return Ok(Preflight::Rejected(
@@ -278,7 +301,10 @@ impl Authorizer {
         if execution_ms == 0 || execution_ms > 86_430_000 {
             return Err(DomainError::InvalidInput("execution lifetime".into()));
         }
-        let expires = fence.now.checked_add(execution_ms).ok_or(DomainError::Conflict)?;
+        let expires = fence
+            .now
+            .checked_add(execution_ms)
+            .ok_or(DomainError::Conflict)?;
         let mut authorization = self.answer(binding, allow, registry, fence)?;
         if let Some(authorization) = &mut authorization {
             authorization.expires_ms = Some(expires);

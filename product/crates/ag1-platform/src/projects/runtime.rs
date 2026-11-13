@@ -664,13 +664,27 @@ impl Runtime {
         }
         let trust = super::environment::system_trust_bundles()?;
         for path in &trust {
-            args.extend(["--ro-bind".into(), path.display().to_string(), path.display().to_string()]);
+            args.extend([
+                "--ro-bind".into(),
+                path.display().to_string(),
+                path.display().to_string(),
+            ]);
         }
         let rustup = self.toolchains.rustup_home();
-        let executable_roots = self.toolchains.cargo.iter().chain(self.toolchains.rustc.iter())
+        let executable_roots = self
+            .toolchains
+            .cargo
+            .iter()
+            .chain(self.toolchains.rustc.iter())
             .filter_map(|p| p.parent());
-        for path in self.toolchains.mounts.iter().map(PathBuf::as_path)
-            .chain(rustup.as_deref()).chain(executable_roots) {
+        for path in self
+            .toolchains
+            .mounts
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(rustup.as_deref())
+            .chain(executable_roots)
+        {
             if !path.is_absolute()
                 || !path.is_dir()
                 || path == Path::new("/")

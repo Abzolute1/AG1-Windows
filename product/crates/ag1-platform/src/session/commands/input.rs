@@ -74,8 +74,10 @@ impl SessionCommands {
                             .into_dimensions()
                             .map_err(|_| DomainError::InvalidInput("image dimensions".into()))?;
                         // Keep original desktop screenshots, including 4K/8K, while bounding decoded memory.
-                        if dimensions.0 > 16384 || dimensions.1 > 16384
-                            || u64::from(dimensions.0) * u64::from(dimensions.1) > 32 * 1024 * 1024 {
+                        if dimensions.0 > 16384
+                            || dimensions.1 > 16384
+                            || u64::from(dimensions.0) * u64::from(dimensions.1) > 32 * 1024 * 1024
+                        {
                             return Err(DomainError::LimitExceeded("image dimensions".into()));
                         }
                         image::load_from_memory(&bytes)
@@ -84,7 +86,11 @@ impl SessionCommands {
                     _ => return Err(DomainError::InvalidInput("Unsupported user block".into())),
                 }
             }
-            let combined = content.iter().filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n");
+            let combined = content
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
             let expanded = self.expand_skill(&combined)?;
             if expanded != combined {
                 // Keep image blocks intact and replace only the textual instruction.
@@ -95,7 +101,9 @@ impl SessionCommands {
             message["timestamp"] = json!(now);
             Ok(message)
         } else {
-            Ok(json!({"role":"user","content":[{"type":"text","text":self.expand_skill(&text)?}],"timestamp":now}))
+            Ok(
+                json!({"role":"user","content":[{"type":"text","text":self.expand_skill(&text)?}],"timestamp":now}),
+            )
         }
     }
 }

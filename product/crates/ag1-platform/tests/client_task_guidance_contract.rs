@@ -210,13 +210,19 @@ async fn prompt_roundtrip(base_prompt: &str, migrate: bool) {
             .unwrap();
         assert!(system.contains("Top-level workspace entries (snapshot at session start):"));
         assert!(system.contains("src/\n"));
-        assert!(system.contains("Keep the user's appended instructions."), "{system}");
+        assert!(
+            system.contains("Keep the user's appended instructions."),
+            "{system}"
+        );
         assert!(system.contains("Host conversation boundary."));
         if base_prompt.is_empty() || migrate && index > 0 {
             assert!(!system.contains("Previously captured workspace prompt."));
             assert!(system.contains("Host-supplied model identity:"));
             assert!(system.contains("Qwen-fixture"));
-            let available = system.lines().find_map(|line| line.strip_prefix("Available tools: ")).unwrap();
+            let available = system
+                .lines()
+                .find_map(|line| line.strip_prefix("Available tools: "))
+                .unwrap();
             assert_eq!(available, if enabled { "taskState" } else { "" });
             assert!(!system.contains("Cruzible") && !system.contains("2026-09-07"));
         }

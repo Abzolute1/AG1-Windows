@@ -20,18 +20,34 @@ async fn wire_print_continuations_keep_the_command_alive_until_mode_settlement()
     let mut promise = stop();
     promise["choices"][0]["delta"]["content"] = json!("Let me inspect it:");
     for (text, replies, expected) in [
-        ("Explain the source.", vec![promise, stop()], w::OperationStatus::Completed),
-        ("Fix the source.", vec![stop(); 4], w::OperationStatus::Failed),
+        (
+            "Explain the source.",
+            vec![promise, stop()],
+            w::OperationStatus::Completed,
+        ),
+        (
+            "Fix the source.",
+            vec![stop(); 4],
+            w::OperationStatus::Failed,
+        ),
     ] {
         let count = replies.len();
         let (endpoint, server) = server(replies);
-        let f = attach(fixture(&endpoint, "disabled"), Arc::new(Resolver::new(false)));
+        let f = attach(
+            fixture(&endpoint, "disabled"),
+            Arc::new(Resolver::new(false)),
+        );
         let mut envelope = prompt(&f.commands, "print", 0, "");
         envelope.command = serde_json::from_value(json!({"kind":"session","action":"print","args":{"input":{"kind":"inline","text":text}}})).unwrap();
         accepted(f.commands.dispatch(envelope).await.result);
         let terminal = f.commands.run_next(&ignore).await.unwrap().unwrap();
         assert_eq!(terminal.status, expected);
-        assert_eq!(lookup(&f.commands, "print").await, w::CommandResult::Settled { operation: terminal });
+        assert_eq!(
+            lookup(&f.commands, "print").await,
+            w::CommandResult::Settled {
+                operation: terminal
+            }
+        );
         assert!(f.host.settled().unwrap());
         assert_eq!(server.join().unwrap().len(), count);
     }

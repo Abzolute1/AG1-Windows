@@ -22,10 +22,14 @@ fn work_objective_correction_preserves_explicit_action_semantics() {
     let (target, routed) = surface::route("work", &args, &[]).unwrap().unwrap();
     assert_eq!(target, "taskState");
     assert_eq!(routed, args);
-    let plan = ag1_core::tools::task_state::prepare(&[], &routed, "2026-09-13T15:00:00Z", "unused").unwrap();
+    let plan = ag1_core::tools::task_state::prepare(&[], &routed, "2026-09-13T15:00:00Z", "unused")
+        .unwrap();
     assert_eq!(plan.next.unwrap().value()["objective"], "Current repair");
     let update = json!({"action":"update","id":"entry","statement":"corrected"});
-    assert_eq!(surface::route("work", &update, &[]).unwrap().unwrap().1, update);
+    assert_eq!(
+        surface::route("work", &update, &[]).unwrap().unwrap().1,
+        update
+    );
 }
 #[test]
 fn preferred_surface_is_smaller_and_capability_gated_without_removing_legacy_definitions() {
@@ -156,20 +160,46 @@ fn metadata_never_claims_command_or_github_effects_are_read_only() {
 
 #[test]
 fn native_effect_annotations_survive_provider_schema_projection_and_aliases_keep_cv_identity() {
- let r=registry();
- for tool in r.native_tools() {let e:Value=serde_json::from_str(tool["parameters"]["$comment"].as_str().unwrap()).unwrap();assert_eq!(e["ag1Effects"],tool["effects"]);ag1_core::tools::schema::Schema::parse(&tool["parameters"]).unwrap();}
- for (name,canonical) in [("inspect","read"),("evidence","artifact"),("retainEvidence","artifact"),("work","runtimeObservation"),("ui","verify_ui"),("capability","sourceContext")] {
-  let m=json!({"role":"toolResult","toolName":name,"details":{"nativeTool":canonical}});assert_eq!(surface::message_tool(&m),canonical);
- }
- assert_eq!(surface::message_tool(&json!({"toolName":"read","details":{"nativeTool":"bash"}})),"read");
- assert_eq!(surface::message_tool(&json!({"toolName":"inspect","details":{"nativeTool":"github"}})),"inspect");
+    let r = registry();
+    for tool in r.native_tools() {
+        let e: Value =
+            serde_json::from_str(tool["parameters"]["$comment"].as_str().unwrap()).unwrap();
+        assert_eq!(e["ag1Effects"], tool["effects"]);
+        ag1_core::tools::schema::Schema::parse(&tool["parameters"]).unwrap();
+    }
+    for (name, canonical) in [
+        ("inspect", "read"),
+        ("evidence", "artifact"),
+        ("retainEvidence", "artifact"),
+        ("work", "runtimeObservation"),
+        ("ui", "verify_ui"),
+        ("capability", "sourceContext"),
+    ] {
+        let m = json!({"role":"toolResult","toolName":name,"details":{"nativeTool":canonical}});
+        assert_eq!(surface::message_tool(&m), canonical);
+    }
+    assert_eq!(
+        surface::message_tool(&json!({"toolName":"read","details":{"nativeTool":"bash"}})),
+        "read"
+    );
+    assert_eq!(
+        surface::message_tool(&json!({"toolName":"inspect","details":{"nativeTool":"github"}})),
+        "inspect"
+    );
 }
 
 #[test]
 fn local_ui_images_reject_browser_actions_and_keep_read_classification() {
     let r = registry();
-    for args in [json!({"path":"a.svg","url":"http://localhost"}),json!({"path":"a.svg","actions":[]}),json!({"path":"a.svg","claim":"looks good"})] {
-        assert!(r.prepare("op","call","ui",&args,true).is_err());
+    for args in [
+        json!({"path":"a.svg","url":"http://localhost"}),
+        json!({"path":"a.svg","actions":[]}),
+        json!({"path":"a.svg","claim":"looks good"}),
+    ] {
+        assert!(r.prepare("op", "call", "ui", &args, true).is_err());
     }
-    assert_eq!(surface::message_tool(&json!({"toolName":"ui","details":{"nativeTool":"read"}})), "read");
+    assert_eq!(
+        surface::message_tool(&json!({"toolName":"ui","details":{"nativeTool":"read"}})),
+        "read"
+    );
 }

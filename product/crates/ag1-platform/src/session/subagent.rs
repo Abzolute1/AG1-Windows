@@ -508,7 +508,11 @@ impl NativeSession {
         // Parent MCP leases belong to its session epoch. Child profiles do not
         // inherit them, and child cleanup must never close a parent's lease.
         #[cfg(target_os = "linux")]
-        { adapters.mcp=None; adapters.mcp_discovery=None; adapters.mcp_management=None; }
+        {
+            adapters.mcp = None;
+            adapters.mcp_discovery = None;
+            adapters.mcp_management = None;
+        }
         adapters.delegation = None;
         adapters.extensions = None;
         // Share host launch configuration, with an isolated durable job book

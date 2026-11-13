@@ -93,7 +93,8 @@ fn path(base: &str, tail: &str) -> Result<String, DomainError> {
     }
     output
         .to_str()
-        .map(str::to_owned)
+        // Package roots are persisted as POSIX strings even on Windows.
+        .map(|value| value.replace('\\', "/"))
         .ok_or_else(|| invalid("package path encoding"))
 }
 fn contained(base: &str, tail: &str) -> Result<String, DomainError> {

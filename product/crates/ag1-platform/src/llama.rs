@@ -5,11 +5,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(any(target_os = "linux", windows))]
 pub mod custody;
 pub mod discovery;
 pub mod lifecycle;
 mod materials;
 #[cfg(target_os = "linux")]
+pub mod native;
+#[cfg(windows)]
+#[path = "llama/native_windows.rs"]
 pub mod native;
 pub mod observation;
 #[cfg(target_os = "linux")]

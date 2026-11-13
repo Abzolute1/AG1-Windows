@@ -13,14 +13,18 @@ use std::{
     sync::LazyLock,
 };
 pub fn workspace_path(root: &Path, value: &str) -> Option<String> {
-    if !root.is_absolute()
+    // Windows allows a rooted path without a drive prefix. The context layer
+    // also uses Unix-style virtual roots, so accept either absolute spelling.
+    let root_is_absolute = root.is_absolute() || root.has_root();
+    if !root_is_absolute
         || value.trim().is_empty()
         || value.contains(['\r', '\n', '\0', '*', '?', '{', '}', '[', ']'])
     {
         return None;
     }
-    let full = if Path::new(value).is_absolute() {
-        Path::new(value).to_path_buf()
+    let input = Path::new(value);
+    let full = if input.is_absolute() || input.has_root() {
+        input.to_path_buf()
     } else {
         root.join(value)
     };

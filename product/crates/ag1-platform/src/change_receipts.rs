@@ -2,7 +2,7 @@
 //! effect happened, and neither result hooks nor assistant text can create one.
 use crate::workspace::{MAX_READ, Workspace};
 use ag1_core::{
-    DomainError, FileRevision,
+    DomainError, FileRevision, OperationId,
     storage::StoragePort,
     tools::registry::{Scope, ValidatedCall},
 };
@@ -130,6 +130,85 @@ impl PendingChange {
         after: &[u8],
         now: u64,
     ) -> Result<Option<Self>, DomainError> {
+        let call_entry = call_entry_for(store, &scope.session, call.call_id(), call.name())?;
+        Self::prepare_with_identity(
+            store,
+            workspace,
+            &scope.session,
+            &scope.workspace,
+            call.operation(),
+            call.call_id(),
+            call.name(),
+            call_entry,
+            path,
+            expected,
+            after,
+            now,
+        )
+    }
+
+    /// Prepare custody for the deliberately small Windows-native tool runner.
+    /// That runner has already committed the model's tool-call message, but it
+    /// does not build a full registry `ValidatedCall` just to execute its
+    /// fixed project tools.
+    pub fn prepare_local(
+        store: &Store,
+        workspace: &Workspace,
+        session: &str,
+        workspace_id: &str,
+        operation: &str,
+        call_id: &str,
+        tool: &str,
+        path: &str,
+        expected: Option<&FileRevision>,
+        after: &[u8],
+        now: u64,
+    ) -> Result<Option<Self>, DomainError> {
+        // Keep this entry point just as strict as the registry path. In
+        // particular, a model cannot attach a receipt to an arbitrary journal
+        // record or claim a different native effect.
+        OperationId::new(session)?;
+        OperationId::new(workspace_id)?;
+        OperationId::new(operation)?;
+        OperationId::new(call_id)?;
+        if !matches!(tool, "edit_project_file" | "write_project_file") {
+            return Err(DomainError::InvalidInput(
+                "native project change tool".into(),
+            ));
+        }
+        let call_entry =
+            call_entry_for(store, session, call_id, tool)?.ok_or(DomainError::PermissionDenied)?;
+        Self::prepare_with_identity(
+            store,
+            workspace,
+            session,
+            workspace_id,
+            operation,
+            call_id,
+            tool,
+            Some(call_entry),
+            path,
+            expected,
+            after,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_with_identity(
+        store: &Store,
+        workspace: &Workspace,
+        session: &str,
+        workspace_id: &str,
+        operation: &str,
+        call_id: &str,
+        tool: &str,
+        call_entry: Option<String>,
+        path: &str,
+        expected: Option<&FileRevision>,
+        after: &[u8],
+        now: u64,
+    ) -> Result<Option<Self>, DomainError> {
         let before = match workspace.snapshot(path, MAX_READ) {
             Ok(snapshot) => Some(snapshot),
             Err(DomainError::NotFound) => None,
@@ -144,14 +223,9 @@ impl PendingChange {
         let id = format!(
             "change-{}",
             digest(
-                json!([
-                    scope.workspace,
-                    scope.session,
-                    call.operation(),
-                    call.call_id()
-                ])
-                .to_string()
-                .as_bytes()
+                json!([workspace_id, session, operation, call_id])
+                    .to_string()
+                    .as_bytes()
             )
         );
         // Never replay a prepared/committed effect after lost acknowledgement.
@@ -170,29 +244,20 @@ impl PendingChange {
         };
         let before_ref = before
             .as_ref()
-            .map(|s| retain(store, &scope.session, &id, "before", &s.bytes, now))
+            .map(|s| retain(store, session, &id, "before", &s.bytes, now))
             .transpose()?;
-        let after_ref = retain(store, &scope.session, &id, "after", after, now)?;
+        let after_ref = retain(store, session, &id, "after", after, now)?;
         let record = ChangeReceipt {
             version: 1,
             id,
-            session: scope.session.clone(),
-            workspace: scope.workspace.clone(),
+            session: session.into(),
+            workspace: workspace_id.into(),
             root: workspace.root().to_string_lossy().into_owned(),
             path: path.into(),
-            call_id: call.call_id().into(),
-            call_entry: {
-                let branch = store.branch(&scope.session, None)?;
-                let records = branch
-                    .iter()
-                    .map(|entry| {
-                        serde_json::from_slice::<Value>(&entry.normalized).map_err(json_error)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                unique_call_entry(&records, call.call_id(), call.name()).map(str::to_owned)
-            },
-            operation: call.operation().into(),
-            tool: call.name().into(),
+            call_id: call_id.into(),
+            call_entry,
+            operation: operation.into(),
+            tool: tool.into(),
             created_ms: now,
             state: "prepared".into(),
             before: before_ref,
@@ -230,6 +295,20 @@ impl PendingChange {
         )?;
         Ok(())
     }
+}
+
+fn call_entry_for(
+    store: &Store,
+    session: &str,
+    call_id: &str,
+    tool: &str,
+) -> Result<Option<String>, DomainError> {
+    let branch = store.branch(session, None)?;
+    let records = branch
+        .iter()
+        .map(|entry| serde_json::from_slice::<Value>(&entry.normalized).map_err(json_error))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(unique_call_entry(&records, call_id, tool).map(str::to_owned))
 }
 
 pub fn read_snapshot(

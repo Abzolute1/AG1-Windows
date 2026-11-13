@@ -124,7 +124,8 @@ impl StdioDiscovery {
 
     fn operation<'a>(&self, cancel: &'a AtomicBool) -> Operation<'a> {
         Operation {
-            input_forms: false,            deadline: Instant::now() + self.limits.timeout(),
+            input_forms: false,
+            deadline: Instant::now() + self.limits.timeout(),
             cancel,
             // Charge buffered bytes to the new operation too; read-ahead from
             // the previous response must not evade the aggregate ceiling.
@@ -140,7 +141,8 @@ impl StdioDiscovery {
             {
                 let cancel = AtomicBool::new(false);
                 let cleanup = Operation {
-                    input_forms: false,                    deadline: Instant::now() + Duration::from_millis(100),
+                    input_forms: false,
+                    deadline: Instant::now() + Duration::from_millis(100),
                     cancel: &cancel,
                     bytes: 0,
                     messages: 0,
@@ -225,7 +227,7 @@ impl StdioDiscovery {
         cancel: &AtomicBool,
         send: &(dyn Fn() -> Result<(), DomainError> + Sync),
         continue_send: &(dyn Fn() -> Result<(), DomainError> + Sync),
-        input: Option<&(dyn Fn(&Value,usize)->Result<Value,DomainError> + Sync)>,
+        input: Option<&(dyn Fn(&Value, usize) -> Result<Value, DomainError> + Sync)>,
     ) -> Result<Value, DomainError> {
         let params = if identity.kind == ag1_core::tools::mcp::Kind::Tool {
             self.refresh_tools(cancel)?;
@@ -237,23 +239,38 @@ impl StdioDiscovery {
         };
         let mut operation = self.operation(cancel);
         operation.send = Some(send);
-        operation.input_forms=input.is_some() && self.binding.protocol==Revision::Current20260728;
-        if operation.input_forms {operation.deadline=Instant::now()+Duration::from_secs(super::input::MAX_SECONDS);}
-        let result=(|| {
-            let mut params=params;
-            let mut round=0;
+        operation.input_forms =
+            input.is_some() && self.binding.protocol == Revision::Current20260728;
+        if operation.input_forms {
+            operation.deadline = Instant::now() + Duration::from_secs(super::input::MAX_SECONDS);
+        }
+        let result = (|| {
+            let mut params = params;
+            let mut round = 0;
             loop {
-                let response=self.request(identity.kind.method(),params,&mut operation)?;
-                if response["result"]["resultType"]!="input_required" || !operation.input_forms {return Ok(response);}
-                round+=1;
-                if round>super::input::MAX_ROUNDS {return Err(DomainError::LimitExceeded("MCP input rounds".into()));}
-                let fields=input.ok_or(DomainError::PermissionDenied)?(&response,round)?;
+                let response = self.request(identity.kind.method(), params, &mut operation)?;
+                if response["result"]["resultType"] != "input_required" || !operation.input_forms {
+                    return Ok(response);
+                }
+                round += 1;
+                if round > super::input::MAX_ROUNDS {
+                    return Err(DomainError::LimitExceeded("MCP input rounds".into()));
+                }
+                let fields = input.ok_or(DomainError::PermissionDenied)?(&response, round)?;
                 operation.check()?;
-                params=if identity.kind==ag1_core::tools::mcp::Kind::Tool {
-                    self.refresh_tools(cancel)?;super::operation::check_tool(self.tools(),identity,args)?;identity.protocol_params(args)?
-                }else{let catalog=self.list(super::operation::discovery_kind(identity.kind)?,cancel)?;super::operation::check_capability(&catalog,identity,args)?};
-                for (key,value) in fields.as_object().ok_or(DomainError::PermissionDenied)? {params[key]=value.clone();}
-                operation.send=Some(continue_send);
+                params = if identity.kind == ag1_core::tools::mcp::Kind::Tool {
+                    self.refresh_tools(cancel)?;
+                    super::operation::check_tool(self.tools(), identity, args)?;
+                    identity.protocol_params(args)?
+                } else {
+                    let catalog =
+                        self.list(super::operation::discovery_kind(identity.kind)?, cancel)?;
+                    super::operation::check_capability(&catalog, identity, args)?
+                };
+                for (key, value) in fields.as_object().ok_or(DomainError::PermissionDenied)? {
+                    params[key] = value.clone();
+                }
+                operation.send = Some(continue_send);
             }
         })();
         self.settle(result)

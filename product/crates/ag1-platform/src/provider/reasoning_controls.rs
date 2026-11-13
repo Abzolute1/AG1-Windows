@@ -45,8 +45,11 @@ pub fn declared(model: &Value) -> Value {
         }
         if let Some(normalized) = result["modes"].as_array_mut() {
             for mode in normalized {
-                if let Some(native) = modes.iter().find(|m| m["id"] == mode["id"])
-                    .and_then(|m| m.get("nativeValue")) {
+                if let Some(native) = modes
+                    .iter()
+                    .find(|m| m["id"] == mode["id"])
+                    .and_then(|m| m.get("nativeValue"))
+                {
                     mode["nativeValue"] = native.clone();
                 }
             }

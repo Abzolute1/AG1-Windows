@@ -70,8 +70,18 @@ pub(crate) struct Metadata {
 }
 impl Metadata {
     pub(crate) fn namespace_git_dir(&self) -> String {
-        if self.git.root() == self.common.root() { "/gitcommon".into() }
-        else { format!("/gitcommon/{}", self.git.root().strip_prefix(self.common.root()).expect("validated dedicated slot").display()) }
+        if self.git.root() == self.common.root() {
+            "/gitcommon".into()
+        } else {
+            format!(
+                "/gitcommon/{}",
+                self.git
+                    .root()
+                    .strip_prefix(self.common.root())
+                    .expect("validated dedicated slot")
+                    .display()
+            )
+        }
     }
 }
 fn text(snapshot: &ByteSnapshot) -> Result<&str> {
@@ -179,7 +189,9 @@ pub(super) fn run(
         std::fs::create_dir_all(temp.path().join("skeleton/info")).map_err(io_error)?;
         std::fs::create_dir_all(temp.path().join("skeleton/objects/info")).map_err(io_error)?;
         Some(overlay.pin_directory("skeleton")?)
-    } else { None };
+    } else {
+        None
+    };
     let mut argv = [
         "--die-with-parent",
         "--unshare-user",
@@ -215,18 +227,29 @@ pub(super) fn run(
     let git_dir = metadata.namespace_git_dir();
     if let Some(skeleton) = &skeleton {
         for pin in [&common, skeleton] {
-            argv.extend(["--overlay-src".into(),
-                format!("{PINNED_DIRECTORY_PREFIX}{}", pin.process_cwd().display())]);
+            argv.extend([
+                "--overlay-src".into(),
+                format!("{PINNED_DIRECTORY_PREFIX}{}", pin.process_cwd().display()),
+            ]);
         }
         argv.extend(["--ro-overlay".into(), "/gitcommon".into()]);
     } else {
-        argv.extend(["--ro-bind-fd".into(),
-            format!("{PINNED_DIRECTORY_PREFIX}{}", common.process_cwd().display()), "/gitcommon".into()]);
+        argv.extend([
+            "--ro-bind-fd".into(),
+            format!(
+                "{PINNED_DIRECTORY_PREFIX}{}",
+                common.process_cwd().display()
+            ),
+            "/gitcommon".into(),
+        ]);
     }
     // Rebinding the common root here would hide the synthesized mount points.
     if metadata.git.root() != metadata.common.root() {
-        argv.extend(["--ro-bind-fd".into(),
-            format!("{PINNED_DIRECTORY_PREFIX}{}", git.process_cwd().display()), git_dir.clone()]);
+        argv.extend([
+            "--ro-bind-fd".into(),
+            format!("{PINNED_DIRECTORY_PREFIX}{}", git.process_cwd().display()),
+            git_dir.clone(),
+        ]);
     }
     for (pin, target) in [
         (&info, "/gitcommon/info"),
@@ -315,12 +338,24 @@ pub(super) fn run(
         }
         std::thread::sleep(Duration::from_millis(2));
     };
-    for pin in [&root, &git, &common, &objects, &info].into_iter()
-        .chain(original_info.as_ref()).chain(original_object_info.as_ref()).chain(skeleton.as_ref()) {
+    for pin in [&root, &git, &common, &objects, &info]
+        .into_iter()
+        .chain(original_info.as_ref())
+        .chain(original_object_info.as_ref())
+        .chain(skeleton.as_ref())
+    {
         pin.verify_identity()?;
     }
-    for (name, before) in [("info", &original_info), ("objects/info", &original_object_info)] {
-        if before.is_none() && !matches!(metadata.common.pin_directory(name), Err(DomainError::NotFound)) {
+    for (name, before) in [
+        ("info", &original_info),
+        ("objects/info", &original_object_info),
+    ] {
+        if before.is_none()
+            && !matches!(
+                metadata.common.pin_directory(name),
+                Err(DomainError::NotFound)
+            )
+        {
             return Err(DomainError::Conflict);
         }
     }

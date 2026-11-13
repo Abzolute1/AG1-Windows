@@ -283,7 +283,8 @@ static CD: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 fn outside_shell(command: &str, cwd: &str, folders: &[String]) -> Option<String> {
-    let contained_here = |path: &str| contained(path,cwd) || folders.iter().any(|root|contained(path,root));
+    let contained_here =
+        |path: &str| contained(path, cwd) || folders.iter().any(|root| contained(path, root));
     for c in PATH_TOKEN.captures_iter(command) {
         let raw = c.get(1).expect("path capture");
         // The legacy token heuristic splits on spaces. Recognize a complete
@@ -291,13 +292,22 @@ fn outside_shell(command: &str, cwd: &str, folders: &[String]) -> Option<String>
         // concatenated suffix such as '/granted folder'-outside.
         let quoted = raw.start().checked_sub(1).and_then(|start| {
             let quote = command.as_bytes()[start];
-            if !matches!(quote,b'\''|b'"') { return None; }
+            if !matches!(quote, b'\'' | b'"') {
+                return None;
+            }
             let rest = &command[raw.start()..];
             let end = rest.find(quote as char)?;
             let path = &rest[..end];
-            let suffix = &rest[end+1..];
-            if !suffix.is_empty() && !suffix.starts_with(|c:char|c.is_whitespace() || ";|&<>".contains(c)) {return None;}
-            folders.iter().any(|folder|folder.contains(' ') && contained(path,folder)).then_some(path)
+            let suffix = &rest[end + 1..];
+            if !suffix.is_empty()
+                && !suffix.starts_with(|c: char| c.is_whitespace() || ";|&<>".contains(c))
+            {
+                return None;
+            }
+            folders
+                .iter()
+                .any(|folder| folder.contains(' ') && contained(path, folder))
+                .then_some(path)
         });
         let token = trim_token(quoted.unwrap_or(raw.as_str()));
         if token.is_empty() || token == "/" {
@@ -328,7 +338,7 @@ fn outside_shell(command: &str, cwd: &str, folders: &[String]) -> Option<String>
                 return Some(token.into());
             }
         }
-        if token.starts_with("../") && !contained_here(&resolve(token,cwd)) {
+        if token.starts_with("../") && !contained_here(&resolve(token, cwd)) {
             return Some(token.into());
         }
     }
@@ -451,12 +461,24 @@ pub fn evaluate(
     p: &Policy,
     untrusted_extensions: bool,
 ) -> Result<Decision, DomainError> {
-    evaluate_in_folders(tool,args,p,untrusted_extensions,&[])
+    evaluate_in_folders(tool, args, p, untrusted_extensions, &[])
 }
 /// Additional directories are captured host capabilities, never model arguments.
 /// This remains a policy heuristic; the host must enforce filesystem effects.
-pub fn evaluate_in_folders(tool: &str, args: &Value, p: &Policy, untrusted_extensions: bool, folders: &[String]) -> Result<Decision, DomainError> {
-    if folders.len()>16 || folders.iter().any(|p| !p.starts_with('/') || p.len()>4096 || p.contains('\0')) { return Err(DomainError::InvalidInput("host folder policy".into())); }
+pub fn evaluate_in_folders(
+    tool: &str,
+    args: &Value,
+    p: &Policy,
+    untrusted_extensions: bool,
+    folders: &[String],
+) -> Result<Decision, DomainError> {
+    if folders.len() > 16
+        || folders
+            .iter()
+            .any(|p| !p.starts_with('/') || p.len() > 4096 || p.contains('\0'))
+    {
+        return Err(DomainError::InvalidInput("host folder policy".into()));
+    }
     if !p.cwd.starts_with('/')
         || p.cwd.contains('\0')
         || p.trusted_tools.len() > 256
@@ -474,16 +496,37 @@ pub fn evaluate_in_folders(tool: &str, args: &Value, p: &Policy, untrusted_exten
     // Trusted-tool lists and autonomous mode still require confirmation;
     // native preparation/execution retain account, target and scope fences.
     if tool == "github" {
-        return Ok(if ["catalog","schema"].contains(&args["operation"].as_str().unwrap_or("")) || p.mode == Mode::Disabled { yes() }
-            else if matches!(p.mode,Mode::Planning|Mode::Headless) { no("GitHub account operations require interactive confirmation.") }
-            else { ask(p,tool,"high","Review GitHub account operation".into(),"Review the native account, repository, request and consequences before approving.".into()) });
+        return Ok(
+            if ["catalog", "schema"].contains(&args["operation"].as_str().unwrap_or(""))
+                || p.mode == Mode::Disabled
+            {
+                yes()
+            } else if matches!(p.mode, Mode::Planning | Mode::Headless) {
+                no("GitHub account operations require interactive confirmation.")
+            } else {
+                ask(p,tool,"high","Review GitHub account operation".into(),"Review the native account, repository, request and consequences before approving.".into())
+            },
+        );
     }
     if tool == "preview" {
-        return Ok(if args["action"] == "status" { yes() } else { match p.mode {
-            Mode::Planning | Mode::Headless => no("Starting or stopping a preview requires execution mode."),
-            Mode::Interactive => ask(p, tool, "high", "Manage owned project preview".into(), "Review the native target and launch command or exact operation to stop.".into()),
-            _ => yes(),
-        }});
+        return Ok(if args["action"] == "status" {
+            yes()
+        } else {
+            match p.mode {
+                Mode::Planning | Mode::Headless => {
+                    no("Starting or stopping a preview requires execution mode.")
+                }
+                Mode::Interactive => ask(
+                    p,
+                    tool,
+                    "high",
+                    "Manage owned project preview".into(),
+                    "Review the native target and launch command or exact operation to stop."
+                        .into(),
+                ),
+                _ => yes(),
+            }
+        });
     }
     if p.mode == Mode::Disabled {
         return Ok(yes());
@@ -497,11 +540,25 @@ pub fn evaluate_in_folders(tool: &str, args: &Value, p: &Policy, untrusted_exten
         )));
     }
     if tool == "edit" && args["mode"] == "preview" {
-        return Ok(if p.mode == Mode::Planning && p.planning_read_only_tools.as_deref() == Some("block") { no("File inspection is blocked for this planning turn.") } else { yes() });
+        return Ok(
+            if p.mode == Mode::Planning && p.planning_read_only_tools.as_deref() == Some("block") {
+                no("File inspection is blocked for this planning turn.")
+            } else {
+                yes()
+            },
+        );
     }
     if READ.contains(&tool)
         || RESEARCH.contains(&tool)
-        || ["task", "explore", "todo", "memory", "taskState", "submit_plan"].contains(&tool)
+        || [
+            "task",
+            "explore",
+            "todo",
+            "memory",
+            "taskState",
+            "submit_plan",
+        ]
+        .contains(&tool)
     {
         return Ok(yes());
     }

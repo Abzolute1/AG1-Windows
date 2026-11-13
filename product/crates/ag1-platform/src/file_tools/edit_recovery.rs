@@ -2,7 +2,9 @@
 use serde_json::{Value, json};
 pub(super) fn explain(error: &str, path: &str, source: &str, args: &Value) -> String {
     if error.starts_with("No changes made") {
-        return format!("{error}\nNo edit was applied. Inspect the intended diff or run the relevant check; do not resubmit a replacement that leaves the current content unchanged.");
+        return format!(
+            "{error}\nNo edit was applied. Inspect the intended diff or run the relevant check; do not resubmit a replacement that leaves the current content unchanged."
+        );
     }
     if !error.contains("Could not find")
         && !error.contains("occurrences")

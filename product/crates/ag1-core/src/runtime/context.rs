@@ -43,8 +43,13 @@ pub fn working_state_with_task_tool(
     validate: impl FnMut(&str) -> Option<SourceValidation>,
     task_tool_available: bool,
 ) -> Option<String> {
-    working_state_with_control_tool(branch, messages, artifacts, validate,
-        task_tool_available.then_some(projections::TaskControlTool::Legacy))
+    working_state_with_control_tool(
+        branch,
+        messages,
+        artifacts,
+        validate,
+        task_tool_available.then_some(projections::TaskControlTool::Legacy),
+    )
 }
 pub fn working_state_with_control_tool(
     branch: &[Value],

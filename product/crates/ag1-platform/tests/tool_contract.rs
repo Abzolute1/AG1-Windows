@@ -55,7 +55,9 @@ fn call(registry: &Registry, id: &str, name: &str, args: Value) -> ValidatedCall
 // Keep captured SDK payloads intact while asserting the native revision fields
 // from the fixture's original source bytes, never from the observed result.
 fn native_file_provenance(expected: &mut Value, tool: &str, path: &str, original: &[u8]) {
-    if !expected.is_object() { return; }
+    if !expected.is_object() {
+        return;
+    }
     let hash = ag1_storage::digest(original);
     if tool == "read" {
         expected["details"]["sourceReference"] = json!(format!("file:{path}@sha256:{hash}"));
@@ -209,7 +211,12 @@ fn native_files_match_39_reference_cases_with_explicit_native_safety_corrections
                 failure_corrected += 1;
             } else {
                 let mut expected = row["output"]["result"].clone();
-                native_file_provenance(&mut expected, input["tool"].as_str().unwrap(), "file.txt", input["original"].as_str().unwrap_or("").as_bytes());
+                native_file_provenance(
+                    &mut expected,
+                    input["tool"].as_str().unwrap(),
+                    "file.txt",
+                    input["original"].as_str().unwrap_or("").as_bytes(),
+                );
                 assert_eq!(normalized, expected, "case {index}");
             }
         }
@@ -576,7 +583,12 @@ fn native_read_windows_match_sdk_bytes_progress_and_inspection_references() {
             )
             .unwrap();
         let mut expected = row["output"]["result"].clone();
-        native_file_provenance(&mut expected, "read", "file.txt", row["input"]["text"].as_str().unwrap().as_bytes());
+        native_file_provenance(
+            &mut expected,
+            "read",
+            "file.txt",
+            row["input"]["text"].as_str().unwrap().as_bytes(),
+        );
         assert_eq!(result.result, expected, "read {i}");
         assert!(result.published.is_none());
     }
@@ -3998,9 +4010,15 @@ fn selected_original_file_cases_match_sdk_results_bytes_modes_and_rejections() {
             .unwrap();
             let mut expected = input["output"].clone();
             if let Some(bytes) = input["before"]["bytes"].as_str()
-                && let Some(result) = expected.get_mut("result") {
+                && let Some(result) = expected.get_mut("result")
+            {
                 let relative = path.strip_prefix(dir.path()).unwrap().to_str().unwrap();
-                native_file_provenance(result, input["tool"].as_str().unwrap(), relative, &STANDARD.decode(bytes).unwrap());
+                native_file_provenance(
+                    result,
+                    input["tool"].as_str().unwrap(),
+                    relative,
+                    &STANDARD.decode(bytes).unwrap(),
+                );
             }
             assert_eq!(output, expected, "{}", row["name"]);
             assert_eq!(state(), input["after"], "final bytes/mode: {}", row["name"]);

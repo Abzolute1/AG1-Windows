@@ -258,7 +258,8 @@ impl<R: WebResolver> HttpDiscovery<R> {
     }
     fn operation<'a>(&self) -> Operation<'a> {
         Operation {
-            input_forms: false,            deadline: Instant::now() + self.limits.timeout(),
+            input_forms: false,
+            deadline: Instant::now() + self.limits.timeout(),
             bytes: 0,
             messages: 0,
             send: None,
@@ -274,7 +275,8 @@ impl<R: WebResolver> HttpDiscovery<R> {
             // a cleanup connection when cancellation occurred before contact.
             let (_source, mut cancel) = cancellation();
             let mut cleanup = Operation {
-                input_forms: false,                deadline: Instant::now() + Duration::from_millis(100),
+                input_forms: false,
+                deadline: Instant::now() + Duration::from_millis(100),
                 bytes: 0,
                 messages: 0,
                 send: None,
@@ -351,7 +353,7 @@ impl<R: WebResolver> HttpDiscovery<R> {
         cancel: &mut CancelToken,
         send: &(dyn Fn() -> Result<(), DomainError> + Sync),
         continue_send: &(dyn Fn() -> Result<(), DomainError> + Sync),
-        input: Option<&(dyn Fn(&Value,usize)->Result<Value,DomainError> + Sync)>,
+        input: Option<&(dyn Fn(&Value, usize) -> Result<Value, DomainError> + Sync)>,
     ) -> Result<Value, DomainError> {
         let params = if identity.kind == ag1_core::tools::mcp::Kind::Tool {
             self.refresh_tools(cancel).await?;
@@ -368,26 +370,49 @@ impl<R: WebResolver> HttpDiscovery<R> {
             .map_err(|_| DomainError::QueueFull)?;
         let mut operation = self.operation();
         operation.send = Some(send);
-        operation.input_forms=input.is_some() && self.binding.protocol==Revision::Current20260728;
-        if operation.input_forms {operation.deadline=Instant::now()+Duration::from_secs(super::input::MAX_SECONDS);}
-        let result=async {
-            let mut params=params;
-            let mut round=0;
+        operation.input_forms =
+            input.is_some() && self.binding.protocol == Revision::Current20260728;
+        if operation.input_forms {
+            operation.deadline = Instant::now() + Duration::from_secs(super::input::MAX_SECONDS);
+        }
+        let result = async {
+            let mut params = params;
+            let mut round = 0;
             loop {
-                let response=self.request(identity.kind.method(),params,&mut operation,cancel).await?;
-                if response["result"]["resultType"]!="input_required" || !operation.input_forms {return Ok(response);}
-                round+=1;
-                if round>super::input::MAX_ROUNDS {return Err(DomainError::LimitExceeded("MCP input rounds".into()));}
-                let fields=input.ok_or(DomainError::PermissionDenied)?(&response,round)?;
-                if cancel.cancelled(){return Err(DomainError::Cancelled);}
-                if Instant::now()>=operation.deadline{return Err(DomainError::TimedOut);}
-                params=if identity.kind==ag1_core::tools::mcp::Kind::Tool {
-                    self.refresh_tools(cancel).await?;super::operation::check_tool(self.tools(),identity,args)?;identity.protocol_params(args)?
-                }else{let catalog=self.list(super::operation::discovery_kind(identity.kind)?,cancel).await?;super::operation::check_capability(&catalog,identity,args)?};
-                for (key,value) in fields.as_object().ok_or(DomainError::PermissionDenied)? {params[key]=value.clone();}
-                operation.send=Some(continue_send);
+                let response = self
+                    .request(identity.kind.method(), params, &mut operation, cancel)
+                    .await?;
+                if response["result"]["resultType"] != "input_required" || !operation.input_forms {
+                    return Ok(response);
+                }
+                round += 1;
+                if round > super::input::MAX_ROUNDS {
+                    return Err(DomainError::LimitExceeded("MCP input rounds".into()));
+                }
+                let fields = input.ok_or(DomainError::PermissionDenied)?(&response, round)?;
+                if cancel.cancelled() {
+                    return Err(DomainError::Cancelled);
+                }
+                if Instant::now() >= operation.deadline {
+                    return Err(DomainError::TimedOut);
+                }
+                params = if identity.kind == ag1_core::tools::mcp::Kind::Tool {
+                    self.refresh_tools(cancel).await?;
+                    super::operation::check_tool(self.tools(), identity, args)?;
+                    identity.protocol_params(args)?
+                } else {
+                    let catalog = self
+                        .list(super::operation::discovery_kind(identity.kind)?, cancel)
+                        .await?;
+                    super::operation::check_capability(&catalog, identity, args)?
+                };
+                for (key, value) in fields.as_object().ok_or(DomainError::PermissionDenied)? {
+                    params[key] = value.clone();
+                }
+                operation.send = Some(continue_send);
             }
-        }.await;
+        }
+        .await;
         self.retire(result).await
     }
 

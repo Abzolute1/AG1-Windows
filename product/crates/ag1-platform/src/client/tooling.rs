@@ -72,13 +72,24 @@ pub(super) fn adapters(
         ..Default::default()
     };
     if let Some(folders) = folders {
-        result.folder_files = folders.roots.iter().map(|root| Arc::new(crate::file_tools::FileService::new(root.clone()).with_reviews(store.clone()))).collect();
+        result.folder_files = folders
+            .roots
+            .iter()
+            .map(|root| {
+                Arc::new(
+                    crate::file_tools::FileService::new(root.clone()).with_reviews(store.clone()),
+                )
+            })
+            .collect();
     }
     if let Some(t) = tooling {
         let spools = state.join("tools");
         fs::create_dir_all(&spools).map_err(crate::io_error)?;
         let supervisor = Arc::new(crate::process::ProcessSupervisor::new(&t.process_host)?);
-        let git = || crate::git::GitService::new(&t.process_host, &t.git, &spools).map(|g|g.with_bubblewrap(&t.bubblewrap));
+        let git = || {
+            crate::git::GitService::new(&t.process_host, &t.git, &spools)
+                .map(|g| g.with_bubblewrap(&t.bubblewrap))
+        };
         result.git = Some(Arc::new(crate::git_tools::GitTools::new(
             workspace.clone(),
             git()?,
@@ -111,23 +122,39 @@ pub(super) fn adapters(
             &spools,
         )?));
         if let Some(folders) = folders {
-            result.folder_search = folders.roots.iter().map(|root| crate::search_tools::SearchService::new(root.clone(), supervisor.clone(), &t.rg, &t.fd, &spools).map(Arc::new)).collect::<Result<Vec<_>>>()?;
+            result.folder_search = folders
+                .roots
+                .iter()
+                .map(|root| {
+                    crate::search_tools::SearchService::new(
+                        root.clone(),
+                        supervisor.clone(),
+                        &t.rg,
+                        &t.fd,
+                        &spools,
+                    )
+                    .map(Arc::new)
+                })
+                .collect::<Result<Vec<_>>>()?;
         }
-        let shell = Arc::new(crate::shell_tools::ShellService::new(
-            workspace.clone(),
-            supervisor,
-            &spools,
-            crate::shell_tools::ShellConfig {
-                executable: "/bin/bash".into(),
-                env: t.targets.environment(workspace.root())?,
-                command_prefix: None,
-                command_template: None,
-                sandbox: crate::shell_tools::Sandbox::Workspace,
-                bubblewrap: Some(t.bubblewrap.clone()),
-                output_bytes: 8 * 1024 * 1024,
-                address_space: None,
-            },
-        )?.with_folders(folders.cloned())?);
+        let shell = Arc::new(
+            crate::shell_tools::ShellService::new(
+                workspace.clone(),
+                supervisor,
+                &spools,
+                crate::shell_tools::ShellConfig {
+                    executable: "/bin/bash".into(),
+                    env: t.targets.environment(workspace.root())?,
+                    command_prefix: None,
+                    command_template: None,
+                    sandbox: crate::shell_tools::Sandbox::Workspace,
+                    bubblewrap: Some(t.bubblewrap.clone()),
+                    output_bytes: 8 * 1024 * 1024,
+                    address_space: None,
+                },
+            )?
+            .with_folders(folders.cloned())?,
+        );
         result.jobs = Some(Arc::new(crate::job_tools::JobService::new(
             store.clone(),
             shell.clone(),

@@ -19,14 +19,14 @@ use std::{
 type Result<T> = std::result::Result<T, DomainError>;
 #[path = "local_clone.rs"]
 mod clone;
-#[path = "local_network.rs"]
-mod network;
-#[path = "local_transition.rs"]
-mod transition;
 #[path = "local_metadata.rs"]
 mod metadata;
+#[path = "local_network.rs"]
+mod network;
 #[path = "local_storage.rs"]
 mod storage;
+#[path = "local_transition.rs"]
+mod transition;
 pub struct LocalGit {
     storage_active: std::sync::atomic::AtomicU8,
     storage_polled: std::sync::Mutex<Instant>,
@@ -106,7 +106,8 @@ impl LocalGit {
         Ok(Self {
             storage_active: std::sync::atomic::AtomicU8::new(0),
             storage_polled: std::sync::Mutex::new(Instant::now()),
-            #[cfg(test)] storage_limits: None,
+            #[cfg(test)]
+            storage_limits: None,
             metadata: std::sync::Mutex::new(None),
             workspace,
             supervisor: ProcessSupervisor::new(helper)?,
@@ -144,7 +145,12 @@ impl LocalGit {
                 return Err(DomainError::PermissionDenied);
             }
         }
-        if let Some(binding) = self.metadata.lock().map_err(|_| DomainError::Conflict)?.as_ref() {
+        if let Some(binding) = self
+            .metadata
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .as_ref()
+        {
             binding.verify(self, write)?;
         }
         Ok(())
@@ -196,7 +202,9 @@ impl LocalGit {
         )
         .map_err(io_error)?;
         for name in ["exclude", "sparse-checkout"] {
-            match binding.common.snapshot(&format!("info/{name}"), 1024 * 1024)
+            match binding
+                .common
+                .snapshot(&format!("info/{name}"), 1024 * 1024)
             {
                 Ok(snapshot) => {
                     std::fs::write(info_temp.path().join(name), snapshot.bytes).map_err(io_error)?
@@ -240,8 +248,15 @@ impl LocalGit {
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-        for (pin,target) in [(&common_pin,"/gitcommon"),(&metadata_pin,binding.namespace_git_dir.as_str())] {
-            argv.extend(["--bind-fd".into(), format!("{PINNED_DIRECTORY_PREFIX}{}",pin.process_cwd().display()),target.into()]);
+        for (pin, target) in [
+            (&common_pin, "/gitcommon"),
+            (&metadata_pin, binding.namespace_git_dir.as_str()),
+        ] {
+            argv.extend([
+                "--bind-fd".into(),
+                format!("{PINNED_DIRECTORY_PREFIX}{}", pin.process_cwd().display()),
+                target.into(),
+            ]);
         }
         argv.extend([
             "--ro-bind-fd".into(),
@@ -251,7 +266,14 @@ impl LocalGit {
             ),
             "/gitcommon/info".into(),
         ]);
-        argv.extend(["--ro-bind-fd".into(),format!("{PINNED_DIRECTORY_PREFIX}{}",overlay_pin.process_cwd().display()),"/gitcommon/objects/info".into()]);
+        argv.extend([
+            "--ro-bind-fd".into(),
+            format!(
+                "{PINNED_DIRECTORY_PREFIX}{}",
+                overlay_pin.process_cwd().display()
+            ),
+            "/gitcommon/objects/info".into(),
+        ]);
         for lib in ["/lib", "/lib64"] {
             if Path::new(lib).exists() {
                 argv.extend(["--ro-bind".into(), lib.into(), lib.into()]);
@@ -352,7 +374,13 @@ impl LocalGit {
         let mut bytes = Vec::new();
         let mut storage_polled = Instant::now();
         let success = loop {
-            let admission=control.check().and_then(|_| {if storage_polled.elapsed() >= Duration::from_millis(100) {self.storage_check(control)?;storage_polled=Instant::now();}Ok(())});
+            let admission = control.check().and_then(|_| {
+                if storage_polled.elapsed() >= Duration::from_millis(100) {
+                    self.storage_check(control)?;
+                    storage_polled = Instant::now();
+                }
+                Ok(())
+            });
             if let Err(error) = admission {
                 if before_commit.is_some() && !abort_reference_transaction(&mut child) {
                     return Err(DomainError::DurabilityUnknown);
@@ -581,10 +609,7 @@ impl LocalGit {
             .as_str()
             .ok_or_else(|| DomainError::InvalidInput("Select a GitHub repository".into()))?;
         super::repo(&json!({"repo":repo})).map_err(DomainError::InvalidInput)?;
-        let config_revision = Some(
-            self.metadata_snapshot(".git/config", 1024 * 1024)?
-                .revision,
-        );
+        let config_revision = Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision);
         let remote = self.run(
             &["config", "--no-includes", "--get", "remote.origin.url"],
             control,
@@ -792,15 +817,13 @@ impl LocalGit {
             None
         };
         preview["metadata"] = self.metadata()?.identity();
-        if !["status","diff","branches"].contains(&action) {preview["storage"] = self.storage_admit(action,control)?;}
+        if !["status", "diff", "branches"].contains(&action) {
+            preview["storage"] = self.storage_admit(action, control)?;
+        }
         preview["display_limits"] = json!(
             "Diff text replaces invalid UTF-8 for display only; staged blob bytes are unchanged."
         );
-        if Some(
-            self.metadata_snapshot(".git/config", 1024 * 1024)?
-                .revision,
-        ) != config_revision
-        {
+        if Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision) != config_revision {
             return Err(DomainError::Conflict);
         }
         let transition = if ["checkout", "pull"].contains(&action) {
@@ -831,19 +854,39 @@ impl LocalGit {
             preview,
         })
     }
-    pub fn execute(&self,plan:LocalPlan,scope:&str,control:&ScanControl<'_>)->Result<Value> {
-        control.check()?;self.authority(plan.may_mutate())?;
-        if plan.scope!=scope || Instant::now()>=plan.expires{return Err(DomainError::PermissionDenied);}
-        if !plan.may_mutate(){return self.execute_admitted(plan,scope,control);}
-        let lease=storage::Lease::acquire(self)?;
-        self.storage_admit(&plan.action,control)?;
-        let mode=if plan.action=="recover"{2}else{1};
-        self.storage_active.store(mode,std::sync::atomic::Ordering::Release);
+    pub fn execute(
+        &self,
+        plan: LocalPlan,
+        scope: &str,
+        control: &ScanControl<'_>,
+    ) -> Result<Value> {
+        control.check()?;
+        self.authority(plan.may_mutate())?;
+        if plan.scope != scope || Instant::now() >= plan.expires {
+            return Err(DomainError::PermissionDenied);
+        }
+        if !plan.may_mutate() {
+            return self.execute_admitted(plan, scope, control);
+        }
+        let lease = storage::Lease::acquire(self)?;
+        self.storage_admit(&plan.action, control)?;
+        let mode = if plan.action == "recover" { 2 } else { 1 };
+        self.storage_active
+            .store(mode, std::sync::atomic::Ordering::Release);
         struct Active<'a>(&'a std::sync::atomic::AtomicU8);
-        impl Drop for Active<'_>{fn drop(&mut self){self.0.store(0,std::sync::atomic::Ordering::Release);}}
-        let _active=Active(&self.storage_active);
-        let result=self.execute_admitted(plan,scope,control);
-        if result.is_ok(){lease.verify().and_then(|_|self.storage_check_now(control)).map_err(|_|DomainError::DurabilityUnknown)?;}
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _active = Active(&self.storage_active);
+        let result = self.execute_admitted(plan, scope, control);
+        if result.is_ok() {
+            lease
+                .verify()
+                .and_then(|_| self.storage_check_now(control))
+                .map_err(|_| DomainError::DurabilityUnknown)?;
+        }
         result
     }
     fn execute_admitted(
@@ -871,10 +914,8 @@ impl LocalGit {
         }
         if self.state(control)? != (plan.head.clone(), plan.branch.clone())
             || self.index()?.as_ref().map(|(_, r)| r) != plan.index.as_ref().map(|(_, r)| r)
-            || Some(
-                self.metadata_snapshot(".git/config", 1024 * 1024)?
-                    .revision,
-            ) != plan.config_revision
+            || Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision)
+                != plan.config_revision
         {
             return Err(DomainError::Conflict);
         }
@@ -1097,7 +1138,7 @@ impl LocalGit {
                 let guard = |_: &crate::process::ProcessIdentity| {
                     control.check()?;
                     self.authority(true)?;
-            self.storage_check(control)?;
+                    self.storage_check(control)?;
                     lock.verify()?;
                     if self.state(control)? != (plan.head.clone(), plan.branch.clone()) {
                         return Err(DomainError::Conflict);
@@ -1138,7 +1179,7 @@ impl LocalGit {
                 let guard = |_: &crate::process::ProcessIdentity| {
                     control.check()?;
                     self.authority(true)?;
-            self.storage_check(control)?;
+                    self.storage_check(control)?;
                     lock.verify()?;
                     if self.state(control)? != (plan.head.clone(), plan.branch.clone()) {
                         return Err(DomainError::Conflict);
@@ -1184,10 +1225,8 @@ impl LocalGit {
                     return Err(DomainError::Conflict);
                 }
             }
-            if Some(
-                self.metadata_snapshot(".git/config", 1024 * 1024)?
-                    .revision,
-            ) != plan.config_revision
+            if Some(self.metadata_snapshot(".git/config", 1024 * 1024)?.revision)
+                != plan.config_revision
             {
                 return Err(DomainError::Conflict);
             }
@@ -1197,9 +1236,10 @@ impl LocalGit {
             Ok(())
         };
         // Keep the exact preimage in private host state before index publication.
-        let private_storage=self.git_private_storage()?;
-        let private_pin=private_storage.pin_directory("")?;
-        let recovery = private_pin.process_cwd()
+        let private_storage = self.git_private_storage()?;
+        let private_pin = private_storage.pin_directory("")?;
+        let recovery = private_pin
+            .process_cwd()
             .join(format!("git-index-recovery-{}", crate::client::nonce()?));
         if let Some((bytes, _)) = &plan.index {
             use std::io::Write;
@@ -1219,10 +1259,14 @@ impl LocalGit {
         }
         match &plan.index {
             Some((_, revision)) => {
-                self.metadata()?.git.replace_checked("index", revision, &candidate, check)?;
+                self.metadata()?
+                    .git
+                    .replace_checked("index", revision, &candidate, check)?;
             }
             None => {
-                self.metadata()?.git.create_checked("index", &candidate, false, check)?;
+                self.metadata()?
+                    .git
+                    .create_checked("index", &candidate, false, check)?;
             }
         }
         lock.verify().map_err(|_| DomainError::DurabilityUnknown)?;

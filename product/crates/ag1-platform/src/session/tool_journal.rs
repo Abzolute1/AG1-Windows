@@ -286,11 +286,13 @@ impl ToolJournal {
     /// Direct send-time check for an external capability. No journal read/copy or
     /// mutation; the exact batch cancellation and live owner/epoch are authority.
     #[cfg(target_os = "linux")]
-    pub(crate) fn check_mcp_scope(&self, scope:&Scope) -> Result<(),DomainError> {
-        if self.cancelled.load(Ordering::Acquire) { return Err(DomainError::Cancelled); }
-        let book=self.book.lock().map_err(|_|DomainError::Conflict)?;
-        let state=self.state.lock().map_err(|_|DomainError::Conflict)?;
-        self.validate(scope,&book,&state)
+    pub(crate) fn check_mcp_scope(&self, scope: &Scope) -> Result<(), DomainError> {
+        if self.cancelled.load(Ordering::Acquire) {
+            return Err(DomainError::Cancelled);
+        }
+        let book = self.book.lock().map_err(|_| DomainError::Conflict)?;
+        let state = self.state.lock().map_err(|_| DomainError::Conflict)?;
+        self.validate(scope, &book, &state)
     }
     pub fn valid(&self) -> bool {
         self.book.lock().is_ok_and(|book| book.valid)
@@ -370,7 +372,11 @@ impl ToolJournal {
         let book = self.book.lock().map_err(|_| DomainError::Conflict)?;
         let state = self.state.lock().map_err(|_| DomainError::Conflict)?;
         self.validate(scope, &book, &state)?;
-        let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
+        let pending = state
+            .pending_tools()
+            .front()
+            .ok_or(DomainError::Conflict)?
+            .effective(&state.branch_snapshot())?;
         if call.origin() != Origin::BuiltIn
             || call.name() != "episode"
             || call.args()["action"] != "draft"
@@ -426,7 +432,11 @@ impl ToolJournal {
         let action = {
             let mut state = self.state.lock().map_err(|_| DomainError::Conflict)?;
             self.validate(scope, &book, &state)?;
-            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
+            let pending = state
+                .pending_tools()
+                .front()
+                .ok_or(DomainError::Conflict)?
+                .effective(&state.branch_snapshot())?;
             if call.origin() != Origin::BuiltIn
                 || pending.id != call.call_id()
                 || pending.name != call.name()
@@ -465,7 +475,11 @@ impl ToolJournal {
         let (action, result) = {
             let mut state = self.state.lock().map_err(|_| DomainError::Conflict)?;
             self.validate(scope, &book, &state)?;
-            let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?.effective(&state.branch_snapshot())?;
+            let pending = state
+                .pending_tools()
+                .front()
+                .ok_or(DomainError::Conflict)?
+                .effective(&state.branch_snapshot())?;
             if call.origin() != Origin::BuiltIn
                 || pending.id != call.call_id()
                 || call.name() != name
@@ -501,12 +515,16 @@ impl ToolJournal {
                 book.valid = false;
             }
             let pending = state.pending_tools().front().ok_or(DomainError::Conflict)?;
-            if pending.id != outcome.record.call_id { return Err(DomainError::Conflict); }
+            if pending.id != outcome.record.call_id {
+                return Err(DomainError::Conflict);
+            }
             // Canonical receipts drive verification; providers receive the
             // original advertised name paired with their original call ID.
             message["toolName"] = json!(pending.name);
             if pending.name != outcome.record.tool {
-                if !message["details"].is_object() { message["details"] = json!({}); }
+                if !message["details"].is_object() {
+                    message["details"] = json!({});
+                }
                 message["details"]["nativeTool"] = json!(outcome.record.tool);
             }
             state.append_message(&id, &id, &self.timestamp, message)?

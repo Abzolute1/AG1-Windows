@@ -283,8 +283,22 @@ async fn conversations_run_independently_preserve_history_and_scope_approvals() 
         .is_err()
     );
     let a_op = a.commands.snapshot().unwrap().queued[0].clone();
-    let running=a.commands.snapshot().unwrap();
-    assert!(a.dispatch(w::CommandEnvelope {version:Default::default(),id:"running-folder-change".to_owned().try_into().unwrap(),scope:running.scope,expected_revision:running.revision,command:w::Command::Runtime {action:"folder_access".into(),args:json!({"revision":1,"action":"mode","path":workspace,"mode":"read_only"})},extension:None}).await.is_err());
+    let running = a.commands.snapshot().unwrap();
+    assert!(
+        a.dispatch(w::CommandEnvelope {
+            version: Default::default(),
+            id: "running-folder-change".to_owned().try_into().unwrap(),
+            scope: running.scope,
+            expected_revision: running.revision,
+            command: w::Command::Runtime {
+                action: "folder_access".into(),
+                args: json!({"revision":1,"action":"mode","path":workspace,"mode":"read_only"})
+            },
+            extension: None
+        })
+        .await
+        .is_err()
+    );
     dispatch(&a, w::Command::Cancel { operation: a_op }).await;
     release_a.store(true, Ordering::SeqCst);
     wait("A cancellation", || {
@@ -334,11 +348,29 @@ async fn conversations_run_independently_preserve_history_and_scope_approvals() 
             .await
             .expect("Repository controls reopen after all project conversations settle"),
     );
-    let folder=temp.path().join("second-folder"); std::fs::create_dir(&folder).unwrap();
-    let history=serde_json::to_value(&b.view().unwrap().details.messages).unwrap();
-    let added=dispatch(&b,w::Command::Runtime {action:"folder_access".into(),args:json!({"revision":1,"action":"add","path":folder,"mode":"read_only"})}).await;
-    dispatch(&b,w::Command::Runtime {action:"folder_access".into(),args:json!({"revision":added["revision"],"action":"primary","path":folder})}).await;
-    assert_eq!(serde_json::to_value(&b.view().unwrap().details.messages).unwrap(),history);
+    let folder = temp.path().join("second-folder");
+    std::fs::create_dir(&folder).unwrap();
+    let history = serde_json::to_value(&b.view().unwrap().details.messages).unwrap();
+    let added = dispatch(
+        &b,
+        w::Command::Runtime {
+            action: "folder_access".into(),
+            args: json!({"revision":1,"action":"add","path":folder,"mode":"read_only"}),
+        },
+    )
+    .await;
+    dispatch(
+        &b,
+        w::Command::Runtime {
+            action: "folder_access".into(),
+            args: json!({"revision":added["revision"],"action":"primary","path":folder}),
+        },
+    )
+    .await;
+    assert_eq!(
+        serde_json::to_value(&b.view().unwrap().details.messages).unwrap(),
+        history
+    );
     let a_scope = a.commands.snapshot().unwrap().scope;
     let wrong = b
         .dispatch(w::CommandEnvelope {

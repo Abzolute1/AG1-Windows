@@ -1,14 +1,35 @@
 //! Release uploads use exactly uploads.github.com, with no redirects/retries.
 use super::*;
 use crate::github::uploads::Upload;
-async fn upload_to(client:&Client,token:&Token,operation:&Operation,upload:&Upload,control:&ScanControl<'_>,origin:&str)->Result<Reply>{
-    if operation.id!="releases.upload_asset"||operation.method!="POST"||operation.body.is_some(){return Err(ApiError::new("arguments","Invalid native upload."));}
+async fn upload_to(
+    client: &Client,
+    token: &Token,
+    operation: &Operation,
+    upload: &Upload,
+    control: &ScanControl<'_>,
+    origin: &str,
+) -> Result<Reply> {
+    if operation.id != "releases.upload_asset"
+        || operation.method != "POST"
+        || operation.body.is_some()
+    {
+        return Err(ApiError::new("arguments", "Invalid native upload."));
+    }
     upload.verify(control)?;
-    let mut auth=b"Bearer ".to_vec();auth.extend_from_slice(&token.0);let header=HeaderValue::from_bytes(&auth);auth.fill(0);
-    let mut header=header.map_err(|_|ApiError::new("credentials","Invalid GitHub credential."))?;header.set_sensitive(true);
-    let request=client.post(format!("{origin}/{}",operation.endpoint)).header(AUTHORIZATION,header)
-        .header("Accept","application/vnd.github+json").header("X-GitHub-Api-Version",crate::github::REST_VERSION)
-        .header("Content-Type",&upload.content_type).body(upload.payload.bytes.clone());
+    let mut auth = b"Bearer ".to_vec();
+    auth.extend_from_slice(&token.0);
+    let header = HeaderValue::from_bytes(&auth);
+    auth.fill(0);
+    let mut header =
+        header.map_err(|_| ApiError::new("credentials", "Invalid GitHub credential."))?;
+    header.set_sensitive(true);
+    let request = client
+        .post(format!("{origin}/{}", operation.endpoint))
+        .header(AUTHORIZATION, header)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", crate::github::REST_VERSION)
+        .header("Content-Type", &upload.content_type)
+        .body(upload.payload.bytes.clone());
     // This final source/grant check follows account identity and body creation.
     upload.verify(control)?;
     checked(control,async {
@@ -27,19 +48,40 @@ async fn upload_to(client:&Client,token:&Token,operation:&Operation,upload:&Uplo
         Ok(Reply{data,status,next:None,rate_remaining:remaining,rate_reset:reset,rate_resource:None,rate_limit:None,outcome:Outcome::Applied})
     }).await.map_err(|e|e.uncertain(operation))
 }
-pub(super) fn execute(expected:&Account,operation:&Operation,upload:&Upload,control:&ScanControl<'_>)->Result<Reply>{
-    network(||{
-        let token=token(control)?;
-        let rt=tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|_|ApiError::new("transport","Cannot start GitHub worker."))?;
+pub(super) fn execute(
+    expected: &Account,
+    operation: &Operation,
+    upload: &Upload,
+    control: &ScanControl<'_>,
+) -> Result<Reply> {
+    network(|| {
+        let token = token(control)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| ApiError::new("transport", "Cannot start GitHub worker."))?;
         rt.block_on(async {
-            let client=client()?;
-            if identify(&client,&token,control).await?!=*expected{return Err(ApiError::new("stale_account","The active GitHub account or credential changed. Review this upload again."));}
+            let client = client()?;
+            if identify(&client, &token, control).await? != *expected {
+                return Err(ApiError::new(
+                    "stale_account",
+                    "The active GitHub account or credential changed. Review this upload again.",
+                ));
+            }
             // GitHub.com release upload relation has this fixed origin and path;
             // untrusted upload_url values can never select a credential target.
-            upload_to(&client,&token,operation,upload,control,"https://uploads.github.com").await
+            upload_to(
+                &client,
+                &token,
+                operation,
+                upload,
+                control,
+                "https://uploads.github.com",
+            )
+            .await
         })
     })
 }
 #[cfg(test)]
-#[path="upload_transport_fixture.rs"]
+#[path = "upload_transport_fixture.rs"]
 mod fixture;

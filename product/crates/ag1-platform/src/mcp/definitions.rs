@@ -26,24 +26,43 @@ pub enum LocalAccess {
     ReadOnlyDirectory,
 }
 impl LocalAccess {
-    pub(crate) fn is_host_account(&self) -> bool { *self == Self::HostAccount }
+    pub(crate) fn is_host_account(&self) -> bool {
+        *self == Self::HostAccount
+    }
     pub(crate) fn validate(self, configuration: &Configuration) -> Result<(), DomainError> {
-        if self == Self::HostAccount { return Ok(()); }
+        if self == Self::HostAccount {
+            return Ok(());
+        }
         let Configuration::Local { cwd, .. } = configuration else {
             return Err(invalid("local access requires a local server"));
         };
         let path = Path::new(cwd);
-        if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
-            || path.parent().is_none()
-            || ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/proc", "/dev", "/run", "/ag1", "/etc"]
-                .iter().any(|reserved| path.starts_with(reserved))
-        { return Err(invalid("read-only MCP directory must be an explicit directory outside reserved system roots")); }
+        if path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        }) || path.parent().is_none()
+            || [
+                "/usr", "/lib", "/lib64", "/bin", "/sbin", "/proc", "/dev", "/run", "/ag1", "/etc",
+            ]
+            .iter()
+            .any(|reserved| path.starts_with(reserved))
+        {
+            return Err(invalid(
+                "read-only MCP directory must be an explicit directory outside reserved system roots",
+            ));
+        }
         Ok(())
     }
     pub fn description(self) -> &'static str {
         match self {
-            Self::HostAccount => "Host-account code execution. Dependencies are mutable; workspace availability and tool rules do not provide OS containment.",
-            Self::ReadOnlyDirectory => "Read-only access to the reviewed directory and system runtime files, with networking disabled. Other user directories are hidden. Dependencies within the allowed paths remain mutable. Runtimes requiring writes or sockets are unsupported in this mode; AG1 never silently falls back to host-account access.",
+            Self::HostAccount => {
+                "Host-account code execution. Dependencies are mutable; workspace availability and tool rules do not provide OS containment."
+            }
+            Self::ReadOnlyDirectory => {
+                "Read-only access to the reviewed directory and system runtime files, with networking disabled. Other user directories are hidden. Dependencies within the allowed paths remain mutable. Runtimes requiring writes or sockets are unsupported in this mode; AG1 never silently falls back to host-account access."
+            }
         }
     }
 }
@@ -67,7 +86,13 @@ pub enum Configuration {
 #[serde(tag = "source", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Provenance {
     Manual,
-    Registry { registry: String, name: String, version: String, sha256: String, retrieved_at: u64 },
+    Registry {
+        registry: String,
+        name: String,
+        version: String,
+        sha256: String,
+        retrieved_at: u64,
+    },
     Project {
         path: String,
         sha256: String,
@@ -188,9 +213,23 @@ impl Draft {
         {
             return Err(invalid("project provenance"));
         }
-        if let Provenance::Registry { registry, name, version, sha256, retrieved_at } = &self.provenance {
-            if registry != "https://api.mcp.github.com" || !label(name, 256) || !label(version, 256)
-                || *retrieved_at == 0 || sha256.len() != 64 || !sha256.bytes().all(|b|b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        if let Provenance::Registry {
+            registry,
+            name,
+            version,
+            sha256,
+            retrieved_at,
+        } = &self.provenance
+        {
+            if registry != "https://api.mcp.github.com"
+                || !label(name, 256)
+                || !label(version, 256)
+                || *retrieved_at == 0
+                || sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
                 return Err(invalid("registry provenance"));
             }
         }

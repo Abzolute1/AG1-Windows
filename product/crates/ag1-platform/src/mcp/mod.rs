@@ -2,21 +2,21 @@
 //!
 //! Live transports must enforce their own aggregate budgets and deadlines before
 //! using these parsers. Catalog validation is never permission to execute a tool.
-pub mod catalog;
 pub mod auth;
+pub mod catalog;
 pub mod definitions;
 pub mod discovery;
-pub mod registry;
-pub mod input;
-pub mod http;
-pub mod oauth;
 #[cfg(feature = "mcp-fixtures")]
 pub mod fixtures;
+pub mod http;
+pub mod input;
 #[cfg(target_os = "linux")]
 pub mod manager;
+pub mod oauth;
+pub(crate) mod operation;
+pub mod registry;
 #[cfg(target_os = "linux")]
 pub mod service;
-pub(crate) mod operation;
 mod sse;
 #[cfg(target_os = "linux")]
 pub mod stdio;

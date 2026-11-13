@@ -844,13 +844,22 @@ fn todo_tool_preserves_sdk_transitions_and_exposes_current_query_ids() {
         if matches!(row["id"].as_str(), Some("query" | "query-phase")) {
             // Native queries intentionally expose reusable IDs; the frozen SDK
             // oracle returned only a generic acknowledgement and null todos.
-            let items = row.get("state").map(|state| state["items"].clone()).unwrap_or_else(|| json!([]));
-            assert_eq!(plan.result["details"], json!({
-                "todos": items, "planId": row["state"]["planId"], "phase": row["state"]["phase"],
-            }));
-            assert_eq!(plan.result["content"], json!([{"type":"text","text":format!(
-                "Current todo list (reuse these IDs when updating): {items}"
-            )}]));
+            let items = row
+                .get("state")
+                .map(|state| state["items"].clone())
+                .unwrap_or_else(|| json!([]));
+            assert_eq!(
+                plan.result["details"],
+                json!({
+                    "todos": items, "planId": row["state"]["planId"], "phase": row["state"]["phase"],
+                })
+            );
+            assert_eq!(
+                plan.result["content"],
+                json!([{"type":"text","text":format!(
+                    "Current todo list (reuse these IDs when updating): {items}"
+                )}])
+            );
         } else {
             assert_eq!(plan.result, row["output"], "{} output", row["id"]);
         }
@@ -1035,24 +1044,44 @@ mod planning_workflow;
 
 #[test]
 fn deeper_observation_explicit_task_scope_projects_once_and_rejects_changed_objective() {
-    use ag1_core::{task::TaskState, tools::observation::{prepare, ObservationIdentity}};
+    use ag1_core::{
+        task::TaskState,
+        tools::observation::{ObservationIdentity, prepare},
+    };
     use serde_json::json;
-    let task = TaskState::empty("2026-09-11T12:00:00.000Z").set(&json!({"objective":"Investigate rendering"}), "2026-09-11T12:00:00.000Z").unwrap();
+    let task = TaskState::empty("2026-09-11T12:00:00.000Z")
+        .set(
+            &json!({"objective":"Investigate rendering"}),
+            "2026-09-11T12:00:00.000Z",
+        )
+        .unwrap();
     let branch = vec![json!({"type":"custom","customType":"task_state","data":task.value()})];
-    let ids = || ObservationIdentity { observation:"obs_000000000001", entry:"observation-entry", task_entry:"ts_00000001", call:"call" };
+    let ids = || ObservationIdentity {
+        observation: "obs_000000000001",
+        entry: "observation-entry",
+        task_entry: "ts_00000001",
+        call: "call",
+    };
     let mut args = json!({"feature":"GPU surface","result":"fail","environment":"owned fixture","revision":"r1","reporter":"user","reproduction":"open window","notes":"blank","taskObjective":"Investigate rendering"});
     let plan = prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).unwrap();
     assert_eq!(plan.records.len(), 2);
     assert_eq!(plan.result["details"]["verification"], "recorded_claim");
     assert!(plan.result["details"]["taskStateEntryId"].is_string());
     args["updateTaskState"] = json!(false);
-    assert_eq!(prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).unwrap().records.len(), 1);
+    assert_eq!(
+        prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids())
+            .unwrap()
+            .records
+            .len(),
+        1
+    );
     args["taskObjective"] = json!("A different task");
     assert!(prepare(&branch, &args, "2026-09-11T12:00:00.000Z", ids()).is_err());
 }
 
 #[test]
-fn deeper_exploration_prior_marks_age_missing_provenance_and_stale_sources_without_verifying_claims() {
+fn deeper_exploration_prior_marks_age_missing_provenance_and_stale_sources_without_verifying_claims()
+ {
     use ag1_core::runtime::subagent::explore::prior_with_freshness;
     let board = serde_json::json!({"version":1,"findings":[{"question":"old","summary":"historical","at":10},{"question":"new","summary":"claim","at":20,"childSession":"child","sourceReferences":["file:changed@sha256:fixture"]}]});
     let text = prior_with_freshness(&board, 30, |_| "stale".into()).unwrap();
@@ -1064,12 +1093,32 @@ fn deeper_exploration_prior_marks_age_missing_provenance_and_stale_sources_witho
 
 #[test]
 fn npm_version_headers_are_not_zero_test_summaries() {
-    use ag1_core::runtime::completion::{classify, Status};
+    use ag1_core::runtime::completion::{Status, classify};
     let output = "> owned-interface-probe@1.0.0 test\n> node --test verify.test.cjs\n✔ fixture value was updated\nℹ tests 1\nℹ pass 1\nℹ fail 0\n";
-    assert_eq!(classify("npm test", output, false).unwrap().status, Status::Passed);
-    for output in ["0 tests", "Collected: 0 tests", "running 0 tests", "=== 0 tests ran ===", "no tests ran", "collected 0 items"] {
-        assert_eq!(classify("npm test", output, false).unwrap().status, Status::NoTests, "{output}");
+    assert_eq!(
+        classify("npm test", output, false).unwrap().status,
+        Status::Passed
+    );
+    for output in [
+        "0 tests",
+        "Collected: 0 tests",
+        "running 0 tests",
+        "=== 0 tests ran ===",
+        "no tests ran",
+        "collected 0 items",
+    ] {
+        assert_eq!(
+            classify("npm test", output, false).unwrap().status,
+            Status::NoTests,
+            "{output}"
+        );
     }
-    assert_eq!(classify("npm test", "1 failed", false).unwrap().status, Status::Failed);
-    assert_eq!(classify("npm test", output, true).unwrap().status, Status::Failed);
+    assert_eq!(
+        classify("npm test", "1 failed", false).unwrap().status,
+        Status::Failed
+    );
+    assert_eq!(
+        classify("npm test", output, true).unwrap().status,
+        Status::Failed
+    );
 }

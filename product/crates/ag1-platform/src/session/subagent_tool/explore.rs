@@ -83,18 +83,37 @@ impl DelegationService {
             board_hash,
             questions,
             prior: {
-                let mut cache: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+                let mut cache: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
                 let mut remaining = 32 * 1024 * 1024usize;
                 board::prior_with_freshness(&value, self.template.clock.now_ms(), |reference| {
-                    cache.entry(reference.to_owned()).or_insert_with(|| {
-                        let Ok(source) = ag1_core::evidence::SourceReference::parse(reference) else { return "invalid".into(); };
-                        if remaining == 0 { return "unverified (inspection budget)".into(); }
-                        match parent.root.snapshot(source.path(), remaining.min(8 * 1024 * 1024)) {
-                            Ok(snapshot) => { remaining = remaining.saturating_sub(snapshot.bytes.len()); if snapshot.revision.sha256 == source.digest() { "matching recorded revision".into() } else { "stale".into() } },
-                            Err(DomainError::NotFound) => "missing".into(),
-                            Err(_) => "unverified".into(),
-                        }
-                    }).clone()
+                    cache
+                        .entry(reference.to_owned())
+                        .or_insert_with(|| {
+                            let Ok(source) = ag1_core::evidence::SourceReference::parse(reference)
+                            else {
+                                return "invalid".into();
+                            };
+                            if remaining == 0 {
+                                return "unverified (inspection budget)".into();
+                            }
+                            match parent
+                                .root
+                                .snapshot(source.path(), remaining.min(8 * 1024 * 1024))
+                            {
+                                Ok(snapshot) => {
+                                    remaining = remaining.saturating_sub(snapshot.bytes.len());
+                                    if snapshot.revision.sha256 == source.digest() {
+                                        "matching recorded revision".into()
+                                    } else {
+                                        "stale".into()
+                                    }
+                                }
+                                Err(DomainError::NotFound) => "missing".into(),
+                                Err(_) => "unverified".into(),
+                            }
+                        })
+                        .clone()
                 })?
             },
             journal,
@@ -142,8 +161,15 @@ impl DelegationService {
                 now: now(),
             },
         )?;
-        let selected_model = domain::routing::select(Profile::Explore, None, &parent.configuration()?.model, &self.models)?;
-        let endpoint = selected_model["baseUrl"].as_str().unwrap_or(&plan.journal.endpoint);
+        let selected_model = domain::routing::select(
+            Profile::Explore,
+            None,
+            &parent.configuration()?.model,
+            &self.models,
+        )?;
+        let endpoint = selected_model["baseUrl"]
+            .as_str()
+            .unwrap_or(&plan.journal.endpoint);
         let capacity = parent.scheduler.capacity(endpoint).unwrap_or(1);
         let results = self.runtime.block_on(async {
             let mut children = tokio::task::JoinSet::new();
@@ -201,15 +227,25 @@ impl DelegationService {
         })?;
         let at = now();
         let mut findings = board::merge(&plan.questions, &results, at)?;
-        let completed = findings.iter().filter(|finding| finding["state"] == "completed").count();
+        let completed = findings
+            .iter()
+            .filter(|finding| finding["state"] == "completed")
+            .count();
         let cancelled = cancel.load(Ordering::Acquire);
         // Stable bounded identities, without per-run IDs, timing or labels.
         // Full errors remain in the retained artifact, not duplicated in context.
-        let recovery_failures = results.iter().map(|result| {
-            let error = if result["error"].is_null() { &result["summary"] } else { &result["error"] };
-            json!({"state":result["state"],"model":result["model"],
+        let recovery_failures = results
+            .iter()
+            .map(|result| {
+                let error = if result["error"].is_null() {
+                    &result["summary"]
+                } else {
+                    &result["error"]
+                };
+                json!({"state":result["state"],"model":result["model"],
                 "errorDigest":ag1_storage::digest(error.to_string().as_bytes())})
-        }).collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
         let raw = json!({"at":at,"findings":findings,"results":results});
         let retained = artifacts.put_evidence(
             &raw.to_string(),
@@ -218,7 +254,9 @@ impl DelegationService {
             &[],
             None,
         )?;
-        for finding in &mut findings { finding["resultArtifact"] = json!(retained.id); }
+        for finding in &mut findings {
+            finding["resultArtifact"] = json!(retained.id);
+        }
         let (existing, expected, _) = current(&parent)?;
         let next = board::append(&existing, &findings, at)?;
         parent.store.save_metadata(

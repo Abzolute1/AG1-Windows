@@ -40,7 +40,9 @@ impl Binding {
     }
     pub fn available_tools(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
-        if self.capabilities.contains(&Capability::Preview) { names.insert("preview".into()); }
+        if self.capabilities.contains(&Capability::Preview) {
+            names.insert("preview".into());
+        }
         if self.capabilities.contains(&Capability::Check) {
             names.insert("check".into());
         }
@@ -104,8 +106,12 @@ impl Request {
             return Err(DomainError::LimitExceeded("target request".into()));
         }
         if call.name() == "preview" {
-            if !["status", "start", "stop"].contains(&args["action"].as_str().unwrap_or("")) { return Err(invalid("preview action")); }
-            if args["action"] == "stop" { text(&args["operation"], 2048, false)?; }
+            if !["status", "start", "stop"].contains(&args["action"].as_str().unwrap_or("")) {
+                return Err(invalid("preview action"));
+            }
+            if args["action"] == "stop" {
+                text(&args["operation"], 2048, false)?;
+            }
         } else if call.name() == "check" {
             if let Some(files) = args.get("files") {
                 let files = files.as_array().ok_or_else(|| invalid("check files"))?;

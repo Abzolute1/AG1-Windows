@@ -137,7 +137,15 @@ async fn native_local_git_confirmation_is_scoped_durable_one_shot_and_grant_boun
         .tools()
         .folder_access()
         .unwrap();
-    request(&host,"revoke",w::Command::Runtime {action:"folder_access".into(),args:json!({"revision":revision,"action":"mode","path":root,"mode":"read_only"})}).await;
+    request(
+        &host,
+        "revoke",
+        w::Command::Runtime {
+            action: "folder_access".into(),
+            args: json!({"revision":revision,"action":"mode","path":root,"mode":"read_only"}),
+        },
+    )
+    .await;
     let s = host.commands.snapshot().unwrap();
     let result = host
         .dispatch(w::CommandEnvelope {
@@ -152,7 +160,7 @@ async fn native_local_git_confirmation_is_scoped_durable_one_shot_and_grant_boun
             extension: None,
         })
         .await;
-    assert!(result.is_err() || result.is_ok_and(|r|data(r).get("error").is_some()));
+    assert!(result.is_err() || result.is_ok_and(|r| data(r).get("error").is_some()));
     assert_eq!(
         std::fs::read_to_string(root.join("notes.txt")).unwrap(),
         "dirty bytes\n"

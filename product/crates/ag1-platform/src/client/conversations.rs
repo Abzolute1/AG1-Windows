@@ -180,7 +180,7 @@ impl Host {
             failure: Mutex::new(None),
             uploads: Mutex::new(Default::default()),
             diff_review: Mutex::new(None),
-            local_git_plans:Mutex::new(Default::default()),
+            local_git_plans: Mutex::new(Default::default()),
             project: self.project.clone(),
             controls: tokio::sync::Mutex::new(()),
             workspace_controls: self.workspace_controls.clone(),

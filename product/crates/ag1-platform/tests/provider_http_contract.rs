@@ -278,17 +278,54 @@ async fn subscription_stream_without_content_type_still_requires_valid_events_an
     for valid in [true, false] {
         let body = if valid {
             "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"id\":\"m\",\"role\":\"assistant\",\"content\":[]}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"output_index\":0,\"content_index\":0,\"delta\":\"OK\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n"
-        } else { "<html>not an event stream</html>" };
+        } else {
+            "<html>not an event stream</html>"
+        };
         let (origin, server) = fixture(move |mut socket| {
-            let input=read_request(&mut socket);
-            write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();input
+            let input = read_request(&mut socket);
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            input
         });
-        let http=ProviderHttp::new(std::slice::from_ref(&origin),Duration::from_secs(1)).unwrap();
-        let scheduler=Scheduler::default();scheduler.register(&origin,EndpointKind::Remote).unwrap();
-        let ticket=scheduler.submit(&origin,OperationId::new("subscription").unwrap()).unwrap();let permit=scheduler.start(&ticket).unwrap().unwrap();
-        let (_source,mut cancel)=cancellation();
-        let result=request_generation(&http,GenerationRequest{request_id:"subscription".into(),tool_names:vec![],family:ApiFamily::CodexResponses,request:request(&origin,8192),limits:GenerationLimits{max_output_bytes:4096,prefill_ms:3000,idle_ms:3000,overall_ms:3000}},permit,&mut cancel,|_|Ok(())).await;
-        if valid { let response=result.unwrap();assert_eq!(response.stop_reason,Some(StopReason::Stop));assert_eq!(response.content[0].text,"OK"); } else { assert!(result.is_err()); }
+        let http =
+            ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1)).unwrap();
+        let scheduler = Scheduler::default();
+        scheduler.register(&origin, EndpointKind::Remote).unwrap();
+        let ticket = scheduler
+            .submit(&origin, OperationId::new("subscription").unwrap())
+            .unwrap();
+        let permit = scheduler.start(&ticket).unwrap().unwrap();
+        let (_source, mut cancel) = cancellation();
+        let result = request_generation(
+            &http,
+            GenerationRequest {
+                request_id: "subscription".into(),
+                tool_names: vec![],
+                family: ApiFamily::CodexResponses,
+                request: request(&origin, 8192),
+                limits: GenerationLimits {
+                    max_output_bytes: 4096,
+                    prefill_ms: 3000,
+                    idle_ms: 3000,
+                    overall_ms: 3000,
+                },
+            },
+            permit,
+            &mut cancel,
+            |_| Ok(()),
+        )
+        .await;
+        if valid {
+            let response = result.unwrap();
+            assert_eq!(response.stop_reason, Some(StopReason::Stop));
+            assert_eq!(response.content[0].text, "OK");
+        } else {
+            assert!(result.is_err());
+        }
         server.join().unwrap();
     }
 }

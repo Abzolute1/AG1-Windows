@@ -1,13 +1,13 @@
 //! Wire adapters for the ten API families registered by the pinned reference.
 //! Credentials and HTTP live in the host; these decoders only consume bounded frames.
 pub mod auth;
-pub mod codex_subscription;
 pub mod capability;
-pub mod reasoning_controls;
+pub mod codex_subscription;
 pub mod credential_storage;
 pub mod framing;
 pub mod generation;
 pub mod http;
+pub mod reasoning_controls;
 pub mod request_http;
 pub mod requests;
 pub mod signing;
@@ -480,7 +480,10 @@ impl WireDecoder {
                     .cloned()
                     .unwrap_or(key);
                 if str_at(item, "type") == "reasoning" {
-                    if let Some(summary) = item["summary"].as_array().filter(|summary| !summary.is_empty()) {
+                    if let Some(summary) = item["summary"]
+                        .as_array()
+                        .filter(|summary| !summary.is_empty())
+                    {
                         out.push(ProviderEvent::Replace {
                             key: resolved.clone(),
                             text: summary
@@ -545,7 +548,9 @@ impl WireDecoder {
                 }));
                 out.push(ProviderEvent::Stop(stop(str_at(response, "status"))));
             }
-            "response.failed" | "response.cancelled" | "error" => out.push(ProviderEvent::Fail(v.to_string())),
+            "response.failed" | "response.cancelled" | "error" => {
+                out.push(ProviderEvent::Fail(v.to_string()))
+            }
             "response.in_progress"
             | "response.queued"
             | "response.content_part.added"
@@ -557,7 +562,11 @@ impl WireDecoder {
             | "response.reasoning_text.done"
             | "response.function_call_arguments.done"
             | "response.refusal.done" => (),
-            "" => return Err(DomainError::InvalidInput("Responses stream event requires a type".into())),
+            "" => {
+                return Err(DomainError::InvalidInput(
+                    "Responses stream event requires a type".into(),
+                ));
+            }
             // Responses streams may add informational events. Only the known
             // output-item and terminal branches can produce content, execute
             // tools or finish a response; additional events carry no authority.

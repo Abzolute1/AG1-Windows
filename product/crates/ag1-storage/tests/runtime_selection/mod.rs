@@ -245,16 +245,60 @@ impl Clock for TestClock {
 
 #[test]
 fn conversation_owners_are_independent_and_preserve_the_workspace_selection() {
-    let directory = tempfile::tempdir().unwrap(); let store = Store::open(directory.path()).unwrap();
-    create(&store, "first"); create(&store, "second");
-    let original = store.commit_runtime_selection(&selection("root", "first", 1, None)).unwrap();
-    let a = store.commit_conversation_selection(&selection("a", "first", 1, None)).unwrap();
-    let b = store.commit_conversation_selection(&selection("b", "second", 1, None)).unwrap();
-    let a2 = store.commit_conversation_selection(&selection("a2", "first", 2, Some(a.sha256.clone()))).unwrap();
-    assert_eq!(store.runtime_selection("workspace").unwrap().unwrap().sha256, original.sha256);
-    assert_eq!(store.conversation_selection("workspace", "second").unwrap().unwrap().sha256, b.sha256);
-    assert_eq!(store.conversation_selection("workspace", "first").unwrap().unwrap().sha256, a2.sha256);
-    assert!(store.commit_conversation_selection(&selection("wrong-parent", "second", 2, Some(a2.sha256))).is_err());
-    assert!(store.save_metadata("native-conversation-selection", "forged", None, b"{}").is_err());
-    assert_eq!(store.commit_conversation_selection(&selection("a", "first", 1, None)).unwrap(), a);
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(directory.path()).unwrap();
+    create(&store, "first");
+    create(&store, "second");
+    let original = store
+        .commit_runtime_selection(&selection("root", "first", 1, None))
+        .unwrap();
+    let a = store
+        .commit_conversation_selection(&selection("a", "first", 1, None))
+        .unwrap();
+    let b = store
+        .commit_conversation_selection(&selection("b", "second", 1, None))
+        .unwrap();
+    let a2 = store
+        .commit_conversation_selection(&selection("a2", "first", 2, Some(a.sha256.clone())))
+        .unwrap();
+    assert_eq!(
+        store
+            .runtime_selection("workspace")
+            .unwrap()
+            .unwrap()
+            .sha256,
+        original.sha256
+    );
+    assert_eq!(
+        store
+            .conversation_selection("workspace", "second")
+            .unwrap()
+            .unwrap()
+            .sha256,
+        b.sha256
+    );
+    assert_eq!(
+        store
+            .conversation_selection("workspace", "first")
+            .unwrap()
+            .unwrap()
+            .sha256,
+        a2.sha256
+    );
+    assert!(
+        store
+            .commit_conversation_selection(&selection("wrong-parent", "second", 2, Some(a2.sha256)))
+            .is_err()
+    );
+    assert!(
+        store
+            .save_metadata("native-conversation-selection", "forged", None, b"{}")
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .commit_conversation_selection(&selection("a", "first", 1, None))
+            .unwrap(),
+        a
+    );
 }

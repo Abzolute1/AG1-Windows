@@ -195,7 +195,12 @@ fn empty_cache_tls_fetch_and_untrusted_rejection() {
             .arg("/etc/ssl")
             .arg("--")
             .arg(std::env::current_exe().unwrap())
-            .args(["--exact", "tls::isolated_tls_worker", "--ignored", "--nocapture"])
+            .args([
+                "--exact",
+                "tls::isolated_tls_worker",
+                "--ignored",
+                "--nocapture",
+            ])
             .env("AG1_P14_TLS_ROOT", &case)
             .env("AG1_P14_TLS_MODE", mode)
             .env("AG1_P14_TLS_PORT", server.port.to_string())

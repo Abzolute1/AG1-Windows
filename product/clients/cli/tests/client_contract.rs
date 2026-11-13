@@ -213,6 +213,22 @@ async fn wait(host: &Host) {
     .await
     .unwrap();
 }
+async fn wait_for_operation(host: &Host, operation: &Value) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let view = host.settled_view().await.unwrap();
+            assert!(view.error.is_none(), "{:?}", view.error);
+            if view.snapshot.status == "idle"
+                && view.details.activity["last_terminal"]["operation"] == *operation
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
 #[tokio::test]
 async fn detached_projection_does_not_cancel_and_jsonl_matches_desktop_domain() {
     let (origin, server) = provider();
@@ -237,9 +253,18 @@ async fn detached_projection_does_not_cancel_and_jsonl_matches_desktop_domain() 
     let duplicate = host.dispatch(envelope).await.unwrap();
     assert!(matches!(duplicate,w::BridgeFrame::Reply{id:reply,..} if reply==id));
     let request = server.join().unwrap();
-    assert_eq!(request["messages"].as_array().unwrap().iter()
-        .filter(|message| message["role"] == "user" && message["content"][0]["text"] == "Say hello")
-        .count(), 1, "the original prompt reaches the provider exactly once alongside request-local state");
+    assert_eq!(
+        request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(
+                |message| message["role"] == "user" && message["content"][0]["text"] == "Say hello"
+            )
+            .count(),
+        1,
+        "the original prompt reaches the provider exactly once alongside request-local state"
+    );
     host.shutdown().await.unwrap();
 }
 #[tokio::test]
@@ -1348,21 +1373,23 @@ async fn binary_artifact_catalog_and_vision_input_use_verified_custody() {
 #[tokio::test]
 async fn fork_commits_before_restoring_full_user_text_and_new_scope() {
     use base64::{Engine, engine::general_purpose::STANDARD};
-    let (origin, server) = provider();
+    let (origin, server) = provider_requests(2);
     let (_dir, host) = host(&origin).await;
     let text = "Fork input Ω ".repeat(3500);
     let id = upload(&host, text.as_bytes()).await;
-    command(
-        &host,
-        w::Command::Prompt {
-            input: w::PromptInput::Artifact {
-                artifact: id.try_into().unwrap(),
+    let prompt = data(
+        command(
+            &host,
+            w::Command::Prompt {
+                input: w::PromptInput::Artifact {
+                    artifact: id.try_into().unwrap(),
+                },
             },
-        },
-    )
-    .await;
-    wait(&host).await;
-    server.join().unwrap();
+        )
+        .await,
+    );
+    wait_for_operation(&host, &prompt["operation"]).await;
+    assert_eq!(server.join().unwrap().len(), 2);
     let before = host.view().unwrap();
     let entry = before
         .details
@@ -1402,7 +1429,7 @@ async fn fork_commits_before_restoring_full_user_text_and_new_scope() {
         )
         .await,
     );
-    wait(&host).await;
+    wait_for_operation(&host, &reply["operation"]).await;
     let after = host.view().unwrap();
     assert_ne!(before.snapshot.scope.session, after.snapshot.scope.session);
     assert_eq!(
@@ -1579,7 +1606,10 @@ async fn configured_browser_host_registers_visual_schemas_without_starting_a_pre
                 );
                 assert!(!active.iter().any(|tool| tool["name"] == name));
             }
-            assert_eq!(active.iter().any(|tool| tool["name"] == "ui"), browser_available);
+            assert_eq!(
+                active.iter().any(|tool| tool["name"] == "ui"),
+                browser_available
+            );
             assert!(
                 selected
                     .services

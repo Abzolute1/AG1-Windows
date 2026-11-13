@@ -216,7 +216,10 @@ async fn stopping_a_generation_retains_the_same_loaded_runtime() {
     assert!(audit.lock().unwrap().active.is_some());
     bundle.cancel_generation(&request("one").url).await.unwrap();
     assert_eq!(audit.lock().unwrap().active.as_deref(), Some("one"));
-    assert_eq!(bundle.events().unwrap().last().unwrap().action, "owned_generation_cancelled");
+    assert_eq!(
+        bundle.events().unwrap().last().unwrap().action,
+        "owned_generation_cancelled"
+    );
     bundle.prepare(&request("one")).await.unwrap();
     assert_eq!(
         audit
@@ -236,10 +239,15 @@ async fn cancelling_preparation_preserves_the_previously_loaded_model() {
     let directory = tempfile::tempdir().unwrap();
     let registry = Registry::at(&directory.path().join("authority")).unwrap();
     let audit = Arc::new(Mutex::new(Audit::default()));
-    let bundle = Arc::new(RuntimeBundle::new(
-        FakeHost::new(audit.clone()), plans(directory.path(), 18087, &["one", "two"], 32768),
-        registry.runtime_lease().unwrap(), Duration::from_secs(2),
-    ).unwrap());
+    let bundle = Arc::new(
+        RuntimeBundle::new(
+            FakeHost::new(audit.clone()),
+            plans(directory.path(), 18087, &["one", "two"], 32768),
+            registry.runtime_lease().unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    );
     bundle.load_model("one").await.unwrap();
     for model in ["one", "two"] {
         let calls = {
@@ -270,14 +278,20 @@ async fn cancellation_waits_for_idle_and_keeps_uncertain_runtime_loaded() {
     let directory = tempfile::tempdir().unwrap();
     let registry = Registry::at(&directory.path().join("authority")).unwrap();
     let audit = Arc::new(Mutex::new(Audit::default()));
-    let bundle = Arc::new(RuntimeBundle::new(
-        FakeHost::new(audit.clone()), plans(directory.path(), 18087, &["one"], 32768),
-        registry.runtime_lease().unwrap(), Duration::from_secs(2),
-    ).unwrap());
+    let bundle = Arc::new(
+        RuntimeBundle::new(
+            FakeHost::new(audit.clone()),
+            plans(directory.path(), 18087, &["one"], 32768),
+            registry.runtime_lease().unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap(),
+    );
     bundle.prepare(&request("one")).await.unwrap();
     audit.lock().unwrap().generation_busy = true;
     let cancelling = bundle.clone();
-    let pending = tokio::spawn(async move { cancelling.cancel_generation(&request("one").url).await });
+    let pending =
+        tokio::spawn(async move { cancelling.cancel_generation(&request("one").url).await });
     while audit.lock().unwrap().idle_polls == 0 {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
@@ -300,12 +314,18 @@ async fn cancellation_timeout_never_ejects_the_loaded_model() {
     let registry = Registry::at(&directory.path().join("authority")).unwrap();
     let audit = Arc::new(Mutex::new(Audit::default()));
     let bundle = RuntimeBundle::new(
-        FakeHost::new(audit.clone()), plans(directory.path(), 18087, &["one"], 32768),
-        registry.runtime_lease().unwrap(), Duration::from_millis(50),
-    ).unwrap();
+        FakeHost::new(audit.clone()),
+        plans(directory.path(), 18087, &["one"], 32768),
+        registry.runtime_lease().unwrap(),
+        Duration::from_millis(50),
+    )
+    .unwrap();
     bundle.prepare(&request("one")).await.unwrap();
     audit.lock().unwrap().generation_busy = true;
-    assert_eq!(bundle.cancel_generation(&request("one").url).await, Err(DomainError::TimedOut));
+    assert_eq!(
+        bundle.cancel_generation(&request("one").url).await,
+        Err(DomainError::TimedOut)
+    );
     assert_eq!(audit.lock().unwrap().active.as_deref(), Some("one"));
     assert_eq!(audit.lock().unwrap().actions.len(), 1);
     bundle.stop().await.unwrap();
@@ -313,14 +333,20 @@ async fn cancellation_timeout_never_ejects_the_loaded_model() {
 
 #[tokio::test]
 async fn cancelled_http_stream_drains_and_next_request_reuses_the_loaded_runtime() {
-    use std::{io::{BufRead, BufReader, Read, Write}, net::{TcpListener, TcpStream}};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+    };
     fn read_request(stream: &TcpStream) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut line = String::new();
         let mut length = 0;
         loop {
-            line.clear(); reader.read_line(&mut line).unwrap();
-            if line == "\r\n" { break; }
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
             if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
                 length = value.trim().parse::<usize>().unwrap();
             }
@@ -337,7 +363,9 @@ async fn cancelled_http_stream_drains_and_next_request_reuses_the_loaded_runtime
     let server_audit = audit.clone();
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
         read_request(&stream);
         server_audit.lock().unwrap().generation_busy = true;
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
@@ -350,31 +378,61 @@ async fn cancelled_http_stream_drains_and_next_request_reuses_the_loaded_runtime
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"next\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
         write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
     });
-    let bundle = Arc::new(RuntimeBundle::new(
-        FakeHost::new(audit.clone()), plans(directory.path(), port, &["one"], 32768),
-        registry.runtime_lease().unwrap(), Duration::from_secs(3),
-    ).unwrap());
+    let bundle = Arc::new(
+        RuntimeBundle::new(
+            FakeHost::new(audit.clone()),
+            plans(directory.path(), port, &["one"], 32768),
+            registry.runtime_lease().unwrap(),
+            Duration::from_secs(3),
+        )
+        .unwrap(),
+    );
     let http = ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(1))
-        .unwrap().with_runtime(bundle.clone());
+        .unwrap()
+        .with_runtime(bundle.clone());
     let scheduler = Scheduler::default();
     scheduler.register(&origin, EndpointKind::Local).unwrap();
     for (index, abort) in [true, false].into_iter().enumerate() {
-        let ticket = scheduler.submit(&origin, ag1_core::OperationId::new(format!("mock-{index}")).unwrap()).unwrap();
+        let ticket = scheduler
+            .submit(
+                &origin,
+                ag1_core::OperationId::new(format!("mock-{index}")).unwrap(),
+            )
+            .unwrap();
         let permit = scheduler.start(&ticket).unwrap().unwrap();
         let (source, mut cancel) = cancellation();
         let mut request = request("one");
         request.url = format!("{origin}/v1/chat/completions");
         request.max_response_bytes = 8192;
-        let result = request_generation(&http, GenerationRequest {
-            request_id:format!("mock-{index}"), tool_names:vec![],
-            family:ag1_core::provider::ApiFamily::Completions, request,
-            limits:GenerationLimits {max_output_bytes:4096,prefill_ms:3000,idle_ms:3000,overall_ms:5000},
-        }, permit, &mut cancel, |event| {
-            if abort && matches!(event, ag1_core::provider::ProviderEvent::Delta { .. }) { source.cancel(); }
-            Ok(())
-        }).await;
-        if abort { assert_eq!(result.unwrap_err().error, DomainError::Cancelled); }
-        else { assert_eq!(result.unwrap().content[0].text, "next"); }
+        let result = request_generation(
+            &http,
+            GenerationRequest {
+                request_id: format!("mock-{index}"),
+                tool_names: vec![],
+                family: ag1_core::provider::ApiFamily::Completions,
+                request,
+                limits: GenerationLimits {
+                    max_output_bytes: 4096,
+                    prefill_ms: 3000,
+                    idle_ms: 3000,
+                    overall_ms: 5000,
+                },
+            },
+            permit,
+            &mut cancel,
+            |event| {
+                if abort && matches!(event, ag1_core::provider::ProviderEvent::Delta { .. }) {
+                    source.cancel();
+                }
+                Ok(())
+            },
+        )
+        .await;
+        if abort {
+            assert_eq!(result.unwrap_err().error, DomainError::Cancelled);
+        } else {
+            assert_eq!(result.unwrap().content[0].text, "next");
+        }
         assert_eq!(scheduler.status(&origin).unwrap().quarantined, 0);
         assert_eq!(audit.lock().unwrap().active.as_deref(), Some("one"));
         assert_eq!(audit.lock().unwrap().actions.len(), 1);
@@ -465,7 +523,13 @@ async fn manual_preparation_reuses_resident_model_and_clears_status_on_unload() 
     let dir = tempfile::tempdir().unwrap();
     let registry = Registry::at(&dir.path().join("authority")).unwrap();
     let audit = Arc::new(Mutex::new(Audit::default()));
-    let bundle = RuntimeBundle::new(FakeHost::new(audit.clone()), plans(dir.path(),18087,&["one","two"],32768),registry.runtime_lease().unwrap(),Duration::from_secs(2)).unwrap();
+    let bundle = RuntimeBundle::new(
+        FakeHost::new(audit.clone()),
+        plans(dir.path(), 18087, &["one", "two"], 32768),
+        registry.runtime_lease().unwrap(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     bundle.load_model("one").await.unwrap();
     assert_eq!(bundle.progress().unwrap()["phase"], "ready");
     bundle.load_model("one").await.unwrap();
@@ -481,14 +545,36 @@ async fn manual_preparation_reuses_resident_model_and_clears_status_on_unload() 
 
 #[test]
 fn verification_percentage_counts_bytes_and_never_completes_failed_verification() {
-    use ag1_platform::llama::{native::MaterialVerifier, Material};
-    let dir = tempfile::tempdir().unwrap(); let path=dir.path().join("weight");
-    let bytes=vec![42u8;1024*1024]; std::fs::write(&path,&bytes).unwrap();
-    let material=Material {path:path.to_string_lossy().into_owned(),sha256:ag1_storage::digest(&bytes),kind:"weight".into()};
-    let mut verifier=MaterialVerifier::default(); let mut values=vec![];
-    verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();
-    assert_eq!(values.first(),Some(&0));assert_eq!(values.last(),Some(&100));assert!(values.len()>5);assert!(values.windows(2).all(|w|w[0]<=w[1]));
-    values.clear();verifier.verify_progress(std::slice::from_ref(&material),&mut |p|values.push(p)).unwrap();assert_eq!(values.last(),Some(&100));
-    std::fs::write(&path,vec![41u8;1024*1024]).unwrap();values.clear();
-    assert!(verifier.verify_progress(&[material],&mut |p|values.push(p)).is_err());assert!(!values.contains(&100));
+    use ag1_platform::llama::{Material, native::MaterialVerifier};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weight");
+    let bytes = vec![42u8; 1024 * 1024];
+    std::fs::write(&path, &bytes).unwrap();
+    let material = Material {
+        path: path.to_string_lossy().into_owned(),
+        sha256: ag1_storage::digest(&bytes),
+        kind: "weight".into(),
+    };
+    let mut verifier = MaterialVerifier::default();
+    let mut values = vec![];
+    verifier
+        .verify_progress(std::slice::from_ref(&material), &mut |p| values.push(p))
+        .unwrap();
+    assert_eq!(values.first(), Some(&0));
+    assert_eq!(values.last(), Some(&100));
+    assert!(values.len() > 5);
+    assert!(values.windows(2).all(|w| w[0] <= w[1]));
+    values.clear();
+    verifier
+        .verify_progress(std::slice::from_ref(&material), &mut |p| values.push(p))
+        .unwrap();
+    assert_eq!(values.last(), Some(&100));
+    std::fs::write(&path, vec![41u8; 1024 * 1024]).unwrap();
+    values.clear();
+    assert!(
+        verifier
+            .verify_progress(&[material], &mut |p| values.push(p))
+            .is_err()
+    );
+    assert!(!values.contains(&100));
 }

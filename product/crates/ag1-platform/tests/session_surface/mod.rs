@@ -140,9 +140,22 @@ async fn preferred_calls_preserve_transcript_identity_and_project_one_observatio
     assert_eq!(outcome.generations, 13);
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 13);
-    assert!(requests[3]["messages"].to_string().contains("update with work"));
-    let current = ag1_core::context::hygiene::content(requests[3]["messages"].as_array().unwrap().last().unwrap(), "\n");
-    assert!(!current.split(ag1_core::runtime::context::WORKING_STATE).last().unwrap().contains("update with taskState"));
+    assert!(
+        requests[3]["messages"]
+            .to_string()
+            .contains("update with work")
+    );
+    let current = ag1_core::context::hygiene::content(
+        requests[3]["messages"].as_array().unwrap().last().unwrap(),
+        "\n",
+    );
+    assert!(
+        !current
+            .split(ag1_core::runtime::context::WORKING_STATE)
+            .last()
+            .unwrap()
+            .contains("update with taskState")
+    );
     let branch = ag1_core::task::branch_values(
         &f.store
             .journal_snapshot(&SessionId::new("session").unwrap())

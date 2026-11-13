@@ -11,8 +11,8 @@ use crate::{
     },
     storage::StoredJournal,
     task::{
-        JournalWritePort, PreparedStateCommit, bounded_json, bounded_json_with_limit, branch_values,
-        invalid, units,
+        JournalWritePort, PreparedStateCommit, bounded_json, bounded_json_with_limit,
+        branch_values, invalid, units,
     },
 };
 use serde_json::{Value, json};
@@ -39,8 +39,12 @@ impl PendingCall {
     /// renderer's or adapter's declaration of which state it may update.
     pub fn effective(&self, branch: &[Value]) -> Result<Self, DomainError> {
         let mut call = self.clone();
-        if let Some((name, args)) = crate::tools::surface::route(&self.name, &self.block["arguments"], branch)? {
-            call.name = name.clone(); call.block["name"] = serde_json::json!(name); call.block["arguments"] = args;
+        if let Some((name, args)) =
+            crate::tools::surface::route(&self.name, &self.block["arguments"], branch)?
+        {
+            call.name = name.clone();
+            call.block["name"] = serde_json::json!(name);
+            call.block["arguments"] = args;
         }
         Ok(call)
     }
@@ -286,7 +290,11 @@ impl PreparationAction {
         Ok(())
     }
     /// Apply a typed native MCP selection before request-specific instructions.
-    pub fn set_mcp_tools(&mut self, selected: &[crate::tools::mcp::SelectedDefinition], tools: Vec<Value>) -> Result<(), DomainError> {
+    pub fn set_mcp_tools(
+        &mut self,
+        selected: &[crate::tools::mcp::SelectedDefinition],
+        tools: Vec<Value>,
+    ) -> Result<(), DomainError> {
         let mut configuration = self.configuration.as_ref().clone();
         if let Some(prompt) = &configuration.prompt {
             configuration.prompt = Some(Arc::new(prompt.with_mcp_selection(selected)?));
@@ -561,13 +569,12 @@ impl SessionRuntime {
             .map(|e| e["id"].clone())
             .unwrap_or(Value::Null);
         record["timestamp"] = json!(timestamp);
-        let record_limit = if record["type"] == "message"
-            && record["message"]["role"] == "assistant"
-        {
-            LONG_ASSISTANT_STATE_BYTES
-        } else {
-            4 * 1024 * 1024
-        };
+        let record_limit =
+            if record["type"] == "message" && record["message"]["role"] == "assistant" {
+                LONG_ASSISTANT_STATE_BYTES
+            } else {
+                4 * 1024 * 1024
+            };
         bounded_json_with_limit(&record, record_limit)?;
         let tools = if record["type"] == "message" && record["message"]["role"] == "assistant" {
             if !self.pending_tools.is_empty() {
@@ -921,7 +928,11 @@ impl SessionRuntime {
         custom_type: &str,
         data: Value,
     ) -> Result<AppendAction, DomainError> {
-        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?.effective(&self.branch)?;
+        let pending = self
+            .pending_tools
+            .front()
+            .ok_or(DomainError::Conflict)?
+            .effective(&self.branch)?;
         if pending.id != call_id {
             return Err(DomainError::Conflict);
         }
@@ -1005,7 +1016,11 @@ impl SessionRuntime {
         call_id: &str,
     ) -> Result<(Option<AppendAction>, Value), DomainError> {
         use sha2::{Digest, Sha256};
-        let pending = self.pending_tools.front().ok_or(DomainError::Conflict)?.effective(&self.branch)?;
+        let pending = self
+            .pending_tools
+            .front()
+            .ok_or(DomainError::Conflict)?
+            .effective(&self.branch)?;
         if pending.id != call_id || !["todo", "runtimeObservation"].contains(&pending.name.as_str())
         {
             return Err(DomainError::PermissionDenied);

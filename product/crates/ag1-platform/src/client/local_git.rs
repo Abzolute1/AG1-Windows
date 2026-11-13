@@ -20,15 +20,38 @@ impl Host {
         ])
         .to_string())
     }
-    pub(super) fn github_upload_preview(&self,args:&Value)->Result<Value>{
-        let request=crate::github::tool::request(args)?;
-        let folders=self.folder_selection()?;
-        let root=folders.resolve(request.parameters.get("folder").and_then(Value::as_str).unwrap_or("."),false)?;
-        let selected=self.registry.selected()?;
-        let (grant,revision)=selected.services.tools().folder_access().ok_or(DomainError::NotFound)?;
-        let service=self.services.github.as_ref().ok_or(DomainError::NotFound)?;
-        let control=crate::resource_fs::ScanControl{cancel:&self.closing,deadline:std::time::Instant::now()+Duration::from_secs(60)};
-        service.preview_upload(request,root,grant,revision,&self.github_scope()?,&control).map_err(crate::github::tool::domain)
+    pub(super) fn github_upload_preview(&self, args: &Value) -> Result<Value> {
+        let request = crate::github::tool::request(args)?;
+        let folders = self.folder_selection()?;
+        let root = folders.resolve(
+            request
+                .parameters
+                .get("folder")
+                .and_then(Value::as_str)
+                .unwrap_or("."),
+            false,
+        )?;
+        let selected = self.registry.selected()?;
+        let (grant, revision) = selected
+            .services
+            .tools()
+            .folder_access()
+            .ok_or(DomainError::NotFound)?;
+        let service = self.services.github.as_ref().ok_or(DomainError::NotFound)?;
+        let control = crate::resource_fs::ScanControl {
+            cancel: &self.closing,
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+        };
+        service
+            .preview_upload(
+                request,
+                root,
+                grant,
+                revision,
+                &self.github_scope()?,
+                &control,
+            )
+            .map_err(crate::github::tool::domain)
     }
     pub(super) fn local_git_preview(&self, args: &Value) -> Result<Value> {
         let action = args["action"]
@@ -56,15 +79,17 @@ impl Host {
             )
             .is_ok();
         let mut service = LocalGit::new(
-                root,
-                &t.process_host,
-                &t.git,
-                &t.bubblewrap,
-                &self.state.join("local-git"),
-            )?
-            .with_grant(authority, revision, writable);
-        if let Some(github)=&self.services.github{service=service.with_github(github.clone());}
-        let service=Arc::new(service);
+            root,
+            &t.process_host,
+            &t.git,
+            &t.bubblewrap,
+            &self.state.join("local-git"),
+        )?
+        .with_grant(authority, revision, writable);
+        if let Some(github) = &self.services.github {
+            service = service.with_github(github.clone());
+        }
+        let service = Arc::new(service);
         let scope = self.github_scope()?;
         let plan = service.prepare(
             action,
@@ -142,7 +167,7 @@ impl Host {
             cancel: &self.closing,
             deadline: std::time::Instant::now() + Duration::from_secs(30),
         };
-        let recovery_path=pending.plan.preview["recovery_path"].clone();
+        let recovery_path = pending.plan.preview["recovery_path"].clone();
         match pending.service.execute(pending.plan, &scope, &control) {
             Ok(mut result) => {
                 for key in ["status", "diff", "staged", "branches"] {

@@ -2,10 +2,10 @@
 use ag1_core::DomainError;
 #[path = "mcp_manager/access_import.rs"]
 mod access_import;
-#[path = "mcp_manager/public_registry.rs"]
-mod public_registry;
 #[path = "mcp_manager/private_credentials.rs"]
 mod private_credentials;
+#[path = "mcp_manager/public_registry.rs"]
+mod public_registry;
 #[path = "mcp_manager/trust.rs"]
 mod trust;
 use ag1_platform::mcp::{

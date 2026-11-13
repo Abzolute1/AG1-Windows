@@ -26,7 +26,10 @@ pattern!(
 );
 // npm's script banner can end in `@1.0.0 test`; that is package
 // metadata, not a "0 test" count. Preserve all other no-test detection.
-pattern!(NPM_SCRIPT_HEADER, r"(?m)^[ \t]*(?:#[ \t]*)?>[ \t]+\S+@\S+[ \t]+test(?:[ \t][^\r\n]*)?$");
+pattern!(
+    NPM_SCRIPT_HEADER,
+    r"(?m)^[ \t]*(?:#[ \t]*)?>[ \t]+\S+@\S+[ \t]+test(?:[ \t][^\r\n]*)?$"
+);
 pattern!(
     ONLY_SKIPPED,
     r"(?i)\bcollected 0 items?\s*/\s*[1-9]\d* skipped\b"

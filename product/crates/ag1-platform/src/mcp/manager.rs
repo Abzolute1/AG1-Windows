@@ -457,8 +457,9 @@ impl Manager {
             }
         }
     }
-    pub fn set_input_entry(&self, entry: Arc<dyn super::input::Entry>) -> Result<(),DomainError> {
-        *self.input_entry.lock().map_err(|_|DomainError::Conflict)?=Some(entry);Ok(())
+    pub fn set_input_entry(&self, entry: Arc<dyn super::input::Entry>) -> Result<(), DomainError> {
+        *self.input_entry.lock().map_err(|_| DomainError::Conflict)? = Some(entry);
+        Ok(())
     }
     pub fn records(&self) -> Result<Vec<ServerRecord>, DomainError> {
         Ok(self.state()?.records.servers.values().cloned().collect())
@@ -467,7 +468,11 @@ impl Manager {
     pub fn add_drafts(&self, drafts: Vec<Draft>) -> Result<Vec<String>, DomainError> {
         self.add_drafts_with_access(drafts, LocalAccess::HostAccount)
     }
-    pub fn add_drafts_with_access(&self, drafts: Vec<Draft>, local_access: LocalAccess) -> Result<Vec<String>, DomainError> {
+    pub fn add_drafts_with_access(
+        &self,
+        drafts: Vec<Draft>,
+        local_access: LocalAccess,
+    ) -> Result<Vec<String>, DomainError> {
         if drafts.is_empty() || drafts.len() > 32 {
             return Err(invalid("draft count"));
         }
@@ -516,10 +521,23 @@ impl Manager {
             false,
         )
     }
-    pub fn edit_with_access(&self, id: &str, expected: u64, draft: Draft, access: LocalAccess) -> Result<(), DomainError> {
+    pub fn edit_with_access(
+        &self,
+        id: &str,
+        expected: u64,
+        draft: Draft,
+        access: LocalAccess,
+    ) -> Result<(), DomainError> {
         draft.validate()?;
         access.validate(&draft.configuration)?;
-        self.change(id, expected, Some(draft), Some(access), Some(Availability::default()), false)
+        self.change(
+            id,
+            expected,
+            Some(draft),
+            Some(access),
+            Some(Availability::default()),
+            false,
+        )
     }
     pub fn set_availability(
         &self,
@@ -552,7 +570,9 @@ impl Manager {
         let had_credentials = record.draft.auth_profile.is_some();
         record.revision = expected.checked_add(1).ok_or(DomainError::Conflict)?;
         let configuration_changed = draft.is_some() || access.is_some();
-        if let Some(access) = access { record.local_access = access; }
+        if let Some(access) = access {
+            record.local_access = access;
+        }
         if let Some(draft) = draft {
             record.draft = draft;
         }
@@ -671,7 +691,11 @@ impl Manager {
                     .as_ref()
                     .ok_or(DomainError::Conflict)?
                     .revalidate(executable, cwd)?;
-                if review.record.local_access == LocalAccess::ReadOnlyDirectory { ConnectionConsent::LocalReadOnlyDirectory } else { ConnectionConsent::LocalHostAccountExecution }
+                if review.record.local_access == LocalAccess::ReadOnlyDirectory {
+                    ConnectionConsent::LocalReadOnlyDirectory
+                } else {
+                    ConnectionConsent::LocalHostAccountExecution
+                }
             }
             Configuration::Http {
                 loopback_development: true,
@@ -727,7 +751,11 @@ impl Manager {
         let (http_cancel, token) = cancellation();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let control = Arc::new(Control {
-            input_entry: self.input_entry.lock().map_err(|_|DomainError::Conflict)?.clone(),
+            input_entry: self
+                .input_entry
+                .lock()
+                .map_err(|_| DomainError::Conflict)?
+                .clone(),
             waiting_input: AtomicBool::new(false),
             target_digest: trust::target_digest(record, review.local.as_ref())?,
             policies: Mutex::new(BTreeMap::new()),
@@ -791,8 +819,12 @@ impl Manager {
         );
         Ok(id)
     }
-    pub fn waiting_for_input(&self,id:&str)->Result<bool,DomainError>{
-        Ok(self.state()?.live.get(id).is_some_and(|w|w.control.waiting_input.load(Ordering::Acquire)))
+    pub fn waiting_for_input(&self, id: &str) -> Result<bool, DomainError> {
+        Ok(self
+            .state()?
+            .live
+            .get(id)
+            .is_some_and(|w| w.control.waiting_input.load(Ordering::Acquire)))
     }
     pub fn status(&self, id: &str) -> Result<ConnectionStatus, DomainError> {
         let state = self.state()?;
@@ -1059,7 +1091,8 @@ fn run_worker(
                 control.credential_check()?;
                 let process = if record.local_access == LocalAccess::ReadOnlyDirectory {
                     let spec = access::contained(spec, cwd, helper)?;
-                    supervisor.spawn_mcp_readonly_protocol(spec, &directory.path().join("stderr"))?
+                    supervisor
+                        .spawn_mcp_readonly_protocol(spec, &directory.path().join("stderr"))?
                 } else {
                     supervisor.spawn_mcp_protocol(spec, &directory.path().join("stderr"))?
                 };
@@ -1084,7 +1117,9 @@ fn run_worker(
                                     &control.cancelled,
                                     &|| command.admit_send(&control),
                                     &|| command.admit_continuation(&control),
-                                    command.input_allowed.then_some(&|envelope:&Value,round|command.input(&control,envelope,round) as _),
+                                    command.input_allowed.then_some(&|envelope: &Value, round| {
+                                        command.input(&control, envelope, round) as _
+                                    }),
                                 ));
                                 let retire = result.is_err()
                                     || client.discovery_generation() != generation
@@ -1156,7 +1191,12 @@ fn run_worker(
                                                 &mut token,
                                                 &|| command.admit_send(&control),
                                                 &|| command.admit_continuation(&control),
-                                                command.input_allowed.then_some(&|envelope:&Value,round|command.input(&control,envelope,round) as _),
+                                                command.input_allowed.then_some(
+                                                    &|envelope: &Value, round| {
+                                                        command.input(&control, envelope, round)
+                                                            as _
+                                                    },
+                                                ),
                                             )
                                             .await,
                                     );

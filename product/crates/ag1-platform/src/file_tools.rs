@@ -417,7 +417,8 @@ impl FileService {
         };
         check()?;
         let expected = snapshot.as_ref().map(|s| s.revision.clone());
-        if call.name() == "editApply" || (call.name() == "edit" && call.args()["mode"] != "preview") {
+        if call.name() == "editApply" || (call.name() == "edit" && call.args()["mode"] != "preview")
+        {
             let records = self.previews.lock().unwrap();
             if let Some(prior) = records.get(&(scope.session.clone(), scope.epoch, path.clone()))
                 && Some(&prior.revision) != expected.as_ref()
@@ -428,13 +429,20 @@ impl FileService {
         let mut preview_success = false;
         let transformation = if call.name() == "read" {
             let snapshot = snapshot.as_ref().ok_or_else(|| DomainError::InvalidInput(format!("Path not found: {raw}. Use find to locate files or ls to inspect directories before retrying read.")))?;
-            let mut result =
-                match crate::image_tools::read_file_with_control(&path, call.args(), &snapshot.bytes, check)? {
-                    Some(image) => image,
-                    None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
-                };
-            let reference = ag1_core::evidence::SourceReference::new(&path, &snapshot.revision.sha256)?;
-            if result.get("details").is_none() { result["details"] = serde_json::json!({}); }
+            let mut result = match crate::image_tools::read_file_with_control(
+                &path,
+                call.args(),
+                &snapshot.bytes,
+                check,
+            )? {
+                Some(image) => image,
+                None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
+            };
+            let reference =
+                ag1_core::evidence::SourceReference::new(&path, &snapshot.revision.sha256)?;
+            if result.get("details").is_none() {
+                result["details"] = serde_json::json!({});
+            }
             result["details"]["sourceReference"] = serde_json::json!(reference.reference());
             result["details"]["sourceSha256"] = serde_json::json!(snapshot.revision.sha256);
             result["details"]["sourceKind"] = serde_json::json!("file_revision");
@@ -605,11 +613,15 @@ impl FileService {
         let (expected, result, streamed_read) = match root.snapshot(&path, MAX_READ) {
             Ok(snapshot) => {
                 check()?;
-                let result =
-                    match crate::image_tools::read_file_with_control(&path, call.args(), &snapshot.bytes, check)? {
-                        Some(image) => image,
-                        None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
-                    };
+                let result = match crate::image_tools::read_file_with_control(
+                    &path,
+                    call.args(),
+                    &snapshot.bytes,
+                    check,
+                )? {
+                    Some(image) => image,
+                    None => ag1_core::tools::read::text(call.args(), &snapshot.bytes)?,
+                };
                 (snapshot.revision, result, false)
             }
             Err(DomainError::LimitExceeded(_)) => {
@@ -673,7 +685,9 @@ impl FileService {
         if !Arc::ptr_eq(&prepared.workspace, &self.workspace) {
             return Err(DomainError::PermissionDenied);
         }
-        if !prepared.will_mutate() { return Ok(()); }
+        if !prepared.will_mutate() {
+            return Ok(());
+        }
         let current = match self.workspace.snapshot(&prepared.path, MAX_READ) {
             Ok(snapshot) => Some(snapshot.revision),
             Err(DomainError::NotFound) => None,
@@ -781,10 +795,23 @@ impl FileService {
         }
         let key = (scope.session.clone(), scope.epoch, prepared.path.clone());
         let published = if let Some(bytes) = &prepared.transformation.bytes {
-            let receipt = self.review_store.as_ref().map(|store|
-                crate::change_receipts::PendingChange::prepare(store, &self.workspace, scope,
-                    &call, &prepared.path, prepared.expected.as_ref(), bytes, now())
-            ).transpose()?.flatten();
+            let receipt = self
+                .review_store
+                .as_ref()
+                .map(|store| {
+                    crate::change_receipts::PendingChange::prepare(
+                        store,
+                        &self.workspace,
+                        scope,
+                        &call,
+                        &prepared.path,
+                        prepared.expected.as_ref(),
+                        bytes,
+                        now(),
+                    )
+                })
+                .transpose()?
+                .flatten();
             let revision = match &prepared.expected {
                 Some(expected) => {
                     self.workspace
@@ -799,10 +826,18 @@ impl FileService {
             };
             if let Some(receipt) = receipt {
                 let id = receipt.record.id.clone();
-                if receipt.settle(self.review_store.as_ref().unwrap(), &revision).is_err() && revision.is_ok() {
+                if receipt
+                    .settle(self.review_store.as_ref().unwrap(), &revision)
+                    .is_err()
+                    && revision.is_ok()
+                {
                     // A committed write must never be reported as failed/retryable
                     // merely because its review acknowledgement was interrupted.
-                    prepared.transformation.result["details"]["reviewWarning"] = serde_json::json!(format!("The file was written, but change record {id} is unconfirmed. Review the file; do not repeat the write automatically."));
+                    prepared.transformation.result["details"]["reviewWarning"] = serde_json::json!(
+                        format!(
+                            "The file was written, but change record {id} is unconfirmed. Review the file; do not repeat the write automatically."
+                        )
+                    );
                 }
             }
             let revision = revision?;

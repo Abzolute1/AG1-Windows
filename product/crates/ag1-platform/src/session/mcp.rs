@@ -116,7 +116,15 @@ impl SessionCapabilities {
         let selection = self
             .selection
             .rebind_registry(&self.manager, context.registry)?;
-        self.manager.prepare_operation(&selection, context.registry, call).map(|plan|plan.allow_input(!matches!(context.policy_mode, ag1_core::tools::policy::Mode::Planning|ag1_core::tools::policy::Mode::Headless)))
+        self.manager
+            .prepare_operation(&selection, context.registry, call)
+            .map(|plan| {
+                plan.allow_input(!matches!(
+                    context.policy_mode,
+                    ag1_core::tools::policy::Mode::Planning
+                        | ag1_core::tools::policy::Mode::Headless
+                ))
+            })
     }
     pub(super) fn execute(
         &self,

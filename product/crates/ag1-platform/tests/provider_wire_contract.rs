@@ -305,16 +305,24 @@ fn responses_additive_events_and_reasoning_text_preserve_tool_execution() {
             json!({"type":"response.output_item.added","output_index":1,"item":{"id":"f","call_id":"c","type":"function_call","name":"github","arguments":""}}),
             json!({"type":"response.output_item.done","output_index":1,"item":{"id":"f","type":"function_call","arguments":"{\"operation\":\"repos.list\"}"}}),
             json!({"type":"response.completed","response":{"status":"completed"}}),
-        ] { apply(&mut decoder, &mut reducer, &v); }
+        ] {
+            apply(&mut decoder, &mut reducer, &v);
+        }
         let result = reducer.finish(false).unwrap();
         assert_eq!(result.stop_reason, Some(StopReason::ToolUse));
         assert_eq!(result.content[0].text, "Checking GitHub");
         assert_eq!(result.content[1].name, "github");
-        assert_eq!(result.content[1].arguments, Some(json!({"operation":"repos.list"})));
+        assert_eq!(
+            result.content[1].arguments,
+            Some(json!({"operation":"repos.list"}))
+        );
         assert!(decoder.decode(&json!({"type":"response.output_item.added","item":{"type":"unknown_executable"}})).is_err());
         assert!(decoder.decode(&json!({})).is_err());
         for kind in ["response.failed", "response.cancelled", "error"] {
-            assert!(matches!(decoder.decode(&json!({"type":kind})).unwrap().as_slice(), [ProviderEvent::Fail(_)]));
+            assert!(matches!(
+                decoder.decode(&json!({"type":kind})).unwrap().as_slice(),
+                [ProviderEvent::Fail(_)]
+            ));
         }
     }
 }

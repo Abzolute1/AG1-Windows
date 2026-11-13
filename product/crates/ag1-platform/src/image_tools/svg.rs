@@ -12,7 +12,11 @@ pub(super) fn render(
 pub(super) fn render_icon(bytes: &[u8]) -> Result<Vec<u8>, DomainError> {
     render_bounded(bytes, &mut || Ok(()), true)
 }
-fn render_bounded(bytes: &[u8], check: &mut impl FnMut() -> Result<(), DomainError>, icon: bool) -> Result<Vec<u8>, DomainError> {
+fn render_bounded(
+    bytes: &[u8],
+    check: &mut impl FnMut() -> Result<(), DomainError>,
+    icon: bool,
+) -> Result<Vec<u8>, DomainError> {
     check()?;
     if bytes.len() > 256 * 1024 {
         return Err(DomainError::LimitExceeded(
@@ -22,7 +26,9 @@ fn render_bounded(bytes: &[u8], check: &mut impl FnMut() -> Result<(), DomainErr
     let _permit = if icon {
         super::DECODER.lock().map_err(|_| DomainError::Conflict)?
     } else {
-        super::DECODER.try_lock().map_err(|_| DomainError::QueueFull)?
+        super::DECODER
+            .try_lock()
+            .map_err(|_| DomainError::QueueFull)?
     };
     let text =
         std::str::from_utf8(bytes).map_err(|_| DomainError::InvalidInput("SVG UTF-8".into()))?;
@@ -54,8 +60,15 @@ fn render_bounded(bytes: &[u8], check: &mut impl FnMut() -> Result<(), DomainErr
     }
     // resvg clips filter regions to its bounded canvas. Also cap primitive
     // chains so a small SVG cannot create an unbounded sequence of buffers.
-    if doc.descendants().filter(|n| n.is_element() && n.tag_name().name().starts_with("fe")).count() > 16 {
-        return Err(DomainError::LimitExceeded("SVG filter primitives (16)".into()));
+    if doc
+        .descendants()
+        .filter(|n| n.is_element() && n.tag_name().name().starts_with("fe"))
+        .count()
+        > 16
+    {
+        return Err(DomainError::LimitExceeded(
+            "SVG filter primitives (16)".into(),
+        ));
     }
     for node in doc.descendants() {
         check()?;
@@ -201,12 +214,17 @@ mod tests {
     #[test]
     fn svg_shadow_and_blur_are_rendered_as_visible_pixels() {
         let _serial = TEST_SERIAL.lock().unwrap();
-        let bytes = svg(r##"<defs><filter id="shadow"><feDropShadow dx="12" dy="8" stdDeviation="3" flood-color="blue"/></filter><filter id="blur"><feGaussianBlur stdDeviation="2"/></filter></defs><rect x="40" y="40" width="60" height="40" fill="red" filter="url(#shadow)"/><circle cx="200" cy="80" r="15" fill="green" filter="url(#blur)"/>"##);
+        let bytes = svg(
+            r##"<defs><filter id="shadow"><feDropShadow dx="12" dy="8" stdDeviation="3" flood-color="blue"/></filter><filter id="blur"><feGaussianBlur stdDeviation="2"/></filter></defs><rect x="40" y="40" width="60" height="40" fill="red" filter="url(#shadow)"/><circle cx="200" cy="80" r="15" fill="green" filter="url(#blur)"/>"##,
+        );
         let png = render(&bytes, &mut || Ok(())).unwrap();
         let pixels = image::load_from_memory(&png).unwrap().to_rgba8();
         assert_eq!(pixels.get_pixel(60, 60).0, [255, 0, 0, 255]);
         let shadow = pixels.get_pixel(105, 75).0;
-        assert!(shadow[2] > 100 && shadow[3] > 0, "missing blue shadow: {shadow:?}");
+        assert!(
+            shadow[2] > 100 && shadow[3] > 0,
+            "missing blue shadow: {shadow:?}"
+        );
         assert!(pixels.get_pixel(200, 80).0[1] > 0);
     }
     #[test]
@@ -228,7 +246,10 @@ mod tests {
         }
         assert!(render(b"<!DOCTYPE svg [<!ENTITY x 'secret'>]><svg xmlns='http://www.w3.org/2000/svg'>&x;</svg>", &mut || Ok(())).is_err());
         let nested = format!("{}{}", "<g>".repeat(35), "</g>".repeat(35));
-        assert!(matches!(render(&svg(&nested), &mut || Ok(())), Err(DomainError::LimitExceeded(_))));
+        assert!(matches!(
+            render(&svg(&nested), &mut || Ok(())),
+            Err(DomainError::LimitExceeded(_))
+        ));
         assert!(render(&svg(&"<circle r='1'/>".repeat(2050)), &mut || Ok(())).is_err());
         assert!(render(&vec![b' '; 256 * 1024 + 1], &mut || Ok(())).is_err());
         assert!(matches!(
@@ -241,12 +262,16 @@ mod tests {
         let _serial = TEST_SERIAL.lock().unwrap();
         let malformed = b"<svg xmlns='http://www.w3.org/2000/svg'>\n<g/>\n</g>\n</svg>";
         let error = render(malformed, &mut || Ok(())).unwrap_err();
-        let DomainError::InvalidInput(message) = error else { panic!("{error:?}") };
+        let DomainError::InvalidInput(message) = error else {
+            panic!("{error:?}")
+        };
         assert!(message.contains("line 3, column 1"), "{message}");
         assert!(message.contains("expected 'svg' tag"), "{message}");
         assert!(message.contains("not a complexity-limit error"));
         let error = render(&svg(&"<circle r='1'/>".repeat(2050)), &mut || Ok(())).unwrap_err();
-        assert!(matches!(error, DomainError::LimitExceeded(ref message) if message.contains("XML nodes (2048")));
+        assert!(
+            matches!(error, DomainError::LimitExceeded(ref message) if message.contains("XML nodes (2048"))
+        );
     }
     #[test]
     fn svg_preview_bounds_size_and_reports_unsupported_without_failing_source_read() {

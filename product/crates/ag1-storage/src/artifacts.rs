@@ -11,6 +11,41 @@ use serde_json::Value;
 use sha2::Sha256;
 use std::fs;
 
+fn output_origin_key() -> StorageResult<[u8; 32]> {
+    let mut key = [0u8; 32];
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+    }
+    #[cfg(windows)]
+    {
+        // New output origins need an unpredictable cursor key. Windows CNG is
+        // the native OS CSPRNG; using a clock or a process ID would make cursor
+        // authorization predictable after a restart.
+        let status = unsafe {
+            windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+                std::ptr::null_mut(),
+                key.as_mut_ptr(),
+                key.len() as u32,
+                windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(StorageError::Unsupported(
+                "Windows system random generator".into(),
+            ));
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        return Err(StorageError::Unsupported(
+            "output origin random generator".into(),
+        ));
+    }
+    Ok(key)
+}
+
 #[derive(Clone, Debug)]
 pub struct ArtifactInput {
     pub origin: String,
@@ -208,7 +243,6 @@ impl Store {
     /// Allocate custody for new native output after resuming a journal without
     /// an artifact store. Existing origins and cursor keys are never replaced.
     pub fn ensure_output_origin(&self, origin: &str, session: &str) -> StorageResult<bool> {
-        use std::io::Read;
         valid_id(origin)?;
         valid_id(session)?;
         let mut db = self.conn()?;
@@ -231,8 +265,7 @@ impl Store {
             }
             return Ok(false);
         }
-        let mut key = [0; 32];
-        fs::File::open("/dev/urandom")?.read_exact(&mut key)?;
+        let key = output_origin_key()?;
         tx.execute(
             "INSERT INTO origins VALUES(?1,?2,?3)",
             params![origin, session, key.as_slice()],
@@ -287,11 +320,14 @@ impl Store {
                 ));
             }
         }
-        let (hash, compressed) = self.publish_custody(&input.bytes, v["kind"].as_str().unwrap_or(""))?;
+        let (hash, compressed) =
+            self.publish_custody(&input.bytes, v["kind"].as_str().unwrap_or(""))?;
         let record_hash = self.publish(&input.record)?;
         self.hit(Boundary::BeforeTransaction)?;
         let tx = db.transaction()?;
-        if compressed { tx.execute_batch("PRAGMA user_version=2;")?; }
+        if compressed {
+            tx.execute_batch("PRAGMA user_version=2;")?;
+        }
         insert_artifact(
             &tx,
             &input.origin,
@@ -665,8 +701,16 @@ impl Store {
         ttl_ms: u64,
         release_on_verification: bool,
     ) -> StorageResult<Lease> {
-        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, None)
-            .map(|(lease, _)| lease)
+        self.write_lease(
+            session,
+            origin,
+            id,
+            reason,
+            ttl_ms,
+            release_on_verification,
+            None,
+        )
+        .map(|(lease, _)| lease)
     }
     /// Returns the exact record captured in the acknowledged transaction, not a
     /// later lookup that could observe a concurrent renewal or release.
@@ -679,15 +723,37 @@ impl Store {
         ttl_ms: u64,
         release_on_verification: bool,
     ) -> StorageResult<Value> {
-        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, None)
-            .map(|(_, record)| record)
+        self.write_lease(
+            session,
+            origin,
+            id,
+            reason,
+            ttl_ms,
+            release_on_verification,
+            None,
+        )
+        .map(|(_, record)| record)
     }
     pub fn scoped_lease_record(
-        &self, session: &str, origin: &str, id: &str, reason: &str,
-        ttl_ms: u64, release_on_verification: bool, verification_scope: Option<&str>,
+        &self,
+        session: &str,
+        origin: &str,
+        id: &str,
+        reason: &str,
+        ttl_ms: u64,
+        release_on_verification: bool,
+        verification_scope: Option<&str>,
     ) -> StorageResult<Value> {
-        self.write_lease(session, origin, id, reason, ttl_ms, release_on_verification, verification_scope)
-            .map(|(_, record)| record)
+        self.write_lease(
+            session,
+            origin,
+            id,
+            reason,
+            ttl_ms,
+            release_on_verification,
+            verification_scope,
+        )
+        .map(|(_, record)| record)
     }
     fn write_lease(
         &self,
@@ -731,7 +797,9 @@ impl Store {
                 .ok_or_else(|| StorageError::Limit("Lease timestamp".into()))
         };
         let mut record = serde_json::json!({"version":1,"id":format!("lease_{}",&digest(format!("{session}:{origin}:{id}:{now}:{reason}").as_bytes())[..32]),"artifactId":id,"reason":reason,"createdAt":stamp(now)?,"expiresAt":stamp(expires)?,"releaseOnVerification":release_on_verification,"verificationScope":verification_scope});
-        if verification_scope.is_none() { record.as_object_mut().unwrap().remove("verificationScope"); }
+        if verification_scope.is_none() {
+            record.as_object_mut().unwrap().remove("verificationScope");
+        }
         let raw = serde_json::to_vec(&record)?;
         tx.execute(
             "INSERT OR REPLACE INTO leases VALUES(?1,?2,?3,?4,?5,?6,?7)",
@@ -778,7 +846,12 @@ impl Store {
         .collect::<Result<_, _>>()?)
     }
     /// Explicit scoped settlement. Unscoped historical leases are never swept.
-    pub fn release_verified_leases(&self, session: &str, scope: &str, started_ms: u64) -> StorageResult<usize> {
+    pub fn release_verified_leases(
+        &self,
+        session: &str,
+        scope: &str,
+        started_ms: u64,
+    ) -> StorageResult<usize> {
         let mut db = self.conn()?;
         Self::ready(&db)?;
         active_session(&db, session)?;
@@ -838,22 +911,49 @@ impl ag1_core::ArtifactPort for Store {
 }
 
 /// Called inside the same transaction as the native verification receipt.
-pub(crate) fn release_scoped_leases(tx: &rusqlite::Transaction<'_>, session: &str, scope: Option<&str>, started_ms: u64) -> StorageResult<usize> {
-    let Some(scope) = scope else { return Ok(0); };
+pub(crate) fn release_scoped_leases(
+    tx: &rusqlite::Transaction<'_>,
+    session: &str,
+    scope: Option<&str>,
+    started_ms: u64,
+) -> StorageResult<usize> {
+    let Some(scope) = scope else {
+        return Ok(0);
+    };
     ag1_core::tools::verification::scope(&serde_json::json!({"verificationScope":scope}))
         .map_err(|_| StorageError::Invalid("Verification scope".into()))?;
     let rows = {
-        let mut query = tx.prepare("SELECT origin,artifact,raw FROM leases WHERE session=?1 AND release_on_verification=1")?;
-        query.query_map([session], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Vec<u8>>(2)?)))?.collect::<Result<Vec<_>,_>>()?
+        let mut query = tx.prepare(
+            "SELECT origin,artifact,raw FROM leases WHERE session=?1 AND release_on_verification=1",
+        )?;
+        query
+            .query_map([session], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
     };
     let mut released = 0;
     for (origin, artifact, raw) in rows {
         let lease: Value = serde_json::from_slice(&raw)?;
-        if lease["verificationScope"].as_str() != Some(scope) { continue; }
-        let created = lease["createdAt"].as_str().and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()).map(|d| d.timestamp_millis());
+        if lease["verificationScope"].as_str() != Some(scope) {
+            continue;
+        }
+        let created = lease["createdAt"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.timestamp_millis());
         // Timestamp ties are retained conservatively: evidence must predate the check.
-        if created.is_none_or(|n| n < 0 || n as u64 >= started_ms) { continue; }
-        released += tx.execute("DELETE FROM leases WHERE session=?1 AND origin=?2 AND artifact=?3 AND raw=?4",params![session,origin,artifact,raw])?;
+        if created.is_none_or(|n| n < 0 || n as u64 >= started_ms) {
+            continue;
+        }
+        released += tx.execute(
+            "DELETE FROM leases WHERE session=?1 AND origin=?2 AND artifact=?3 AND raw=?4",
+            params![session, origin, artifact, raw],
+        )?;
     }
     Ok(released)
 }

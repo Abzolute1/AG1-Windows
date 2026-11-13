@@ -121,7 +121,11 @@ async fn run() -> Result<u8> {
                 ))
             }
             "--list-models" => list_models = true,
-            "--discover-openai-subscription" => subscription_session = Some(PathBuf::from(args.next().ok_or("--discover-openai-subscription requires the private Codex session file")?)),
+            "--discover-openai-subscription" => {
+                subscription_session = Some(PathBuf::from(args.next().ok_or(
+                    "--discover-openai-subscription requires the private Codex session file",
+                )?))
+            }
             "--" => {
                 prompt.extend(args);
                 break;
@@ -139,8 +143,13 @@ async fn run() -> Result<u8> {
         return Err("--mode requires jsonl or print".into());
     }
     if let Some(path) = subscription_session {
-        let models = ag1_platform::provider::codex_subscription::discover(&path).await.map_err(|e| format!("{e:?}"))?;
-        println!("{}", serde_json::to_string(&models).map_err(|e| e.to_string())?);
+        let models = ag1_platform::provider::codex_subscription::discover(&path)
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+        println!(
+            "{}",
+            serde_json::to_string(&models).map_err(|e| e.to_string())?
+        );
         return Ok(0);
     }
     let path = config.ok_or("--config is required; no implicit user profile writes")?;

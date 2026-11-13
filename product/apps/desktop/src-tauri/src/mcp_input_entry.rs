@@ -1,16 +1,45 @@
 //! Native choice forms. No opaque continuation state or responses cross WebKit.
 use ag1_core::DomainError;
-use ag1_platform::{mcp::input::{self,Answer,Choices,Form},resource_fs::ScanControl};
+use ag1_platform::{
+    mcp::input::{self, Answer, Choices, Form},
+    resource_fs::ScanControl,
+};
 use gtk::prelude::*;
-use std::{collections::BTreeMap,sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}},time::Duration};
-pub struct Entry {window:tauri::WebviewWindow,active:Mutex<()>}
-impl Entry {pub fn new(window:tauri::WebviewWindow)->Self{Self{window,active:Mutex::new(())}}}
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+pub struct Entry {
+    window: tauri::WebviewWindow,
+    active: Mutex<()>,
+}
+impl Entry {
+    pub fn new(window: tauri::WebviewWindow) -> Self {
+        Self {
+            window,
+            active: Mutex::new(()),
+        }
+    }
+}
 impl input::Entry for Entry {
-    fn enter(&self,form:&Form,control:&ScanControl<'_>)->Result<Answer,DomainError>{
-        let _active=self.active.try_lock().map_err(|_|DomainError::QueueFull)?;control.check()?;
-        let (sender,receiver)=std::sync::mpsc::sync_channel(1);
-        let closed=Arc::new(AtomicBool::new(false));struct Close(Arc<AtomicBool>);impl Drop for Close{fn drop(&mut self){self.0.store(true,Ordering::Release);}}
-        let _close=Close(closed.clone());let parent=self.window.clone();let form=form.clone();
+    fn enter(&self, form: &Form, control: &ScanControl<'_>) -> Result<Answer, DomainError> {
+        let _active = self.active.try_lock().map_err(|_| DomainError::QueueFull)?;
+        control.check()?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let closed = Arc::new(AtomicBool::new(false));
+        struct Close(Arc<AtomicBool>);
+        impl Drop for Close {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _close = Close(closed.clone());
+        let parent = self.window.clone();
+        let form = form.clone();
         self.window.run_on_main_thread(move||{
             if closed.load(Ordering::Acquire){return;}
             let parent=match parent.gtk_window(){Ok(p)=>p,Err(_)=>{let _=sender.send(Err(DomainError::Unavailable("Cannot open MCP input form".into())));return;}};
@@ -47,6 +76,16 @@ impl input::Entry for Entry {
                 dialog.close();unsafe{dialog.destroy();}if !closed.load(Ordering::Acquire){timer.remove();}let _=sender.send(Ok(answer));
             });
         }).map_err(|_|DomainError::Unavailable("Cannot schedule MCP input form".into()))?;
-        loop{control.check()?;match receiver.recv_timeout(Duration::from_millis(20)){Ok(answer)=>{control.check()?;return answer;},Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{},Err(_)=>return Err(DomainError::Cancelled)}}
+        loop {
+            control.check()?;
+            match receiver.recv_timeout(Duration::from_millis(20)) {
+                Ok(answer) => {
+                    control.check()?;
+                    return answer;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => return Err(DomainError::Cancelled),
+            }
+        }
     }
 }

@@ -15,13 +15,27 @@ pub fn repository_target(id: &str) -> bool {
 }
 pub fn query(id: &str) -> Option<&'static str> {
     Some(match id {
-        "projects.list" => "query($login:String!,$after:String){organization(login:$login){login projectsV2(first:30,after:$after){nodes{id number title url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}",
-        "projects.user_list" => "query($login:String!,$after:String){user(login:$login){login projectsV2(first:30,after:$after){nodes{id number title url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}",
-        "discussions.list" => "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){id nameWithOwner discussions(first:30,after:$after){nodes{id number title body url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}",
-        "projects.field_users" => "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldUserValue{field{... on ProjectV2FieldCommon{id name}} values:users(first:30,after:$after){nodes{id login name url} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}",
-        "projects.field_labels" => "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldLabelValue{field{... on ProjectV2FieldCommon{id name}} values:labels(first:30,after:$after){nodes{id name color description url} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}",
-        "projects.field_pull_requests" => "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldPullRequestValue{field{... on ProjectV2FieldCommon{id name}} values:pullRequests(first:30,after:$after){nodes{id number title url state} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}",
-        "projects.field_reviewers" => "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldReviewerValue{field{... on ProjectV2FieldCommon{id name}} values:reviewers(first:30,after:$after){nodes{__typename ... on User{id login url} ... on Team{id name slug url} ... on Bot{id login url} ... on Mannequin{id login url} ... on EnterpriseTeam{id name slug}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}",
+        "projects.list" => {
+            "query($login:String!,$after:String){organization(login:$login){login projectsV2(first:30,after:$after){nodes{id number title url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}"
+        }
+        "projects.user_list" => {
+            "query($login:String!,$after:String){user(login:$login){login projectsV2(first:30,after:$after){nodes{id number title url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}"
+        }
+        "discussions.list" => {
+            "query($owner:String!,$name:String!,$after:String){repository(owner:$owner,name:$name){id nameWithOwner discussions(first:30,after:$after){nodes{id number title body url} pageInfo{hasNextPage endCursor}}} rateLimit{cost remaining resetAt}}"
+        }
+        "projects.field_users" => {
+            "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldUserValue{field{... on ProjectV2FieldCommon{id name}} values:users(first:30,after:$after){nodes{id login name url} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}"
+        }
+        "projects.field_labels" => {
+            "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldLabelValue{field{... on ProjectV2FieldCommon{id name}} values:labels(first:30,after:$after){nodes{id name color description url} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}"
+        }
+        "projects.field_pull_requests" => {
+            "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldPullRequestValue{field{... on ProjectV2FieldCommon{id name}} values:pullRequests(first:30,after:$after){nodes{id number title url state} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}"
+        }
+        "projects.field_reviewers" => {
+            "query($id:ID!,$fieldId:ID!,$fieldName:String!,$after:String){field:node(id:$fieldId){id} node(id:$id){... on ProjectV2Item{id fieldValueByName(name:$fieldName){__typename ... on ProjectV2ItemFieldReviewerValue{field{... on ProjectV2FieldCommon{id name}} values:reviewers(first:30,after:$after){nodes{__typename ... on User{id login url} ... on Team{id name slug url} ... on Bot{id login url} ... on Mannequin{id login url} ... on EnterpriseTeam{id name slug}} pageInfo{hasNextPage endCursor}}}}}} rateLimit{cost remaining resetAt}}"
+        }
         "projects.items" => {
             "query($id:ID!,$after:String){node(id:$id){... on ProjectV2{id title items(first:30,after:$after){nodes{id content{... on Issue{title url} ... on PullRequest{title url} ... on DraftIssue{title body}}} pageInfo{hasNextPage endCursor}}}} rateLimit{cost remaining resetAt}}"
         }
@@ -59,7 +73,10 @@ pub fn schema(id: &str) -> Option<Value> {
         (json!(["id"]), json!({"id":node}))
     };
     if field_type(id).is_some() {
-        required.as_array_mut().unwrap().extend([json!("fieldId"), json!("fieldName")]);
+        required
+            .as_array_mut()
+            .unwrap()
+            .extend([json!("fieldId"), json!("fieldName")]);
         properties["fieldId"] = node;
         properties["fieldName"] = json!({"type":"string","minLength":1,"maxLength":1024});
     }
@@ -117,9 +134,22 @@ pub fn validate(operation: &Operation, data: &Value) -> Result<()> {
             return Err(malformed());
         }
         repo
-    } else if matches!(operation.id.as_str(), "projects.list" | "projects.user_list") {
-        let owner = &data["data"][if operation.id == "projects.list" { "organization" } else { "user" }];
-        if !owner["login"].as_str().zip(variables["login"].as_str()).is_some_and(|(actual, expected)|actual.eq_ignore_ascii_case(expected)) { return Err(malformed()); }
+    } else if matches!(
+        operation.id.as_str(),
+        "projects.list" | "projects.user_list"
+    ) {
+        let owner = &data["data"][if operation.id == "projects.list" {
+            "organization"
+        } else {
+            "user"
+        }];
+        if !owner["login"]
+            .as_str()
+            .zip(variables["login"].as_str())
+            .is_some_and(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+        {
+            return Err(malformed());
+        }
         owner
     } else {
         let node = &data["data"]["node"];
@@ -150,7 +180,8 @@ pub fn validate(operation: &Operation, data: &Value) -> Result<()> {
             if value["__typename"].as_str() != field_type(id)
                 || value["field"]["id"] != variables["fieldId"]
                 || data["data"]["field"]["id"] != variables["fieldId"]
-                || value["field"]["name"] != variables["fieldName"] {
+                || value["field"]["name"] != variables["fieldName"]
+            {
                 return Err(malformed());
             }
             &value["values"]
@@ -194,8 +225,32 @@ pub(super) fn bounded(value: &Value, depth: usize) -> Result<()> {
                 return Err(malformed());
             }
             for (key, value) in map {
-                if !value.is_null() && (["id", "title", "body", "readme", "shortDescription", "name", "login", "nameWithOwner", "url", "__typename", "dataType", "optionId", "iterationId", "startDate", "date", "text"].contains(&key.as_str()) && !value.is_string()
-                    || ["closed", "isArchived", "isAnswer"].contains(&key.as_str()) && !value.is_boolean()) { return Err(malformed()); }
+                if !value.is_null()
+                    && ([
+                        "id",
+                        "title",
+                        "body",
+                        "readme",
+                        "shortDescription",
+                        "name",
+                        "login",
+                        "nameWithOwner",
+                        "url",
+                        "__typename",
+                        "dataType",
+                        "optionId",
+                        "iterationId",
+                        "startDate",
+                        "date",
+                        "text",
+                    ]
+                    .contains(&key.as_str())
+                        && !value.is_string()
+                        || ["closed", "isArchived", "isAnswer"].contains(&key.as_str())
+                            && !value.is_boolean())
+                {
+                    return Err(malformed());
+                }
                 bounded(value, depth + 1)?;
             }
         }
@@ -225,7 +280,10 @@ mod tests {
         } else {
             json!({"id":"P_owned"})
         };
-        if field_type(id).is_some() { parameters["fieldId"]=json!("F_owned"); parameters["fieldName"]=json!("Literal field"); }
+        if field_type(id).is_some() {
+            parameters["fieldId"] = json!("F_owned");
+            parameters["fieldName"] = json!("Literal field");
+        }
         if id == "discussions.get" {
             parameters["number"] = json!(7);
         }
@@ -237,10 +295,14 @@ mod tests {
     fn data(id: &str) -> Value {
         let page = json!({"nodes":[{"id":"row","name":"Literal <script>value</script>"},null],"pageInfo":{"hasNextPage":true,"endCursor":"cursor-two"}});
         match id {
-            "discussions.list" => json!({"data":{"repository":{"nameWithOwner":"owned/repo","discussions":page}}}),
+            "discussions.list" => {
+                json!({"data":{"repository":{"nameWithOwner":"owned/repo","discussions":page}}})
+            }
             "projects.list" => json!({"data":{"organization":{"login":"owned","projectsV2":page}}}),
             "projects.user_list" => json!({"data":{"user":{"login":"owned","projectsV2":page}}}),
-            id if field_type(id).is_some() => json!({"data":{"field":{"id":"F_owned"},"node":{"id":"P_owned","fieldValueByName":{"__typename":field_type(id),"field":{"id":"F_owned","name":"Literal field"},"values":page}}}}),
+            id if field_type(id).is_some() => {
+                json!({"data":{"field":{"id":"F_owned"},"node":{"id":"P_owned","fieldValueByName":{"__typename":field_type(id),"field":{"id":"F_owned","name":"Literal field"},"values":page}}}})
+            }
             "discussions.categories" => {
                 json!({"data":{"repository":{"nameWithOwner":"owned/repo","discussionCategories":page}}})
             }
@@ -270,7 +332,9 @@ mod tests {
                 status: 200,
                 next: None,
                 rate_remaining: None,
-                rate_reset: None, rate_resource: None, rate_limit: None,
+                rate_reset: None,
+                rate_resource: None,
+                rate_limit: None,
                 outcome: Outcome::Read,
             })
         }
@@ -278,8 +342,13 @@ mod tests {
     #[test]
     fn typed_detail_reads_bind_target_and_bounded_cursor_pages_for_ui_and_model() {
         for id in [
-            "projects.list", "projects.user_list", "discussions.list",
-            "projects.field_users", "projects.field_labels", "projects.field_pull_requests", "projects.field_reviewers",
+            "projects.list",
+            "projects.user_list",
+            "discussions.list",
+            "projects.field_users",
+            "projects.field_labels",
+            "projects.field_pull_requests",
+            "projects.field_reviewers",
             "discussions.categories",
             "discussions.get",
             "discussions.replies",
@@ -356,9 +425,20 @@ mod tests {
     }
     #[test]
     fn nested_fields_reject_changed_type_identity_name_and_cursor_without_authority() {
-        for id in ["projects.field_users", "projects.field_labels", "projects.field_pull_requests", "projects.field_reviewers"] {
+        for id in [
+            "projects.field_users",
+            "projects.field_labels",
+            "projects.field_pull_requests",
+            "projects.field_reviewers",
+        ] {
             let op = request(id, Value::Null).compile().unwrap();
-            for path in ["/data/node/id", "/data/field/id", "/data/node/fieldValueByName/field/id", "/data/node/fieldValueByName/field/name", "/data/node/fieldValueByName/__typename"] {
+            for path in [
+                "/data/node/id",
+                "/data/field/id",
+                "/data/node/fieldValueByName/field/id",
+                "/data/node/fieldValueByName/field/name",
+                "/data/node/fieldValueByName/__typename",
+            ] {
                 let mut value = data(id);
                 *value.pointer_mut(path).unwrap() = json!("wrong");
                 assert!(validate(&op, &value).is_err(), "{id} {path}");
@@ -369,7 +449,8 @@ mod tests {
                 assert!(r.compile().is_err());
             }
             let mut r = request(id, Value::Null);
-            r.parameters.insert("fieldName".into(), json!("name \" } mutation { literal"));
+            r.parameters
+                .insert("fieldName".into(), json!("name \" } mutation { literal"));
             let compiled = r.compile().unwrap();
             assert_eq!(compiled.body.unwrap()["query"], query(id).unwrap());
         }
@@ -377,9 +458,14 @@ mod tests {
     #[test]
     fn malformed_visible_scalars_are_rejected_before_rendering() {
         let op = request("projects.get", Value::Null).compile().unwrap();
-        for (key, invalid) in [("title", json!({"untrusted":"object"})), ("readme",json!(["array"])), ("closed",json!("yes"))] {
-            let mut response = data("projects.get");response["data"]["node"][key]=invalid;
-            assert!(validate(&op,&response).is_err());
+        for (key, invalid) in [
+            ("title", json!({"untrusted":"object"})),
+            ("readme", json!(["array"])),
+            ("closed", json!("yes")),
+        ] {
+            let mut response = data("projects.get");
+            response["data"]["node"][key] = invalid;
+            assert!(validate(&op, &response).is_err());
         }
     }
     #[test]

@@ -40,24 +40,43 @@ impl MaterialVerifier {
     pub fn verify(&mut self, materials: &[Material]) -> Result<(), DomainError> {
         self.verify_progress(materials, &mut |_| {})
     }
-    pub fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+    pub fn verify_progress(
+        &mut self,
+        materials: &[Material],
+        progress: &mut dyn FnMut(u8),
+    ) -> Result<(), DomainError> {
         if materials.is_empty() || materials.len() > 1024 {
             return Err(DomainError::InvalidInput(
                 "runtime material manifest".into(),
             ));
         }
-        let total: u128 = materials.iter().map(|m| {
-            if !Path::new(&m.path).is_absolute() || m.sha256.len() != 64 || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return Err(DomainError::InvalidInput("runtime material identity".into()));
-            }
-            fs::metadata(&m.path).map(|m| m.len() as u128).map_err(io_error)
-        }).collect::<Result<Vec<_>, _>>()?.into_iter().sum();
+        let total: u128 = materials
+            .iter()
+            .map(|m| {
+                if !Path::new(&m.path).is_absolute()
+                    || m.sha256.len() != 64
+                    || !m.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err(DomainError::InvalidInput(
+                        "runtime material identity".into(),
+                    ));
+                }
+                fs::metadata(&m.path)
+                    .map(|m| m.len() as u128)
+                    .map_err(io_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum();
         let mut done = 0u128;
         let mut last = 0u8;
         progress(0);
         let mut report = |done: u128| {
             let percent = (done.saturating_mul(100) / total.max(1)).min(99) as u8;
-            if percent != last { progress(percent); last = percent; }
+            if percent != last {
+                progress(percent);
+                last = percent;
+            }
         };
         let mut unique = BTreeMap::new();
         for material in materials {
@@ -182,16 +201,26 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError> {
         self.verifier.verify(materials)
     }
-    fn verify_progress(&mut self, materials: &[Material], progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+    fn verify_progress(
+        &mut self,
+        materials: &[Material],
+        progress: &mut dyn FnMut(u8),
+    ) -> Result<(), DomainError> {
         self.verifier.verify_progress(materials, progress)
     }
     fn loading_phase(&mut self, handle: &Self::Handle) -> Option<&'static str> {
         let process = handle.process.lock().ok()?;
         let log = process.tail(8192).ok()?;
         let text = String::from_utf8_lossy(&log.bytes);
-        if text.contains("warming up") { Some("warming") }
-        else if text.contains("load_model: initializing") || text.contains("loaded multimodal model") { Some("initializing") }
-        else { None }
+        if text.contains("warming up") {
+            Some("warming")
+        } else if text.contains("load_model: initializing")
+            || text.contains("loaded multimodal model")
+        {
+            Some("initializing")
+        } else {
+            None
+        }
     }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError> {
         if self.exclusive_gpu && self.owned_pid.is_none() {
@@ -287,7 +316,11 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             _ => Err(DomainError::Conflict),
         }
     }
-    fn generation_idle(&mut self, _handle: &Self::Handle, plan: &LaunchPlan) -> Result<bool, DomainError> {
+    fn generation_idle(
+        &mut self,
+        _handle: &Self::Handle,
+        plan: &LaunchPlan,
+    ) -> Result<bool, DomainError> {
         super::observation::blocking_generation_idle(plan)
     }
     fn stop(&mut self, handle: &mut Self::Handle) -> Result<(), DomainError> {

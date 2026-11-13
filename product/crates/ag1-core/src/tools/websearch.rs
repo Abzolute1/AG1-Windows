@@ -989,7 +989,7 @@ pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, Domain
             continue;
         };
         let url = normalize_result_url(&href);
-        let title = compact(&anchor.text());
+        let title = decode_html(&anchor.text());
         if title.is_empty() || !usable(&url) || !seen.insert(canonical(&url)) {
             continue;
         }
@@ -998,7 +998,7 @@ pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, Domain
         // in the next table row. Bound sibling scans to this result only.
         for parent in anchor.ancestors(Some(6)).iter() {
             if parent.is(".result, .web-result") {
-                snippet = compact(&parent.select(".result__snippet").text());
+                snippet = decode_html(&parent.select(".result__snippet").text());
                 break;
             }
             if parent.is("tr") {
@@ -1007,7 +1007,7 @@ pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, Domain
                     if next.is_empty() || !next.select("a.result-link").is_empty() {
                         break;
                     }
-                    snippet = compact(&next.select(".result-snippet").text());
+                    snippet = decode_html(&next.select(".result-snippet").text());
                     if !snippet.is_empty() {
                         break;
                     }
@@ -1023,7 +1023,7 @@ pub fn parse_duckduckgo(html: &str, max: usize) -> Result<Vec<ResultRow>, Domain
                     break;
                 }
                 if next.is(".result__snippet, .result-snippet") {
-                    snippet = compact(&next.text());
+                    snippet = decode_html(&next.text());
                     break;
                 }
                 next = next.next_sibling();

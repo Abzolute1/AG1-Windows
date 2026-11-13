@@ -213,13 +213,31 @@ impl RuntimeRegistry {
             .await
     }
     /// Rebuild capabilities without changing the conversation or journal identity.
-    pub(crate) async fn refresh(&self, factory: &dyn RuntimeFactory) -> Result<Selection, DomainError> {
-        let _replacement = self.replacing.try_lock().map_err(|_|DomainError::Conflict)?;
+    pub(crate) async fn refresh(
+        &self,
+        factory: &dyn RuntimeFactory,
+    ) -> Result<Selection, DomainError> {
+        let _replacement = self
+            .replacing
+            .try_lock()
+            .map_err(|_| DomainError::Conflict)?;
         let previous = self.selected()?;
         let runtime = previous.services.runtime();
-        if !runtime.settled()? { return Err(DomainError::Conflict); }
-        let target = Target { workspace: runtime.workspace.clone(), session: runtime.state()?.stamp().session().clone() };
-        self.replace_locked(previous.epoch, target, factory, false, Some(runtime.journal_revision()?)).await
+        if !runtime.settled()? {
+            return Err(DomainError::Conflict);
+        }
+        let target = Target {
+            workspace: runtime.workspace.clone(),
+            session: runtime.state()?.stamp().session().clone(),
+        };
+        self.replace_locked(
+            previous.epoch,
+            target,
+            factory,
+            false,
+            Some(runtime.journal_revision()?),
+        )
+        .await
     }
     /// User-directed session switching cancels unstarted prompts with durable
     /// terminal receipts. Never discard an accepted queue or replay a claim.
@@ -241,7 +259,9 @@ impl RuntimeRegistry {
         source_revision: Option<u64>,
     ) -> Result<Selection, DomainError> {
         if self.durable.as_ref().is_some_and(|d| d.conversation) {
-            return Err(DomainError::Unavailable("Use the desktop chat picker to open a different conversation".into()));
+            return Err(DomainError::Unavailable(
+                "Use the desktop chat picker to open a different conversation".into(),
+            ));
         }
 
         let _replacement = self

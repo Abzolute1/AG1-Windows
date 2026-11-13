@@ -51,18 +51,30 @@ pub enum Observation {
 pub trait RuntimeHost {
     type Handle;
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError>;
-    fn verify_progress(&mut self, materials: &[Material], _progress: &mut dyn FnMut(u8)) -> Result<(), DomainError> {
+    fn verify_progress(
+        &mut self,
+        materials: &[Material],
+        _progress: &mut dyn FnMut(u8),
+    ) -> Result<(), DomainError> {
         self.verify_materials(materials)
     }
-    fn loading_phase(&mut self, _handle: &Self::Handle) -> Option<&'static str> { None }
+    fn loading_phase(&mut self, _handle: &Self::Handle) -> Option<&'static str> {
+        None
+    }
     fn observe(&mut self, plan: &LaunchPlan) -> Result<Observation, DomainError>;
     fn spawn(&mut self, plan: &LaunchPlan) -> Result<Self::Handle, DomainError>;
     /// Verifies both process lifetime and executable identity; false means exited.
     fn owned_alive(&mut self, handle: &Self::Handle) -> Result<bool, DomainError>;
     /// Called after the cancelled HTTP stream is closed. Idle observation settles
     /// generation without releasing the authenticated process or its loaded model.
-    fn generation_idle(&mut self, _handle: &Self::Handle, _plan: &LaunchPlan) -> Result<bool, DomainError> {
-        Err(DomainError::Unavailable("Owned generation status unavailable".into()))
+    fn generation_idle(
+        &mut self,
+        _handle: &Self::Handle,
+        _plan: &LaunchPlan,
+    ) -> Result<bool, DomainError> {
+        Err(DomainError::Unavailable(
+            "Owned generation status unavailable".into(),
+        ))
     }
     /// Returns only after verified exit. Never signals a process found just by port.
     fn stop(&mut self, handle: &mut Self::Handle) -> Result<(), DomainError>;

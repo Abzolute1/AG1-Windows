@@ -89,8 +89,10 @@ impl Manager {
 }
 impl PreparedOperation {
     pub(crate) fn allow_input(mut self, allowed: bool) -> Self {
-        self.input_allowed=allowed && self.control.input_entry.is_some();
-        if self.input_allowed {self.wait=Duration::from_secs(super::super::input::MAX_SECONDS+2);}
+        self.input_allowed = allowed && self.control.input_entry.is_some();
+        if self.input_allowed {
+            self.wait = Duration::from_secs(super::super::input::MAX_SECONDS + 2);
+        }
         self
     }
     pub(crate) fn target_revision(&self) -> String {
@@ -200,19 +202,29 @@ impl PreparedOperation {
         match result {
             Ok(Ok(envelope)) => {
                 let outcome = operation::retain_result(
-                    artifacts, self.call.mcp_identity().expect("MCP reservation"),
-                    self.tool.as_ref(), self.call.call_id(), envelope,
+                    artifacts,
+                    self.call.mcp_identity().expect("MCP reservation"),
+                    self.tool.as_ref(),
+                    self.call.call_id(),
+                    envelope,
                 )?;
                 // Bounded decoding/storage may outlast revocation. Historical
                 // custody stays scoped, but the now-private projection is withheld.
                 if self.control.cancelled.load(Ordering::Acquire) {
                     return Ok(operation::failure("cancelled", admitted));
                 }
-                if let Err(error) = self.control.credential_check().and_then(|_| check.as_ref().map_or(Ok(()), |check|check())) {
-                    return Ok(operation::failure(operation::error_code(&error,admitted),admitted));
+                if let Err(error) = self
+                    .control
+                    .credential_check()
+                    .and_then(|_| check.as_ref().map_or(Ok(()), |check| check()))
+                {
+                    return Ok(operation::failure(
+                        operation::error_code(&error, admitted),
+                        admitted,
+                    ));
                 }
                 Ok(outcome)
-            },
+            }
             Ok(Err(error)) => Ok(operation::failure(
                 operation::error_code(&error, admitted),
                 admitted,

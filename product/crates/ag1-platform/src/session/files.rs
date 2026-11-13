@@ -117,7 +117,11 @@ impl NativeToolRunner {
     fn capability_status(&self, registry: &Registry, args: &Value) -> Result<Value, DomainError> {
         use ag1_core::tools::{policy, surface};
         let available = self.adapters.available_names();
-        let tools: Vec<_> = registry.native_tools().into_iter().filter(|t|available.iter().any(|n| t["name"]==*n)).collect();
+        let tools: Vec<_> = registry
+            .native_tools()
+            .into_iter()
+            .filter(|t| available.iter().any(|n| t["name"] == *n))
+            .collect();
         let permissions = json!({"mode":self.policy.mode,"policyRevision":self.policy_revision,"folders":self.adapters.folders.as_ref().map(|f|&f.selection),"shell":self.adapters.shell.as_ref().map(|s|s.boundary_status()),"metadataGrantsAuthority":false});
         match args["action"].as_str() {
             Some("list") => Ok(json!({"permissions":permissions,"tools":tools.iter().map(|t|json!({"name":t["name"],"advanced":surface::ADVANCED.contains(&t["name"].as_str().unwrap_or("")),"effects":t["effects"]})).collect::<Vec<_>>()})),
@@ -141,15 +145,34 @@ impl NativeToolRunner {
         // The complete arguments remain in the assistant's native tool record.
         let mut parts = Vec::new();
         if let Some(edits) = args["edits"].as_array() {
-            parts.push(format!("{} ordered edits; showing a bounded excerpt:\n", edits.len()));
+            parts.push(format!(
+                "{} ordered edits; showing a bounded excerpt:\n",
+                edits.len()
+            ));
             for edit in edits.iter().take(16) {
-                let old: String = edit["oldText"].as_str().unwrap_or("").chars().take(1500).collect();
-                let new: String = edit["newText"].as_str().unwrap_or("").chars().take(1500).collect();
+                let old: String = edit["oldText"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1500)
+                    .collect();
+                let new: String = edit["newText"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(1500)
+                    .collect();
                 parts.push(format!("Old text:\n{old}\nReplacement:\n{new}"));
-                if parts.iter().map(String::len).sum::<usize>() >= 3000 { break; }
+                if parts.iter().map(String::len).sum::<usize>() >= 3000 {
+                    break;
+                }
             }
         } else if let Some(content) = args["content"].as_str() {
-            parts.push(format!("Proposed content ({} bytes; bounded excerpt):\n{}", content.len(), content.chars().take(3000).collect::<String>()));
+            parts.push(format!(
+                "Proposed content ({} bytes; bounded excerpt):\n{}",
+                content.len(),
+                content.chars().take(3000).collect::<String>()
+            ));
         }
         parts.join("\n\n").chars().take(3000).collect()
     }
@@ -157,9 +180,20 @@ impl NativeToolRunner {
         // Delegation has its own bounded child lifetime and must include time
         // waiting for a local inference slot. Ordinary tools retain their limit.
         match call.name.as_str() {
-            "task" => Duration::from_secs_f64(call.block["arguments"]["timeout"].as_f64()
-                .filter(|v| v.is_finite() && *v > 0.).unwrap_or(300.).clamp(1., 86400.) + 30.),
-            "explore" => Duration::from_secs(180 * call.block["arguments"]["questions"].as_array().map_or(1, |q| q.len().clamp(1, 4)) as u64 + 30),
+            "task" => Duration::from_secs_f64(
+                call.block["arguments"]["timeout"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v > 0.)
+                    .unwrap_or(300.)
+                    .clamp(1., 86400.)
+                    + 30.,
+            ),
+            "explore" => Duration::from_secs(
+                180 * call.block["arguments"]["questions"]
+                    .as_array()
+                    .map_or(1, |q| q.len().clamp(1, 4)) as u64
+                    + 30,
+            ),
             _ => self.tool_timeout,
         }
     }
@@ -362,7 +396,10 @@ impl NativeToolRunner {
             SessionId::new(&scope.session)?,
             &self.origin,
             &work.operation,
-            current.selection.journal.as_ref()
+            current
+                .selection
+                .journal
+                .as_ref()
                 .map_or(self.timestamp.as_str(), |journal| journal.timestamp()),
             Features::default(),
         )?;
@@ -429,7 +466,8 @@ impl NativeToolRunner {
                         match (*plan).execute(
                             authorization,
                             AdapterContext {
-                    policy_mode: self.policy.mode,                                journal: current.selection.journal.as_ref(),
+                                policy_mode: self.policy.mode,
+                                journal: current.selection.journal.as_ref(),
                                 registry: current.registry,
                                 scope,
                                 policy_revision: self.policy_revision,
@@ -482,60 +520,120 @@ impl NativeToolRunner {
 }
 impl ToolRunner for NativeToolRunner {
     #[cfg(target_os = "linux")]
-    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> { self.adapters.mcp_management.clone() }
+    fn client_mcp(&self) -> Option<Arc<crate::mcp::service::Session>> {
+        self.adapters.mcp_management.clone()
+    }
     #[cfg(target_os = "linux")]
-    fn mcp_request_runner(&self,scope:&Scope)->Result<Option<Arc<dyn ToolRunner>>,DomainError> {
-        let Some(discovery)=&self.adapters.mcp_discovery else { return Ok(None); };
-        let mut runner=self.clone();
-        let mut registry=self.registry.as_ref().clone();
-        runner.adapters.mcp=Some(Arc::new(discovery.capture(scope,&mut registry)?));
-        runner.registry=Arc::new(registry);
+    fn mcp_request_runner(
+        &self,
+        scope: &Scope,
+    ) -> Result<Option<Arc<dyn ToolRunner>>, DomainError> {
+        let Some(discovery) = &self.adapters.mcp_discovery else {
+            return Ok(None);
+        };
+        let mut runner = self.clone();
+        let mut registry = self.registry.as_ref().clone();
+        runner.adapters.mcp = Some(Arc::new(discovery.capture(scope, &mut registry)?));
+        runner.registry = Arc::new(registry);
         Ok(Some(Arc::new(runner)))
     }
     #[cfg(target_os = "linux")]
-    fn mcp_request_definitions(&self)->Option<Vec<ag1_core::tools::mcp::SelectedDefinition>> {
-        self.adapters.mcp_discovery.as_ref().map(|_|self.registry.mcp_selection())
+    fn mcp_request_definitions(&self) -> Option<Vec<ag1_core::tools::mcp::SelectedDefinition>> {
+        self.adapters
+            .mcp_discovery
+            .as_ref()
+            .map(|_| self.registry.mcp_selection())
     }
 
     #[cfg(target_os = "linux")]
-    fn prepare_mcp_request(&self,scope:&Scope,tools:&[Value])->Result<Vec<Value>,DomainError> {
-        let valid=self.adapters.mcp.as_ref().is_some_and(|mcp|mcp.validate(scope,&self.registry).is_ok());
-        let catalog=self.registry.public_tools();
-        let dynamic=self.adapters.mcp_discovery.is_some();
-        let mut view:Vec<_>=tools.iter().filter_map(|tool| {
-            if dynamic && (tool["sourceInfo"]["source"]=="mcp" || self.registry.definitions().any(|d|d.origin==ag1_core::tools::registry::Origin::Mcp && d.metadata["name"]==tool["name"])) { return None; }
-            let definition=self.registry.definitions().find(|d|d.metadata["name"]==tool["name"]);
-            if definition.is_some_and(|d|d.origin==ag1_core::tools::registry::Origin::Mcp) {
-                valid.then(||catalog.iter().find(|d|d["name"]==tool["name"]).cloned()).flatten()
-            } else { Some(tool.clone()) }
-        }).collect();
+    fn prepare_mcp_request(
+        &self,
+        scope: &Scope,
+        tools: &[Value],
+    ) -> Result<Vec<Value>, DomainError> {
+        let valid = self
+            .adapters
+            .mcp
+            .as_ref()
+            .is_some_and(|mcp| mcp.validate(scope, &self.registry).is_ok());
+        let catalog = self.registry.public_tools();
+        let dynamic = self.adapters.mcp_discovery.is_some();
+        let mut view: Vec<_> = tools
+            .iter()
+            .filter_map(|tool| {
+                if dynamic
+                    && (tool["sourceInfo"]["source"] == "mcp"
+                        || self.registry.definitions().any(|d| {
+                            d.origin == ag1_core::tools::registry::Origin::Mcp
+                                && d.metadata["name"] == tool["name"]
+                        }))
+                {
+                    return None;
+                }
+                let definition = self
+                    .registry
+                    .definitions()
+                    .find(|d| d.metadata["name"] == tool["name"]);
+                if definition.is_some_and(|d| d.origin == ag1_core::tools::registry::Origin::Mcp) {
+                    valid
+                        .then(|| catalog.iter().find(|d| d["name"] == tool["name"]).cloned())
+                        .flatten()
+                } else {
+                    Some(tool.clone())
+                }
+            })
+            .collect();
         if dynamic && valid {
-            let facade=ag1_core::tools::mcp::discovery::NAME;
-            if !view.iter().any(|t|t["name"]==facade) && let Some(tool)=catalog.iter().find(|t|t["name"]==facade) { view.push(tool.clone()); }
-            view.extend(catalog.into_iter().filter(|t|self.registry.definitions().any(|d|d.origin==ag1_core::tools::registry::Origin::Mcp && d.metadata["name"]==t["name"])));
+            let facade = ag1_core::tools::mcp::discovery::NAME;
+            if !view.iter().any(|t| t["name"] == facade)
+                && let Some(tool) = catalog.iter().find(|t| t["name"] == facade)
+            {
+                view.push(tool.clone());
+            }
+            view.extend(catalog.into_iter().filter(|t| {
+                self.registry.definitions().any(|d| {
+                    d.origin == ag1_core::tools::registry::Origin::Mcp
+                        && d.metadata["name"] == t["name"]
+                })
+            }));
         }
         Ok(view)
     }
     #[cfg(target_os = "linux")]
-    fn validate_mcp_request(&self,scope:&Scope,tools:&[Value])->Result<(),DomainError> {
+    fn validate_mcp_request(&self, scope: &Scope, tools: &[Value]) -> Result<(), DomainError> {
         if self.adapters.mcp_discovery.is_some() {
-            self.adapters.mcp.as_ref().ok_or(DomainError::Conflict)?.validate(scope,&self.registry)?;
-            let catalog=self.registry.public_tools();
+            self.adapters
+                .mcp
+                .as_ref()
+                .ok_or(DomainError::Conflict)?
+                .validate(scope, &self.registry)?;
+            let catalog = self.registry.public_tools();
             // Native planning/controlled modes may further reduce the captured
             // selection. Revalidate every advertised MCP schema without adding
             // removed tools back after those mode-specific restrictions.
             for tool in tools {
-                let mcp=tool["sourceInfo"]["source"]=="mcp" || self.registry.definitions().any(|d|d.origin==ag1_core::tools::registry::Origin::Mcp && d.metadata["name"]==tool["name"]);
-                if mcp && !catalog.iter().any(|expected|expected==tool) { return Err(DomainError::Conflict); }
+                let mcp = tool["sourceInfo"]["source"] == "mcp"
+                    || self.registry.definitions().any(|d| {
+                        d.origin == ag1_core::tools::registry::Origin::Mcp
+                            && d.metadata["name"] == tool["name"]
+                    });
+                if mcp && !catalog.iter().any(|expected| expected == tool) {
+                    return Err(DomainError::Conflict);
+                }
             }
             return Ok(());
         }
-        if self.prepare_mcp_request(scope,tools)?!=tools { return Err(DomainError::Conflict); }
+        if self.prepare_mcp_request(scope, tools)? != tools {
+            return Err(DomainError::Conflict);
+        }
         Ok(())
     }
 
     fn folder_access(&self) -> Option<(Arc<crate::folder_access::FolderAccess>, u64)> {
-        Some((self.adapters.folder_authority.clone()?, self.adapters.folders.as_ref()?.selection.revision))
+        Some((
+            self.adapters.folder_authority.clone()?,
+            self.adapters.folders.as_ref()?.selection.revision,
+        ))
     }
     fn client_activity(&self) -> Result<Value, DomainError> {
         self.adapters
@@ -698,7 +796,9 @@ impl ToolRunner for NativeToolRunner {
     }
     fn quiesce(&self, scope: &Scope, operation: &str) -> Result<(), DomainError> {
         #[cfg(target_os = "linux")]
-        if let Some(mcp)=&self.adapters.mcp_management { mcp.close()?; }
+        if let Some(mcp) = &self.adapters.mcp_management {
+            mcp.close()?;
+        }
         if let Some(jobs) = &self.adapters.jobs {
             let mut artifacts = ContextStore::new(
                 &self.store,
@@ -724,7 +824,9 @@ impl ToolRunner for NativeToolRunner {
         cancel: &AtomicBool,
         current_revision: &AtomicU64,
     ) -> Result<Vec<ToolOutcome>, DomainError> {
-        if let Some((authority, revision)) = self.folder_access() { authority.check(revision)?; }
+        if let Some((authority, revision)) = self.folder_access() {
+            authority.check(revision)?;
+        }
         if self.policy.mode != ag1_core::tools::policy::Mode::Planning
             && let Some(policy) = &self.adapters.approval_policy
         {
@@ -755,10 +857,20 @@ impl ToolRunner for NativeToolRunner {
             })
             .cloned()
             .collect::<Vec<_>>();
-        for facade in selection.names.iter().filter(|n| ag1_core::tools::surface::is_facade(n)) {
-            let dependencies = if facade == "capability" { ag1_core::tools::surface::ADVANCED } else { ag1_core::tools::surface::dependencies(facade) };
+        for facade in selection
+            .names
+            .iter()
+            .filter(|n| ag1_core::tools::surface::is_facade(n))
+        {
+            let dependencies = if facade == "capability" {
+                ag1_core::tools::surface::ADVANCED
+            } else {
+                ag1_core::tools::surface::dependencies(facade)
+            };
             for dependency in dependencies {
-                if available.contains(*dependency) && !names.iter().any(|n|n==dependency) { names.push((*dependency).into()); }
+                if available.contains(*dependency) && !names.iter().any(|n| n == dependency) {
+                    names.push((*dependency).into());
+                }
             }
         }
         registry.activate(&names, &available)?;
@@ -839,15 +951,38 @@ impl ToolRunner for NativeToolRunner {
                 let result = result?;
                 if let Some(journal) = &selection.journal {
                     journal.publish_result(&result.outcome)?;
-                    if result.execution_settled && !result.outcome.replayed
-                        && matches!(result.outcome.record.tool.as_str(), "edit" | "editApply" | "editPreview" | "write" | "append" | "todo" | "bash" | "check" | "task" | "explore") {
+                    if result.execution_settled
+                        && !result.outcome.replayed
+                        && matches!(
+                            result.outcome.record.tool.as_str(),
+                            "edit"
+                                | "editApply"
+                                | "editPreview"
+                                | "write"
+                                | "append"
+                                | "todo"
+                                | "bash"
+                                | "check"
+                                | "task"
+                                | "explore"
+                        )
+                    {
                         let record = &result.outcome.record;
-                        let artifacts = ContextStore::new(&self.store, SessionId::new(&scope.session)?,
-                            &self.origin, &record.operation, &self.timestamp, Features::default())?;
+                        let artifacts = ContextStore::new(
+                            &self.store,
+                            SessionId::new(&scope.session)?,
+                            &self.origin,
+                            &record.operation,
+                            &self.timestamp,
+                            Features::default(),
+                        )?;
                         // Rejections have no native-result artifact. Their
                         // acknowledged rejection is already the native result.
-                        let native = record.native_result.as_ref()
-                            .map(|artifact| artifacts.read_json(artifact)).transpose()?
+                        let native = record
+                            .native_result
+                            .as_ref()
+                            .map(|artifact| artifacts.read_json(artifact))
+                            .transpose()?
                             .unwrap_or_else(|| result.outcome.result.clone());
                         // The durable arguments are the actual admitted inputs,
                         // including native shell transforms. Extension display
@@ -857,9 +992,16 @@ impl ToolRunner for NativeToolRunner {
                         snapshot_scope.revision = journal.revision()?;
                         let todo = if record.tool == "todo" {
                             ag1_core::tools::todo::latest(&journal.snapshot(&snapshot_scope)?)
-                        } else { None };
-                        let events = journal.repetition.recovery_outcome(&record.tool, &record.call_id,
-                            &arguments, &native, todo.as_ref())?;
+                        } else {
+                            None
+                        };
+                        let events = journal.repetition.recovery_outcome(
+                            &record.tool,
+                            &record.call_id,
+                            &arguments,
+                            &native,
+                            todo.as_ref(),
+                        )?;
                         journal.repetition_events(events);
                     }
                     if let Some(completion) = &journal.completion {

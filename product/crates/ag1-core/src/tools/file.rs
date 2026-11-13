@@ -2,8 +2,8 @@
 use super::{diff, edit};
 use crate::DomainError;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub struct Transformation {
     /// None denotes a read-only result or a rejected transformation; never publish it.
@@ -58,8 +58,13 @@ pub fn transform(
     }
     let preview = name == "edit" && args["mode"] == "preview";
     if name == "edit" {
-        if args.get("mode").is_some_and(|mode| mode != "preview" && mode != "apply") {
-            return Err(DomainError::InvalidInput("edit mode must be preview or apply".into()));
+        if args
+            .get("mode")
+            .is_some_and(|mode| mode != "preview" && mode != "apply")
+        {
+            return Err(DomainError::InvalidInput(
+                "edit mode must be preview or apply".into(),
+            ));
         }
         if let Some(expected) = args.get("expectedSha256") {
             let hash = original.map(|bytes| format!("{:x}", Sha256::digest(bytes)));
@@ -121,7 +126,9 @@ pub fn transform(
             let mut result = json!({"content":[text(format!("{} {} block(s) in {path}.{note}", if preview {"Previewed"} else {"Patched"}, edits.len())),text(diff::format_summary(&d.summary)),text(d.diff)],"details":details});
             if preview {
                 let hash = result["details"]["sourceSha256"].as_str().unwrap();
-                let receipt = text(format!("Preview only; no file was written. Source SHA-256: {hash}. Apply the same edits with mode=apply and expectedSha256 set to this exact 64-character hash."));
+                let receipt = text(format!(
+                    "Preview only; no file was written. Source SHA-256: {hash}. Apply the same edits with mode=apply and expectedSha256 set to this exact 64-character hash."
+                ));
                 result["content"].as_array_mut().unwrap().push(receipt);
             }
             (edit::restore(&old, &changed.new_content), result, false)
@@ -234,7 +241,11 @@ pub fn transform(
         return Err(DomainError::LimitExceeded("edited file bytes".into()));
     }
     Ok(Transformation {
-        bytes: if preview { None } else { Some(new.into_bytes()) },
+        bytes: if preview {
+            None
+        } else {
+            Some(new.into_bytes())
+        },
         result,
         create_parents: parents,
     })

@@ -206,27 +206,60 @@ pub fn setup(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Test-only TLS composition is loaded before native OAuth/manager creation.
 /// The manifest lives beside the authenticated visual socket in an owned run.
-pub fn configure_mcp_tls()->Result<(),Box<dyn std::error::Error>> {
-    let Some(socket)=std::env::var_os("AG1_VISUAL_SOCKET") else {return Ok(())};
-    let socket=PathBuf::from(socket);
-    let parent=socket.parent().ok_or("Visual socket parent")?.canonicalize()?;
-    let base=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../../.local/p14-live-fixes").canonicalize()?;
-    let path=parent.join("owned-mcp-tls.json");
-    if !path.exists() {return Ok(());}
-    if std::env::var("AG1_FIXTURE_PROVIDER").as_deref()!=Ok("1") || !parent.starts_with(&base) || !parent.parent().and_then(|p|p.file_name()).is_some_and(|p|p.to_string_lossy().starts_with("native-candidate-mcp-c2-")) {
+pub fn configure_mcp_tls() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(socket) = std::env::var_os("AG1_VISUAL_SOCKET") else {
+        return Ok(());
+    };
+    let socket = PathBuf::from(socket);
+    let parent = socket
+        .parent()
+        .ok_or("Visual socket parent")?
+        .canonicalize()?;
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../../.local/p14-live-fixes")
+        .canonicalize()?;
+    let path = parent.join("owned-mcp-tls.json");
+    if !path.exists() {
+        return Ok(());
+    }
+    if std::env::var("AG1_FIXTURE_PROVIDER").as_deref() != Ok("1")
+        || !parent.starts_with(&base)
+        || !parent
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|p| p.to_string_lossy().starts_with("native-candidate-mcp-c2-"))
+    {
         return Err("Owned MCP TLS requires an isolated C2 fixture run".into());
     }
-    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
-    let mut file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path)?;
-    let meta=file.metadata()?;
-    if !meta.is_file() || meta.len()>100000 || meta.permissions().mode()&0o077!=0 || meta.uid()!=unsafe{libc::geteuid()} {return Err("Owned MCP TLS manifest identity".into());}
-    let mut bytes=Vec::new();std::io::Read::read_to_end(&mut std::io::Read::take(&mut file,100001),&mut bytes)?;
-    if bytes.len()>100000 {return Err("Owned MCP TLS manifest quota".into());}
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.len() > 100000
+        || meta.permissions().mode() & 0o077 != 0
+        || meta.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("Owned MCP TLS manifest identity".into());
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 100001), &mut bytes)?;
+    if bytes.len() > 100000 {
+        return Err("Owned MCP TLS manifest quota".into());
+    }
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Manifest {origin:String,certificate_pem:String}
-    let manifest:Manifest=serde_json::from_slice(&bytes)?;
-    ag1_platform::mcp::fixtures::TlsPeer::install(&manifest.origin,manifest.certificate_pem.as_bytes()).map_err(|_|"Owned MCP TLS policy invalid")?;
+    struct Manifest {
+        origin: String,
+        certificate_pem: String,
+    }
+    let manifest: Manifest = serde_json::from_slice(&bytes)?;
+    ag1_platform::mcp::fixtures::TlsPeer::install(
+        &manifest.origin,
+        manifest.certificate_pem.as_bytes(),
+    )
+    .map_err(|_| "Owned MCP TLS policy invalid")?;
     Ok(())
 }
-

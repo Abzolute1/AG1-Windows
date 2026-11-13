@@ -62,9 +62,7 @@ impl Host {
             return Err(DomainError::Conflict);
         }
         let project = self.working_project()?;
-        let slot = project
-            .try_lock()
-            .map_err(|_| DomainError::QueueFull)?;
+        let slot = project.try_lock().map_err(|_| DomainError::QueueFull)?;
         f(slot
             .as_ref()
             .ok_or_else(|| DomainError::Unavailable("Project runtime is not configured".into()))?)
@@ -72,11 +70,15 @@ impl Host {
 
     pub(super) fn project_command(&self, action: &str, args: &Value) -> Result<Value> {
         let workspace = self.working_workspace()?;
-        if !self.folder_selection()?.primary_writable() && !["status", "stop", "log"].contains(&action) { return Err(DomainError::InvalidInput("Project actions require a read/write working folder".into())); }
+        if !self.folder_selection()?.primary_writable()
+            && !["status", "stop", "log"].contains(&action)
+        {
+            return Err(DomainError::InvalidInput(
+                "Project actions require a read/write working folder".into(),
+            ));
+        }
         let project = self.working_project()?;
-        let mut slot = project
-            .try_lock()
-            .map_err(|_| DomainError::QueueFull)?;
+        let mut slot = project.try_lock().map_err(|_| DomainError::QueueFull)?;
         let Some(runtime) = slot.as_mut() else {
             return if action == "status" {
                 Ok(

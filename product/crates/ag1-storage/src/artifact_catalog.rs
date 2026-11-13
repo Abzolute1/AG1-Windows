@@ -50,8 +50,18 @@ impl Store {
     ) -> StorageResult<Vec<CatalogRecord>> {
         self.catalog_page(session, None, limit, None, true, None)
     }
-    pub fn call_artifact_catalog(&self, session: &str, calls: &[String], before: Option<&CatalogPosition>, limit: usize) -> StorageResult<Vec<CatalogRecord>> {
-        if calls.len() > 1024 || calls.iter().any(|id| id.len() > 256) { return Err(StorageError::Limit("Turn output calls; use conversation artifacts".into())); }
+    pub fn call_artifact_catalog(
+        &self,
+        session: &str,
+        calls: &[String],
+        before: Option<&CatalogPosition>,
+        limit: usize,
+    ) -> StorageResult<Vec<CatalogRecord>> {
+        if calls.len() > 1024 || calls.iter().any(|id| id.len() > 256) {
+            return Err(StorageError::Limit(
+                "Turn output calls; use conversation artifacts".into(),
+            ));
+        }
         self.catalog_page(session, before, limit, None, true, Some(calls))
     }
     fn catalog_page(
@@ -75,15 +85,27 @@ impl Store {
         let db = self.conn()?;
         Self::ready(&db)?;
         active_session(&db, session)?;
-        let cache_stamp = if evidence_only && before.is_none() && kind.is_none() && calls.is_none() {
-            let external_version: u64 = db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let cache_stamp = if evidence_only && before.is_none() && kind.is_none() && calls.is_none()
+        {
+            let external_version: u64 =
+                db.query_row("PRAGMA data_version", [], |row| row.get(0))?;
             let own_changes = db.total_changes();
-            let cached = self.catalog_cache.lock().map_err(|_| StorageError::Corrupt("Poisoned catalog cache".into()))?;
-            if let Some(entry) = cached.as_ref().filter(|entry| entry.own_changes == own_changes && entry.external_version == external_version && entry.session == session && entry.limit == limit) {
+            let cached = self
+                .catalog_cache
+                .lock()
+                .map_err(|_| StorageError::Corrupt("Poisoned catalog cache".into()))?;
+            if let Some(entry) = cached.as_ref().filter(|entry| {
+                entry.own_changes == own_changes
+                    && entry.external_version == external_version
+                    && entry.session == session
+                    && entry.limit == limit
+            }) {
                 return Ok(entry.records.clone());
             }
             Some((own_changes, external_version))
-        } else { None };
+        } else {
+            None
+        };
         let mut query = db.prepare("SELECT a.origin,a.id,a.record,COALESCE(json_extract(CAST(a.record AS TEXT),'$.createdAt'),'') AS created FROM artifacts a JOIN access x ON x.origin=a.origin AND x.artifact=a.id WHERE x.session=?1 AND (?2 IS NULL OR json_extract(CAST(a.record AS TEXT),'$.kind')=?2) AND (?3 IS NULL OR (COALESCE(json_extract(CAST(a.record AS TEXT),'$.createdAt'),''),a.id,a.origin)<(?3,?4,?5)) AND (NOT ?7 OR json_extract(CAST(a.record AS TEXT),'$.kind') NOT IN (SELECT value FROM json_each(?8))) AND (?9 IS NULL OR (a.origin=?1 AND json_extract(CAST(a.record AS TEXT),'$.producer.callId') IN (SELECT value FROM json_each(?9)))) ORDER BY created DESC,a.id DESC,a.origin DESC LIMIT ?6")?;
         let rows = query.query_map(
             params![
@@ -121,9 +143,16 @@ impl Store {
             });
         }
         if let Some((own_changes, external_version)) = cache_stamp {
-            let mut cached = self.catalog_cache.lock().map_err(|_| StorageError::Corrupt("Poisoned catalog cache".into()))?;
+            let mut cached = self
+                .catalog_cache
+                .lock()
+                .map_err(|_| StorageError::Corrupt("Poisoned catalog cache".into()))?;
             *cached = (record_bytes <= MAX_CACHED_RECORD_BYTES).then(|| CatalogCache {
-                own_changes, external_version, session: session.into(), limit, records: out.clone(),
+                own_changes,
+                external_version,
+                session: session.into(),
+                limit,
+                records: out.clone(),
             });
         }
         Ok(out)
@@ -242,7 +271,14 @@ mod preview_cache_tests {
         let id = format!("art_{number:032x}");
         let bytes = format!("evidence {number}").into_bytes();
         let record = json!({"version":1,"id":id,"sessionId":"parent","kind":kind,"mimeType":"text/plain","encoding":"utf8","createdAt":"2026-09-13T00:00:00Z","sha256":digest(&bytes),"bytes":bytes.len(),"producer":{"type":"system","name":"fixture"},"extra":extra});
-        store.put_artifact(&ArtifactInput {origin:"origin".into(),session:"parent".into(),record:serde_json::to_vec(&record).unwrap(),bytes}).unwrap();
+        store
+            .put_artifact(&ArtifactInput {
+                origin: "origin".into(),
+                session: "parent".into(),
+                record: serde_json::to_vec(&record).unwrap(),
+                bytes,
+            })
+            .unwrap();
         id
     }
     #[test]
@@ -250,27 +286,77 @@ mod preview_cache_tests {
         let (_dir, store) = fixture();
         let first = put(&store, 1, "text", "");
         put(&store, 2, "context-history-segment", "custody only");
-        assert_eq!(store.artifact_catalog("parent", None, 20, None).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .artifact_catalog("parent", None, 20, None)
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(store.evidence_catalog("parent", 20).unwrap().len(), 1);
-        let stamp = store.catalog_cache.lock().unwrap().as_ref().unwrap().own_changes;
-        assert_eq!(store.evidence_catalog("parent", 20).unwrap()[0].position.id, first);
-        assert_eq!(store.catalog_cache.lock().unwrap().as_ref().unwrap().own_changes, stamp);
+        let stamp = store
+            .catalog_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .own_changes;
+        assert_eq!(
+            store.evidence_catalog("parent", 20).unwrap()[0].position.id,
+            first
+        );
+        assert_eq!(
+            store
+                .catalog_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .own_changes,
+            stamp
+        );
         let third = put(&store, 3, "text", "");
         assert_eq!(store.evidence_catalog("parent", 20).unwrap().len(), 2);
-        assert_eq!(store.evidence_catalog("parent", 1).unwrap()[0].position.id, third);
+        assert_eq!(
+            store.evidence_catalog("parent", 1).unwrap()[0].position.id,
+            third
+        );
         assert!(store.evidence_catalog("stranger", 20).unwrap().is_empty());
         assert_eq!(store.evidence_catalog("parent", 20).unwrap().len(), 2);
-        store.conn().unwrap().execute("DELETE FROM access WHERE session='parent' AND artifact=?1", [&first]).unwrap();
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "DELETE FROM access WHERE session='parent' AND artifact=?1",
+                [&first],
+            )
+            .unwrap();
         assert_eq!(store.evidence_catalog("parent", 20).unwrap().len(), 1);
         // Deliberate external SQL against this disposable fixture proves that
         // total_changes alone is insufficient; data_version must also change.
         let external = rusqlite::Connection::open(store.root.join("storage.sqlite")).unwrap();
-        external.execute("DELETE FROM access WHERE session='parent' AND artifact=?1", [&third]).unwrap();
+        external
+            .execute(
+                "DELETE FROM access WHERE session='parent' AND artifact=?1",
+                [&third],
+            )
+            .unwrap();
         assert!(store.evidence_catalog("parent", 20).unwrap().is_empty());
-        external.execute("INSERT INTO access VALUES('parent','origin',?1,'historical-evidence')", [&third]).unwrap();
-        assert_eq!(store.evidence_catalog("parent", 20).unwrap()[0].position.id, third);
+        external
+            .execute(
+                "INSERT INTO access VALUES('parent','origin',?1,'historical-evidence')",
+                [&third],
+            )
+            .unwrap();
+        assert_eq!(
+            store.evidence_catalog("parent", 20).unwrap()[0].position.id,
+            third
+        );
         store.archive_session("parent").unwrap();
-        assert!(matches!(store.evidence_catalog("parent", 20), Err(StorageError::Missing(_))));
+        assert!(matches!(
+            store.evidence_catalog("parent", 20),
+            Err(StorageError::Missing(_))
+        ));
     }
     #[test]
     fn cache_stays_bounded_and_never_bypasses_incomplete_import_or_argument_checks() {
@@ -278,11 +364,24 @@ mod preview_cache_tests {
         put(&store, 1, "text", &"x".repeat(MAX_CACHED_RECORD_BYTES));
         assert_eq!(store.evidence_catalog("parent", 20).unwrap().len(), 1);
         assert!(store.catalog_cache.lock().unwrap().is_none());
-        assert!(matches!(store.evidence_catalog("parent", 0), Err(StorageError::Limit(_))));
+        assert!(matches!(
+            store.evidence_catalog("parent", 0),
+            Err(StorageError::Limit(_))
+        ));
         // Populate an ordinary empty preview, then fence storage with an import.
         assert!(store.evidence_catalog("stranger", 20).unwrap().is_empty());
         assert!(store.catalog_cache.lock().unwrap().is_some());
-        store.conn().unwrap().execute("INSERT INTO imports(id,manifest,state) VALUES('fixture',X'7b7d','staging')", []).unwrap();
-        assert!(matches!(store.evidence_catalog("stranger", 20), Err(StorageError::ImportIncomplete)));
+        store
+            .conn()
+            .unwrap()
+            .execute(
+                "INSERT INTO imports(id,manifest,state) VALUES('fixture',X'7b7d','staging')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.evidence_catalog("stranger", 20),
+            Err(StorageError::ImportIncomplete)
+        ));
     }
 }

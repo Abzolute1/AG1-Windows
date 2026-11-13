@@ -4,39 +4,129 @@ use super::*;
 use crate::workspace::PinnedDirectory;
 use std::os::unix::fs::DirBuilderExt;
 
-pub(super) struct CloneTarget {parent:PinnedDirectory,destination:String,staging:String}
+pub(super) struct CloneTarget {
+    parent: PinnedDirectory,
+    destination: String,
+    staging: String,
+}
 
-fn branch_valid(branch:&str)->bool {
-    !branch.is_empty()&&branch.len()<=512&&!branch.contains("..")&&!branch.contains("@{")&&!branch.ends_with('.')
-        &&!branch.chars().any(|c|c.is_control()||c.is_whitespace()||"~^:?*[\\".contains(c))
-        &&!branch.split('/').any(|s|s.is_empty()||s.starts_with('.')||s.ends_with(".lock"))
+fn branch_valid(branch: &str) -> bool {
+    !branch.is_empty()
+        && branch.len() <= 512
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && !branch.ends_with('.')
+        && !branch
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
+        && !branch
+            .split('/')
+            .any(|s| s.is_empty() || s.starts_with('.') || s.ends_with(".lock"))
 }
 impl LocalGit {
-    pub(super) fn prepare_clone(&self,args:&Value,scope:&str,control:&ScanControl<'_>)->Result<LocalPlan> {
-        self.authority(true)?;self.workspace.verify_root()?;control.check()?;
-        if scope.is_empty()||scope.len()>1024{return Err(DomainError::PermissionDenied);}
-        let repo=super::super::repo(args).map_err(DomainError::InvalidInput)?;
-        let branch=args["branch"].as_str().filter(|s|branch_valid(s)).ok_or_else(||DomainError::InvalidInput("Choose an exact valid branch to clone".into()))?;
-        let sha=args["expected_remote_sha"].as_str().filter(|s|s.len()==40&&oid(s)&&*s!="0".repeat(40)).ok_or_else(||DomainError::InvalidInput("Clone requires the reviewed 40-character branch head SHA".into()))?;
-        let destination=args["destination"].as_str().filter(|s|!s.is_empty()&&s.len()<2048&&!s.contains('\0')&&s.split('/').all(|p|!p.is_empty()&&p!="."&&p!=".."&&p!=".git")).ok_or_else(||DomainError::InvalidInput("Choose a new relative clone folder inside the granted root".into()))?;
-        let path=Path::new(destination);let parent=self.workspace.pin_directory(path.parent().and_then(Path::to_str).unwrap_or(""))?;
-        if self.workspace.exists(destination)?{return Err(DomainError::Conflict);}
-        let staging=format!(".ag1-clone-{}",crate::client::nonce()?);
-        let admission=self.github.as_ref().ok_or_else(||DomainError::Unavailable("Connect GitHub before cloning".into()))?.prepare_git(scope,control).map_err(super::super::tool::domain)?;
-        parent.verify_identity()?;self.authority(true)?;
-        let mut preview=json!({"action":"clone","repository":repo,"folder":self.root(),"destination":self.root().join(destination),"remote_branch":format!("refs/heads/{branch}"),"expected_remote_sha":sha,"account":admission.account(),"arguments":args,
+    pub(super) fn prepare_clone(
+        &self,
+        args: &Value,
+        scope: &str,
+        control: &ScanControl<'_>,
+    ) -> Result<LocalPlan> {
+        self.authority(true)?;
+        self.workspace.verify_root()?;
+        control.check()?;
+        if scope.is_empty() || scope.len() > 1024 {
+            return Err(DomainError::PermissionDenied);
+        }
+        let repo = super::super::repo(args).map_err(DomainError::InvalidInput)?;
+        let branch = args["branch"]
+            .as_str()
+            .filter(|s| branch_valid(s))
+            .ok_or_else(|| {
+                DomainError::InvalidInput("Choose an exact valid branch to clone".into())
+            })?;
+        let sha = args["expected_remote_sha"]
+            .as_str()
+            .filter(|s| s.len() == 40 && oid(s) && *s != "0".repeat(40))
+            .ok_or_else(|| {
+                DomainError::InvalidInput(
+                    "Clone requires the reviewed 40-character branch head SHA".into(),
+                )
+            })?;
+        let destination = args["destination"]
+            .as_str()
+            .filter(|s| {
+                !s.is_empty()
+                    && s.len() < 2048
+                    && !s.contains('\0')
+                    && s.split('/')
+                        .all(|p| !p.is_empty() && p != "." && p != ".." && p != ".git")
+            })
+            .ok_or_else(|| {
+                DomainError::InvalidInput(
+                    "Choose a new relative clone folder inside the granted root".into(),
+                )
+            })?;
+        let path = Path::new(destination);
+        let parent = self
+            .workspace
+            .pin_directory(path.parent().and_then(Path::to_str).unwrap_or(""))?;
+        if self.workspace.exists(destination)? {
+            return Err(DomainError::Conflict);
+        }
+        let staging = format!(".ag1-clone-{}", crate::client::nonce()?);
+        let admission = self
+            .github
+            .as_ref()
+            .ok_or_else(|| DomainError::Unavailable("Connect GitHub before cloning".into()))?
+            .prepare_git(scope, control)
+            .map_err(super::super::tool::domain)?;
+        parent.verify_identity()?;
+        self.authority(true)?;
+        let mut preview = json!({"action":"clone","repository":repo,"folder":self.root(),"destination":self.root().join(destination),"remote_branch":format!("refs/heads/{branch}"),"expected_remote_sha":sha,"account":admission.account(),"arguments":args,
             "recovery_path":self.root().join(parent.relative_path()).join(&staging),"network_warning":"Clone this exact reviewed branch into a new folder. Existing destinations are never replaced. Interrupted staging remains recoverable.",
             "limits":"Selected branch with its history, no implicit submodule/LFS downloads, hooks or filters. Exact Git bytes. Checkout bound: 10,000 entries / 256 MiB; network pack files: 256 MiB each. No automatic retries."});
-        preview["storage"]=self.storage_admit("clone",control)?;
-        let revision=format!("local-git-{:x}",Sha256::digest(json!([scope,preview]).to_string()));
-        Ok(LocalPlan{action:"clone".into(),args:args.clone(),scope:scope.into(),head:String::new(),branch:format!("refs/heads/{branch}"),index:None,sources:Vec::new(),config_revision:None,network:Some(admission),clone_target:Some(CloneTarget{parent,destination:destination.into(),staging}),transition:None,revision,expires:Instant::now()+Duration::from_secs(300),preview})
+        preview["storage"] = self.storage_admit("clone", control)?;
+        let revision = format!(
+            "local-git-{:x}",
+            Sha256::digest(json!([scope, preview]).to_string())
+        );
+        Ok(LocalPlan {
+            action: "clone".into(),
+            args: args.clone(),
+            scope: scope.into(),
+            head: String::new(),
+            branch: format!("refs/heads/{branch}"),
+            index: None,
+            sources: Vec::new(),
+            config_revision: None,
+            network: Some(admission),
+            clone_target: Some(CloneTarget {
+                parent,
+                destination: destination.into(),
+                staging,
+            }),
+            transition: None,
+            revision,
+            expires: Instant::now() + Duration::from_secs(300),
+            preview,
+        })
     }
 
-    pub(super) fn execute_clone(&self,mut plan:LocalPlan,scope:&str,control:&ScanControl<'_>)->Result<Value> {
-        let target=plan.clone_target.take().ok_or(DomainError::PermissionDenied)?;
-        let admission=plan.network.take().ok_or(DomainError::PermissionDenied)?;
-        self.authority(true)?;target.parent.verify_identity()?;
-        if self.workspace.exists(&target.destination)?{return Err(DomainError::Conflict);}
+    pub(super) fn execute_clone(
+        &self,
+        mut plan: LocalPlan,
+        scope: &str,
+        control: &ScanControl<'_>,
+    ) -> Result<Value> {
+        let target = plan
+            .clone_target
+            .take()
+            .ok_or(DomainError::PermissionDenied)?;
+        let admission = plan.network.take().ok_or(DomainError::PermissionDenied)?;
+        self.authority(true)?;
+        target.parent.verify_identity()?;
+        if self.workspace.exists(&target.destination)? {
+            return Err(DomainError::Conflict);
+        }
         self.github.as_ref().ok_or(DomainError::PermissionDenied)?.execute_git(admission,scope,control,|credential,c| {
             let check=||->Result<()> {c.check()?;self.authority(true)?;self.storage_check(c)?;self.workspace.verify_root()?;target.parent.verify_identity()?;Ok(())};
             check()?;if self.workspace.exists(&target.destination)?{return Err(DomainError::Conflict);}

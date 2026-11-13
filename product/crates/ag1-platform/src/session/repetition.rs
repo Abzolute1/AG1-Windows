@@ -42,7 +42,12 @@ impl Guard {
         Ok(())
     }
     pub fn stop_reason(&self) -> Result<Option<String>, DomainError> {
-        if let Some(reason) = &self.recovery.lock().map_err(|_| DomainError::Conflict)?.stop {
+        if let Some(reason) = &self
+            .recovery
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
+            .stop
+        {
             return Ok(Some(reason.clone()));
         }
         Ok(self
@@ -55,11 +60,18 @@ impl Guard {
     /// Observe only acknowledged native outcomes, never extension projections
     /// or replayed receipts. This does not authorize or execute a retry.
     pub(super) fn recovery_outcome(
-        &self, tool: &str, call: &str, args: &Value, result: &Value,
+        &self,
+        tool: &str,
+        call: &str,
+        args: &Value,
+        result: &Value,
         todo: Option<&Value>,
     ) -> Result<Vec<repetition::Event>, DomainError> {
         let candidate = recovery::candidate(&self.root, tool, args, result, todo);
-        Ok(self.recovery.lock().map_err(|_| DomainError::Conflict)?
+        Ok(self
+            .recovery
+            .lock()
+            .map_err(|_| DomainError::Conflict)?
             .observe(tool, call, candidate))
     }
     pub fn before(

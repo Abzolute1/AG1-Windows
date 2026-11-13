@@ -1,17 +1,51 @@
 //! Password entry is GTK-native, outside WebKit and the conversation bridge.
-use ag1_platform::{github::{operations::Operation,secrets::{PrivateEntry,Secret,MAX_BYTES},service::{Account,ApiError,Result,check}},resource_fs::ScanControl};
-use std::sync::{Arc,atomic::{AtomicBool,Ordering}};
+use ag1_platform::{
+    github::{
+        operations::Operation,
+        secrets::{MAX_BYTES, PrivateEntry, Secret},
+        service::{Account, ApiError, Result, check},
+    },
+    resource_fs::ScanControl,
+};
 use gtk::prelude::*;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 pub struct Entry(pub tauri::WebviewWindow);
 impl PrivateEntry for Entry {
-    fn enter(&self,account:&Account,operation:&Operation,control:&ScanControl<'_>)->Result<Secret>{
+    fn enter(
+        &self,
+        account: &Account,
+        operation: &Operation,
+        control: &ScanControl<'_>,
+    ) -> Result<Secret> {
         check(control)?;
-        let (sender,receiver)=std::sync::mpsc::sync_channel(1);
-        let cancel=Arc::new(AtomicBool::new(false));let closed=cancel.clone();
-        struct Close(Arc<AtomicBool>);impl Drop for Close {fn drop(&mut self){self.0.store(true,Ordering::Release);}}
-        let _close=Close(cancel);
-        let parent=self.0.clone();let account=account.public();let metadata=serde_json::to_value(operation).map_err(|_|ApiError::new("private_entry","Invalid secret target."))?;let endpoint=metadata["endpoint"].as_str().unwrap_or("").to_owned();let fields=metadata["body"].clone();
-        let access=match fields["visibility"].as_str(){Some("all")=>"All organization repositories".into(),Some("private")=>"Private organization repositories".into(),_ if fields["selected_repository_ids"].is_array()=>format!("Selected repository IDs: {}",fields["selected_repository_ids"]),_=>"Uses this destination’s permissions".into()};
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let closed = cancel.clone();
+        struct Close(Arc<AtomicBool>);
+        impl Drop for Close {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _close = Close(cancel);
+        let parent = self.0.clone();
+        let account = account.public();
+        let metadata = serde_json::to_value(operation)
+            .map_err(|_| ApiError::new("private_entry", "Invalid secret target."))?;
+        let endpoint = metadata["endpoint"].as_str().unwrap_or("").to_owned();
+        let fields = metadata["body"].clone();
+        let access = match fields["visibility"].as_str() {
+            Some("all") => "All organization repositories".into(),
+            Some("private") => "Private organization repositories".into(),
+            _ if fields["selected_repository_ids"].is_array() => format!(
+                "Selected repository IDs: {}",
+                fields["selected_repository_ids"]
+            ),
+            _ => "Uses this destination’s permissions".into(),
+        };
         self.0.run_on_main_thread(move||{
             if closed.load(Ordering::Acquire){return;}
             let parent=match parent.gtk_window(){Ok(p)=>p,Err(_)=>{let _=sender.send(Err(ApiError::new("private_entry","Cannot open private secret entry.")));return;}};
@@ -41,6 +75,21 @@ impl PrivateEntry for Entry {
                 let _=sender.send(result);
             });
         }).map_err(|_|ApiError::new("private_entry","Cannot schedule private secret entry."))?;
-        loop {check(control)?;match receiver.recv_timeout(std::time::Duration::from_millis(20)){Ok(result)=>{check(control)?;return result;},Err(std::sync::mpsc::RecvTimeoutError::Timeout)=>{},Err(_)=>return Err(ApiError::new("private_entry","Private secret entry closed."))}}
+        loop {
+            check(control)?;
+            match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(result) => {
+                    check(control)?;
+                    return result;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(_) => {
+                    return Err(ApiError::new(
+                        "private_entry",
+                        "Private secret entry closed.",
+                    ));
+                }
+            }
+        }
     }
 }

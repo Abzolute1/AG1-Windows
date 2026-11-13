@@ -87,12 +87,18 @@ impl RuntimeHost for FakeHost {
     fn owned_alive(&mut self, handle: &String) -> Result<bool, DomainError> {
         Ok(self.audit.lock().unwrap().active.as_ref() == Some(handle))
     }
-    fn generation_idle(&mut self, handle: &String, _plan: &LaunchPlan) -> Result<bool, DomainError> {
+    fn generation_idle(
+        &mut self,
+        handle: &String,
+        _plan: &LaunchPlan,
+    ) -> Result<bool, DomainError> {
         let mut audit = self.audit.lock().unwrap();
         assert_eq!(audit.active.as_ref(), Some(handle));
         audit.idle_polls += 1;
         if audit.idle_observation_error {
-            return Err(DomainError::Unavailable("fixture idle observation failed".into()));
+            return Err(DomainError::Unavailable(
+                "fixture idle observation failed".into(),
+            ));
         }
         Ok(!audit.generation_busy)
     }

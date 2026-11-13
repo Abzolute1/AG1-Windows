@@ -15,27 +15,27 @@ use std::{
 };
 type Result<T> = std::result::Result<T, String>;
 pub const REST_VERSION: &str = "2026-03-10";
-pub mod operations;
-pub mod service;
-pub mod transport;
-pub mod tool;
-pub mod browse;
-pub mod schemas;
-mod model_contract;
-mod graph_reads;
-mod graph_mutations;
-mod workflow_responses;
-mod pull_responses;
 #[cfg(test)]
 mod acceptance_tests;
+pub mod browse;
 mod credential_fields;
 pub mod downloads;
-pub mod uploads;
-pub mod secrets;
+mod graph_mutations;
+mod graph_reads;
 pub mod local;
+mod model_contract;
+pub mod operations;
+mod pull_responses;
+pub mod schemas;
+pub mod secrets;
+pub mod service;
+pub mod tool;
+pub mod transport;
+pub mod uploads;
+mod workflow_responses;
 #[derive(Default)]
 pub struct GitHub {
-    closing:AtomicBool,
+    closing: AtomicBool,
     service: Mutex<Option<Arc<service::Service>>>,
     login: Arc<Mutex<Login>>,
     writes: Mutex<()>,
@@ -210,33 +210,70 @@ fn connected(state: &Path) -> bool {
 }
 fn mark(state: &Path) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
-    let generation=crate::client::nonce().map_err(|_|"Cannot create GitHub connection identity")?;
-    let mut file=fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(state.join("github-connected"))
-        .map_err(|_|"Cannot save GitHub connection")?;
-    file.write_all(format!("github.com\n{generation}\n").as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"Cannot save GitHub connection".into())
+    let generation =
+        crate::client::nonce().map_err(|_| "Cannot create GitHub connection identity")?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(state.join("github-connected"))
+        .map_err(|_| "Cannot save GitHub connection")?;
+    file.write_all(format!("github.com\n{generation}\n").as_bytes())
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "Cannot save GitHub connection".into())
 }
 impl GitHub {
     pub fn shutdown(&self) {
-        self.closing.store(true,Ordering::Release);
-        self.cancel_login.store(true,Ordering::Release);
-        if let Ok(slot)=self.service.lock() && let Some(service)=slot.as_ref(){service.shutdown();}
-    }
-    pub fn wait_stopped(&self)->Result<()> {
-        let deadline=Instant::now()+Duration::from_secs(3);
-        if let Some(service)=self.service.lock().map_err(|_|"GitHub service busy")?.clone() {
-            service.wait_stopped(deadline).map_err(|e|e.message.to_string())?;
+        self.closing.store(true, Ordering::Release);
+        self.cancel_login.store(true, Ordering::Release);
+        if let Ok(slot) = self.service.lock()
+            && let Some(service) = slot.as_ref()
+        {
+            service.shutdown();
         }
-        while self.login.lock().map_err(|_|"GitHub login control busy")?.running {
-            if Instant::now()>=deadline{return Err("GitHub sign-in cleanup is still in progress. Wait before quitting again.".into());}
+    }
+    pub fn wait_stopped(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        if let Some(service) = self
+            .service
+            .lock()
+            .map_err(|_| "GitHub service busy")?
+            .clone()
+        {
+            service
+                .wait_stopped(deadline)
+                .map_err(|e| e.message.to_string())?;
+        }
+        while self
+            .login
+            .lock()
+            .map_err(|_| "GitHub login control busy")?
+            .running
+        {
+            if Instant::now() >= deadline {
+                return Err(
+                    "GitHub sign-in cleanup is still in progress. Wait before quitting again."
+                        .into(),
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
         Ok(())
     }
-    pub fn with_service(service:Arc<service::Service>)->Self { let mut result=Self::default(); result.service=Mutex::new(Some(service)); result }
-    pub fn shared(&self,state:&Path)->Result<Arc<service::Service>> {
-        let mut slot=self.service.lock().map_err(|_|"GitHub service busy")?;
-        if slot.is_none() { *slot=Some(service::Service::shared(state).map_err(|e|e.message.to_string())?); }
-        slot.clone().ok_or_else(||"GitHub service unavailable".into())
+    pub fn with_service(service: Arc<service::Service>) -> Self {
+        let mut result = Self::default();
+        result.service = Mutex::new(Some(service));
+        result
+    }
+    pub fn shared(&self, state: &Path) -> Result<Arc<service::Service>> {
+        let mut slot = self.service.lock().map_err(|_| "GitHub service busy")?;
+        if slot.is_none() {
+            *slot = Some(service::Service::shared(state).map_err(|e| e.message.to_string())?);
+        }
+        slot.clone()
+            .ok_or_else(|| "GitHub service unavailable".into())
     }
     pub fn request(
         &self,
@@ -245,7 +282,9 @@ impl GitHub {
         args: Value,
         _workspace: Option<PathBuf>,
     ) -> Result<Value> {
-        if self.closing.load(Ordering::Acquire){return Err("GitHub is shutting down.".into());}
+        if self.closing.load(Ordering::Acquire) {
+            return Err("GitHub is shutting down.".into());
+        }
         if action == "status" {
             let l = self.login.lock().map_err(|_| "GitHub connection busy")?;
             if l.running {
@@ -259,8 +298,14 @@ impl GitHub {
                 );
             }
             drop(l);
-            let cancel=AtomicBool::new(false);
-            let user = self.shared(state)?.account_view(&crate::resource_fs::ScanControl {cancel:&cancel,deadline:Instant::now()+Duration::from_secs(45)}).map_err(|e|e.message.to_string())?;
+            let cancel = AtomicBool::new(false);
+            let user = self
+                .shared(state)?
+                .account_view(&crate::resource_fs::ScanControl {
+                    cancel: &cancel,
+                    deadline: Instant::now() + Duration::from_secs(45),
+                })
+                .map_err(|e| e.message.to_string())?;
             return Ok(
                 json!({"state":"connected","login":user["login"],"name":user["name"],"url":user["html_url"]}),
             );
@@ -377,7 +422,9 @@ impl GitHub {
             if self.login.lock().map_err(|_| "GitHub busy")?.running {
                 return Err("Finish the current sign-in first.".into());
             }
-            self.shared(state)?.disconnect().map_err(|e|e.message.to_string())?;
+            self.shared(state)?
+                .disconnect()
+                .map_err(|e| e.message.to_string())?;
             return Ok(json!({"state":"disconnected"}));
         }
         if action == "open_url" {
@@ -404,11 +451,15 @@ impl GitHub {
         if !connected(state) {
             return Err("Connect your GitHub account first.".into());
         }
-        if ["local","push","clone","checkout"].contains(&action) {
-            return Err("Use the shared Local Git panel and its native exact-target confirmation.".into());
+        if ["local", "push", "clone", "checkout"].contains(&action) {
+            return Err(
+                "Use the shared Local Git panel and its native exact-target confirmation.".into(),
+            );
         }
-        if ["create_issue","create_pr","comment","review","merge"].contains(&action) {
-            return Err("Review this change through the native GitHub confirmation service.".into());
+        if ["create_issue", "create_pr", "comment", "review", "merge"].contains(&action) {
+            return Err(
+                "Review this change through the native GitHub confirmation service.".into(),
+            );
         }
         // Serialize deliberate writes, including disconnect, to prevent double-click publication.
         let writing = matches!(
@@ -569,17 +620,37 @@ impl GitHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn legacy_local_git_actions_cannot_bypass_shared_native_custody() {
-        let dir=tempfile::tempdir().unwrap();fs::write(dir.path().join("github-connected"),b"owned marker").unwrap();
-        let client=GitHub::default();
-        for action in ["local","push","clone","checkout"] {assert!(client.request(dir.path(),action,json!({"repo":"owned/repo"}),None).unwrap_err().contains("shared Local Git"));}
+    #[test]
+    fn legacy_local_git_actions_cannot_bypass_shared_native_custody() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("github-connected"), b"owned marker").unwrap();
+        let client = GitHub::default();
+        for action in ["local", "push", "clone", "checkout"] {
+            assert!(
+                client
+                    .request(dir.path(), action, json!({"repo":"owned/repo"}), None)
+                    .unwrap_err()
+                    .contains("shared Local Git")
+            );
+        }
     }
-    #[test] fn quit_blocks_new_sign_in_without_removing_the_connection_marker() {
-        let dir=tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("github-connected"),"saved-generation").unwrap();
-        let client=GitHub::default();client.shutdown();client.wait_stopped().unwrap();
-        assert!(client.request(dir.path(),"connect",json!({}),None).unwrap_err().contains("shutting down"));
-        assert_eq!(fs::read_to_string(dir.path().join("github-connected")).unwrap(),"saved-generation");
+    #[test]
+    fn quit_blocks_new_sign_in_without_removing_the_connection_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("github-connected"), "saved-generation").unwrap();
+        let client = GitHub::default();
+        client.shutdown();
+        client.wait_stopped().unwrap();
+        assert!(
+            client
+                .request(dir.path(), "connect", json!({}), None)
+                .unwrap_err()
+                .contains("shutting down")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("github-connected")).unwrap(),
+            "saved-generation"
+        );
     }
     #[test]
     fn repository_targets_are_not_commands_or_urls() {
