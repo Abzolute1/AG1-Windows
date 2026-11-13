@@ -24,7 +24,7 @@ impl ModelIdentity {
         // Some llama.cpp versions omit model_path; only then use the identity
         // exposed by that version's props response.
         let model = if let Some(path) = &self.path {
-            path == &plan.model_path
+            same_model_path(path, &plan.model_path)
         } else if let Some(alias) = &self.alias {
             alias == &plan.model_id
         } else {
@@ -37,6 +37,32 @@ impl ModelIdentity {
                 loaded >= plan.requested_context && loaded - plan.requested_context < 1024
             })
             && (plan.projector.is_none() || self.vision)
+    }
+}
+
+fn same_model_path(observed: &str, expected: &str) -> bool {
+    if observed == expected {
+        return true;
+    }
+
+    // Windows accepts the extended-length `\\?\` path form, but llama.cpp
+    // reports the ordinary form through /props. They name the same local file.
+    #[cfg(windows)]
+    {
+        fn normalize(path: &str) -> String {
+            path.strip_prefix("\\\\?\\")
+                .unwrap_or(path)
+                .replace('/', "\\")
+                .trim_end_matches('\\')
+                .to_ascii_lowercase()
+        }
+
+        return normalize(observed) == normalize(expected);
+    }
+
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,9 +259,12 @@ impl<H: RuntimeHost> RuntimeController<H> {
                 self.state = RuntimeState::Ready;
                 Ok(true)
             }
-            Observation::Healthy(_) => {
+            Observation::Healthy(identity) => {
                 self.state = RuntimeState::Failed("loaded model/context conflict".into());
-                Err(DomainError::Conflict)
+                Err(DomainError::Unavailable(format!(
+                    "loaded runtime did not match its sealed plan (model={}, context={}): {identity:?}",
+                    plan.model_id, plan.requested_context
+                )))
             }
             _ => {
                 self.state = RuntimeState::Loading;
@@ -310,5 +339,20 @@ impl<H: RuntimeHost> RuntimeHandoff<H> {
     }
     pub fn stop(mut self) -> Result<(), DomainError> {
         self.controller.stop_owned_runtime()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::same_model_path;
+
+    #[test]
+    fn props_path_matches_the_sealed_windows_path() {
+        // This is the exact difference between a sealed AG1W capture and
+        // llama.cpp's /props reply on Windows.
+        assert!(same_model_path(
+            r"C:\Users\Alex\AppData\Local\AG1W\models\model.gguf",
+            r"\\?\C:\Users\Alex\AppData\Local\AG1W\models\model.gguf",
+        ));
     }
 }

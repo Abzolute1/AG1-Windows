@@ -7,7 +7,7 @@
 use crate::{
     cutover::{Registry, configuration::ConfigurationCapture, private_dir},
     llama::{Material, custody::RuntimeBundle, lifecycle::Observation, native::NativeRuntimeHost},
-    provider::http::{GenerationRuntime, ProviderHttp, endpoint_origin},
+    provider::http::{GenerationRuntime, endpoint_origin},
 };
 use ag1_core::DomainError;
 use serde::{Deserialize, Serialize};
@@ -55,7 +55,6 @@ impl WindowsRuntimeConfig {
         let state = state.to_path_buf();
         let registry = Registry::for_user()?;
         let lease = registry.runtime_lease()?;
-        let handle = tokio::runtime::Handle::current();
 
         let bundle = tokio::task::spawn_blocking(move || -> Result<NativeBundle> {
             // Reading a catalog must not hash every multi-gigabyte model. The
@@ -112,14 +111,10 @@ impl WindowsRuntimeConfig {
             verifier.verify(std::slice::from_ref(&setup.process_host))?;
             let directory = state.join("owned-llama-runtime");
             private_dir(&directory)?;
-            let observer: Observer = Box::new(move |plan| {
-                let origin = crate::llama::observation::origin(plan)?;
-                handle.block_on(async {
-                    let http =
-                        ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(2))?;
-                    crate::llama::observation::observe(&http, &origin).await
-                })
-            });
+            // This worker is outside Tauri's async runtime. Give its short
+            // health probes their own runtime instead of re-entering the UI
+            // runtime from a blocking thread.
+            let observer: Observer = Box::new(crate::llama::observation::blocking_observer()?);
             let host = NativeRuntimeHost::with_verifier(
                 Path::new(&setup.process_host.path),
                 &directory,

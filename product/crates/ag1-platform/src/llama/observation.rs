@@ -92,8 +92,11 @@ pub async fn observe(http: &ProviderHttp, base: &str) -> Result<Observation, Dom
             Ok(Observation::Healthy(identity_from_props(&value)))
         }
         Ok(_) => Ok(Observation::Occupied),
-        Err(DomainError::Unavailable(_)) => {
-            // Only a literal loopback address can be tested as vacant. A failed remote
+        Err(DomainError::Unavailable(_)) | Err(DomainError::TimedOut) => {
+            // Some Windows TCP stacks report a refused connection as the request's
+            // two-second deadline. Binding the exact local port is the real test:
+            // success proves it is vacant; failure leaves it occupied.
+            // Only a literal loopback address can be tested this way. A failed remote
             // request, DNS error or unreadable listener identity is never vacancy evidence.
             let address = url
                 .host_str()
@@ -111,15 +114,18 @@ pub async fn observe(http: &ProviderHttp, base: &str) -> Result<Observation, Dom
         Err(error) => Err(error),
     }
 }
-/// A dedicated runtime for the native supervisor's bounded blocking executor.
-/// The closure must not be invoked directly on an async executor worker.
+/// Creates the short-lived runtime inside each observation rather than retaining
+/// one in the host. The host itself is eventually dropped by the desktop's async
+/// runtime, where Tokio intentionally refuses to drop another Tokio runtime.
 pub fn blocking_observer()
 -> Result<impl FnMut(&LaunchPlan) -> Result<Observation, DomainError>, DomainError> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| DomainError::Unavailable("runtime observation executor".into()))?;
     Ok(move |plan: &LaunchPlan| {
+        // RuntimeBundle invokes this from its one-worker blocking pool, so the
+        // probe cannot stall Tauri's event loop and its runtime drops here too.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| DomainError::Unavailable("runtime observation executor".into()))?;
         let origin = origin(plan)?;
         let http = ProviderHttp::new(std::slice::from_ref(&origin), Duration::from_secs(2))?;
         runtime.block_on(observe(&http, &origin))
@@ -168,6 +174,69 @@ pub(crate) fn blocking_generation_idle(plan: &LaunchPlan) -> Result<bool, Domain
 mod cancellation_tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
+
+    fn loopback_plan(port: u16) -> LaunchPlan {
+        LaunchPlan {
+            command: "server.exe".into(),
+            args: vec![
+                "--host".into(),
+                "127.0.0.1".into(),
+                "--port".into(),
+                port.to_string(),
+            ],
+            environment: BTreeMap::new(),
+            model_id: "fixture".into(),
+            model_path: "fixture.gguf".into(),
+            projector: None,
+            requested_context: 1024,
+            max_tokens: 1,
+            profile_sha256: "0".repeat(64),
+            plan_sha256: "0".repeat(64),
+            sources: BTreeMap::new(),
+            materials: vec![],
+        }
+    }
+
+    #[test]
+    fn blocking_observer_reports_an_unused_loopback_port_as_vacant() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut observer = blocking_observer().unwrap();
+        assert!(matches!(
+            observer(&loopback_plan(port)),
+            Ok(Observation::Vacant)
+        ));
+    }
+
+    #[test]
+    fn blocking_observer_does_not_claim_a_slow_listener_is_vacant() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            // Keep the socket open beyond the health request deadline. The
+            // observer must use the failed bind to retain an occupied verdict.
+            std::thread::sleep(Duration::from_secs(3));
+        });
+
+        let mut observer = blocking_observer().unwrap();
+        assert!(matches!(
+            observer(&loopback_plan(port)),
+            Ok(Observation::Occupied)
+        ));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocking_observer_can_drop_from_an_async_host() {
+        // NativeHost is dropped by the desktop's async runtime, so its observer
+        // must not retain a nested Tokio runtime that would panic during drop.
+        let observer = blocking_observer().unwrap();
+        drop(observer);
+    }
 
     #[test]
     fn cancellation_requires_every_slot_to_be_explicitly_idle() {

@@ -484,7 +484,7 @@ impl NativeHost {
         if tokens < 1_024 {
             return Err("Working context must be at least 1024 tokens.".into());
         }
-        let session = {
+        let (session, session_id) = {
             let active = self.active()?;
             let active = active.as_ref().ok_or("Open a local chat first")?;
             if active.busy || active.loading {
@@ -498,13 +498,13 @@ impl NativeHost {
                     "Working context must be between 1024 and {maximum} tokens for this model."
                 ));
             }
-            active.session.clone()
+            (active.session.clone(), active.id.as_str().to_owned())
         };
         let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
         session
             .select_context(
-                &format!("context-{serial}"),
-                &format!("context-level-{serial}"),
+                &format!("{session_id}-context-{serial}"),
+                &format!("{session_id}-context-level-{serial}"),
                 &timestamp(now_ms()),
                 tokens,
             )
@@ -1161,7 +1161,7 @@ impl NativeHost {
                 "Start this branch summary through the asynchronous native command.".into(),
             );
         }
-        let session = {
+        let (session, session_id) = {
             let active = self.active()?;
             let active = active.as_ref().ok_or("Open a local chat first")?;
             if active.busy || active.loading {
@@ -1169,10 +1169,10 @@ impl NativeHost {
                     "Wait for the local model to finish before changing this branch".into(),
                 );
             }
-            active.session.clone()
+            (active.session.clone(), active.id.as_str().to_owned())
         };
         let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let operation = format!("native-tree-{serial}");
+        let operation = format!("{session_id}-tree-{serial}");
         session
             .select_history_entry(&operation, target)
             .map_err(describe)?;
@@ -1204,10 +1204,9 @@ impl NativeHost {
         // the renderer that the summary has started.
         self.ensure_runtime().await?;
         let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
-        let operation = format!("native-tree-{serial}");
         let stamp = now_ms();
         let (cancel_source, cancel_token) = cancellation();
-        {
+        let operation = {
             let mut active = self.active()?;
             let active = active.as_mut().ok_or("Open a local chat first")?;
             if active.busy || active.loading {
@@ -1225,7 +1224,8 @@ impl NativeHost {
                 format!("{}-tree-{stamp}", active.id.as_str()),
                 stamp,
             ));
-        }
+            format!("{}-tree-{serial}", active.id.as_str())
+        };
         *self
             .inner
             .last_terminal
@@ -1573,6 +1573,7 @@ impl NativeHost {
                     .ok_or("The local generation has no cancellation token")?;
                 let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
                 let stamp = now_ms();
+                let session_id = active.id.as_str().to_owned();
                 (
                     active.session.clone(),
                     active.model.clone(),
@@ -1593,9 +1594,9 @@ impl NativeHost {
                             ))
                         })
                         .transpose()?,
-                    format!("local-turn-{serial}"),
-                    format!("local-user-{serial}"),
-                    format!("local-assistant-{serial}"),
+                    format!("{session_id}-turn-{serial}"),
+                    format!("{session_id}-user-{serial}"),
+                    format!("{session_id}-assistant-{serial}"),
                     timestamp(stamp),
                     stamp,
                     cancel,
@@ -5490,5 +5491,72 @@ mod tests {
         assert_eq!(projected["blocks"][1]["kind"], "attachment");
         assert_eq!(projected["blocks"][1]["reference"], "user-image");
         host.finish_prompt(None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a configured local AG1W model and GPU"]
+    async fn live_owned_model_loads_answers_and_stops() {
+        // This is intentionally opt-in. It exercises the same sealed runtime
+        // path as the desktop without needing to drive a browser window.
+        let state = std::env::var_os("AG1W_LIVE_STATE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("AG1W"))
+            })
+            .expect("set AG1W_LIVE_STATE or LOCALAPPDATA");
+        let model = std::env::var("AG1W_LIVE_MODEL")
+            .expect("set AG1W_LIVE_MODEL to a configured local model ID");
+        let host = NativeHost::open(state).expect("open AG1W state");
+
+        let load = tokio::time::timeout(
+            Duration::from_secs(900),
+            host.load_model("llamacpp", &model),
+        )
+        .await;
+        let prompt = if matches!(load, Ok(Ok(_))) {
+            Some(
+                tokio::time::timeout(
+                    Duration::from_secs(180),
+                    host.prompt("Reply with exactly: AG1W runtime smoke passed.".into()),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+
+        let stopped = tokio::time::timeout(Duration::from_secs(30), host.shutdown()).await;
+        assert!(matches!(&load, Ok(Ok(_))), "model load failed: {load:?}");
+        assert!(
+            matches!(&prompt, Some(Ok(Ok(_)))),
+            "prompt failed: {prompt:?}"
+        );
+        let response = prompt
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|result| result.as_ref().ok())
+            .expect("a completed prompt returns the refreshed chat view");
+        let answer = response["snapshot"]["messages"]
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .rev()
+                    .find(|message| message["role"] == "assistant")
+            })
+            .and_then(|message| message["text"].as_str())
+            .unwrap_or_default();
+        assert!(
+            !answer.trim().is_empty(),
+            "the model finished without an assistant answer: {response}"
+        );
+        assert!(
+            response["error"].is_null(),
+            "the completed chat has a diagnostic: {response}"
+        );
+        assert!(
+            matches!(&stopped, Ok(Ok(_))),
+            "shutdown failed: {stopped:?}"
+        );
     }
 }

@@ -13,11 +13,12 @@ use crate::{
     process::{OwnedProcess, ProcessIdentity, ProcessSpec, ProcessSupervisor},
 };
 use ag1_core::DomainError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, File},
-    io::Read,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
     os::windows::{fs::MetadataExt, io::AsRawHandle},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -30,8 +31,8 @@ use windows_sys::Win32::{
     },
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Signature {
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct MaterialStamp {
     volume: u64,
     file: u64,
     size: u64,
@@ -39,13 +40,13 @@ struct Signature {
     created: u64,
 }
 
-fn signature(file: &File) -> Result<Signature, DomainError> {
+fn signature(file: &File) -> Result<MaterialStamp, DomainError> {
     let metadata = file.metadata().map_err(io_error)?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut info) } == 0 {
         return Err(io_error(std::io::Error::last_os_error()));
     }
-    Ok(Signature {
+    Ok(MaterialStamp {
         volume: info.dwVolumeSerialNumber as u64,
         file: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
         size: metadata.file_size(),
@@ -56,12 +57,51 @@ fn signature(file: &File) -> Result<Signature, DomainError> {
 
 #[derive(Default)]
 pub struct MaterialVerifier {
-    cache: BTreeMap<PathBuf, (Signature, String)>,
+    cache: BTreeMap<PathBuf, (MaterialStamp, String)>,
     #[cfg(test)]
     pub(crate) bytes_hashed: u64,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CachedMaterial {
+    path: PathBuf,
+    sha256: String,
+    stamp: MaterialStamp,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistentCache {
+    version: u32,
+    materials: Vec<CachedMaterial>,
+}
+
 impl MaterialVerifier {
+    fn restore(&mut self, materials: Vec<CachedMaterial>) {
+        for material in materials.into_iter().take(1024) {
+            if !material.path.is_absolute()
+                || material.sha256.len() != 64
+                || !material.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                continue;
+            }
+            self.cache
+                .insert(material.path, (material.stamp, material.sha256));
+        }
+    }
+
+    fn cached_materials(&self) -> Vec<CachedMaterial> {
+        self.cache
+            .iter()
+            .map(|(path, (stamp, sha256))| CachedMaterial {
+                path: path.clone(),
+                sha256: sha256.clone(),
+                stamp: *stamp,
+            })
+            .collect()
+    }
+
     pub fn verify(&mut self, materials: &[Material]) -> Result<(), DomainError> {
         self.verify_progress(materials, &mut |_| {})
     }
@@ -126,7 +166,10 @@ impl MaterialVerifier {
                 return Err(DomainError::Conflict);
             }
             let mut hash = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
+            // A large GGUF should be read efficiently on its first sealed
+            // verification. This still hashes every byte; it just avoids a
+            // syscall for every 64 KiB fragment.
+            let mut buffer = [0u8; 1024 * 1024];
             loop {
                 let count = file.read(&mut buffer).map_err(io_error)?;
                 if count == 0 {
@@ -166,6 +209,89 @@ fn report_progress(done: u128, total: u128, last: &mut u8, progress: &mut dyn Fn
     if percent != *last {
         progress(percent);
         *last = percent;
+    }
+}
+
+fn restore_persistent_cache(directory: &Path, verifier: &mut MaterialVerifier) {
+    let cache_directory = directory.join("material-cache");
+    let Ok(entries) = fs::read_dir(cache_directory) else {
+        return;
+    };
+
+    let mut materials = Vec::new();
+    for entry in entries.flatten().take(1024) {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_file() {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        if bytes.len() > 16 * 1024 {
+            continue;
+        }
+        let Ok(cache) = serde_json::from_slice::<PersistentCache>(&bytes) else {
+            continue;
+        };
+        if cache.version == 1 && cache.materials.len() == 1 {
+            materials.extend(cache.materials);
+        }
+    }
+    verifier.restore(materials);
+}
+
+fn cache_name(material: &CachedMaterial) -> String {
+    let mut hash = Sha256::new();
+    hash.update(material.path.to_string_lossy().as_bytes());
+    hash.update([0]);
+    hash.update(material.sha256.as_bytes());
+    format!("{:x}.json", hash.finalize())
+}
+
+fn persist_verified_materials(directory: &Path, verifier: &MaterialVerifier) {
+    let cache_directory = directory.join("material-cache");
+    if fs::create_dir_all(&cache_directory).is_err() {
+        return;
+    }
+
+    for material in verifier.cached_materials() {
+        let path = cache_directory.join(cache_name(&material));
+        let current = fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PersistentCache>(&bytes).ok());
+        let matches_current_file = current.is_some_and(|cache| {
+            cache.version == 1
+                && cache.materials.len() == 1
+                && cache.materials[0].path == material.path
+                && cache.materials[0].sha256 == material.sha256
+                && cache.materials[0].stamp == material.stamp
+        });
+        if matches_current_file {
+            continue;
+        }
+        // A model can be replaced with the same verified bytes at the same
+        // path. Its SHA stays the same but Windows gives it a new file identity,
+        // so overwrite the old stamp after re-hashing it once.
+        let _ = fs::remove_file(&path);
+        let Ok(bytes) = serde_json::to_vec(&PersistentCache {
+            version: 1,
+            materials: vec![material],
+        }) else {
+            continue;
+        };
+        let write = (|| -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        })();
+        if write.is_err() {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -214,13 +340,16 @@ impl<O> NativeRuntimeHost<O> {
         legacy_process_host: &Path,
         private_dir: &Path,
         observer: O,
-        verifier: MaterialVerifier,
+        mut verifier: MaterialVerifier,
     ) -> Result<Self, DomainError> {
         let directory = private_dir.canonicalize().map_err(io_error)?;
         let metadata = fs::symlink_metadata(&directory).map_err(io_error)?;
         if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(DomainError::PermissionDenied);
         }
+        // A cache entry is usable only when the current Windows file identity
+        // still matches. Changed or replaced files fall through to a full hash.
+        restore_persistent_cache(&directory, &mut verifier);
         Ok(Self {
             supervisor: ProcessSupervisor::new(legacy_process_host)?,
             observer,
@@ -238,7 +367,11 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
     type Handle = NativeOwnedRuntime;
 
     fn verify_materials(&mut self, materials: &[Material]) -> Result<(), DomainError> {
-        self.verifier.verify(materials)
+        let result = self.verifier.verify(materials);
+        if result.is_ok() {
+            persist_verified_materials(&self.private_dir, &self.verifier);
+        }
+        result
     }
 
     fn verify_progress(
@@ -246,7 +379,11 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
         materials: &[Material],
         progress: &mut dyn FnMut(u8),
     ) -> Result<(), DomainError> {
-        self.verifier.verify_progress(materials, progress)
+        let result = self.verifier.verify_progress(materials, progress);
+        if result.is_ok() {
+            persist_verified_materials(&self.private_dir, &self.verifier);
+        }
+        result
     }
 
     fn loading_phase(&mut self, handle: &Self::Handle) -> Option<&'static str> {
@@ -402,6 +539,48 @@ mod tests {
         fs::rename(&replacement, &path).unwrap();
         verifier.verify(std::slice::from_ref(&material)).unwrap();
         assert_eq!(verifier.bytes_hashed, 18);
+    }
+
+    #[test]
+    fn verifier_reuses_a_persistent_cache_only_for_the_same_file() {
+        let root = tempfile::Builder::new()
+            .prefix("ag1-material-cache-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let path = root.path().join("model.gguf");
+        fs::write(&path, b"pinned").unwrap();
+        let material = Material {
+            path: path.display().to_string(),
+            sha256: format!("{:x}", Sha256::digest(b"pinned")),
+            kind: "weight".into(),
+        };
+
+        let mut first = MaterialVerifier::default();
+        first.verify(std::slice::from_ref(&material)).unwrap();
+        persist_verified_materials(root.path(), &first);
+
+        let mut later = MaterialVerifier::default();
+        restore_persistent_cache(root.path(), &mut later);
+        later.verify(std::slice::from_ref(&material)).unwrap();
+        assert_eq!(later.bytes_hashed, 0);
+
+        // A replace creates a different Windows file identity, so the next
+        // verifier reads and checks the replacement rather than trusting cache.
+        let replacement = root.path().join("replacement.gguf");
+        fs::write(&replacement, b"pinned").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let mut replaced = MaterialVerifier::default();
+        restore_persistent_cache(root.path(), &mut replaced);
+        replaced.verify(std::slice::from_ref(&material)).unwrap();
+        assert_eq!(replaced.bytes_hashed, 6);
+        persist_verified_materials(root.path(), &replaced);
+
+        let mut after_replace = MaterialVerifier::default();
+        restore_persistent_cache(root.path(), &mut after_replace);
+        after_replace
+            .verify(std::slice::from_ref(&material))
+            .unwrap();
+        assert_eq!(after_replace.bytes_hashed, 0);
     }
 
     #[test]
