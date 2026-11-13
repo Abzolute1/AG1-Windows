@@ -8,7 +8,7 @@ import "./workflow.css";
 import { SiteIcons, SourceList, webSources } from "./WebSources";
 type Call = Extract<MessageBlock, { kind: "tool" }>;
 type ToolOutcome = "complete" | "notice" | "unavailable" | "attention" | "failed";
-const labels: Record<string, string> = { read: "Read", ls: "List folder", grep: "Search", glob: "Find files", bash: "Run command", check: "Check", edit: "Edit", editPreview: "Preview edit", editApply: "Apply edit", append: "Append", write: "Write", webSearch: "Search the web", webFetch: "Fetch page", repo: "Inspect repository" };
+const labels: Record<string, string> = { read: "Read", ls: "List folder", grep: "Search", glob: "Find files", bash: "Run command", check: "Check", edit: "Edit", editPreview: "Preview edit", editApply: "Apply edit", append: "Append", write: "Write", webSearch: "Search the web", webFetch: "Fetch page", mcpSearch: "Search connected tools", mcpCall: "Run connected tool", repo: "Inspect repository" };
 
 /**
  * A provider or website declining automated access is useful context, but it is
@@ -80,6 +80,8 @@ export function toolTarget(call: Call): string {
 }
 export function toolLabel(call: Call, completed = false): string {
   if (call.name === "webSearch") return completed ? "Searched the web" : "Searching the web";
+  if (call.name === "mcpSearch") return completed ? "Searched connected tools" : "Searching connected tools";
+  if (call.name === "mcpCall") return completed ? "Ran connected tool" : "Running connected tool";
   if (call.name === "webFetch") return completed ? "Read webpage" : "Reading webpage";
   if (call.name.startsWith("mcp_")) return "MCP operation";
   if (call.name === "mcpDiscover") return completed ? "Discovered MCP capabilities" : "Discovering MCP capabilities";
@@ -135,7 +137,7 @@ function ToolEntry({ call, results, active, run, onExpand, loading }: { call?: C
   const name = call?.name ?? results[0]?.tool?.name;
   const status = outcomeLabel(call, results, outcome);
   const label = unavailable ? status : typeof capability === "string" ? `MCP · ${capability.slice(0, 128)}` : call ? toolLabel(call, results.length > 0 && !failed) : name || "Tool output";
-  const Icon = call?.name === "github" ? Github : ["read", "inspect", "write", "edit"].includes(call?.name ?? "") ? FileText : ["grep", "find", "webSearch"].includes(call?.name ?? "") ? Search : Terminal;
+  const Icon = call?.name === "github" ? Github : ["read", "inspect", "write", "edit"].includes(call?.name ?? "") ? FileText : ["grep", "find", "webSearch", "mcpSearch"].includes(call?.name ?? "") ? Search : Terminal;
   const sources = results.flatMap(webSources);
   return <div className={`tool-entry ${failed ? "failed" : ""} ${unavailable ? "unavailable" : ""} ${attention ? "attention" : ""} ${notice ? "notice" : ""}`}>
     <button className="tool-entry-toggle" aria-expanded={open} onClick={() => { setOpen(!open); if (!open) results.forEach(m => onExpand(m.id)); }}>{failed ? <X size={14} /> : unavailable || attention || notice ? <Info size={14} /> : active && !results.length ? <LoaderCircle size={14} className="spin" /> : sources.length ? <SiteIcons sources={sources} run={run} /> : <Icon size={14} />}<span>{label}</span>{sources.length > 0 && <small className="web-source-count">{sources.length} {sources.length === 1 ? "source" : "sources"}</small>}{target && <span className="tool-target" title={target}>{target}</span>}{failed && <small>Failed</small>}{unavailable && <small>Unavailable</small>}{attention && <small>{status}</small>}{notice && <small>{status}</small>}{!active && !results.length && <small>No result</small>}<ChevronRight size={12} className={open ? "expanded" : ""} /></button>

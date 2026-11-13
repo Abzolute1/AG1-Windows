@@ -21,6 +21,14 @@ export function liveToolDisplay(tool: ToolBlock): { label: string; target: strin
     const url = typeof args.url === "string" ? args.url.trim().slice(0, 240) : "";
     return { label: "Reading webpage", target: url, kind: "page" };
   }
+  if (tool.name === "mcpSearch") {
+    const query = typeof args.query === "string" ? args.query.trim().slice(0, 240) : "";
+    return { label: query ? "Searching connected tools" : "Preparing tool search", target: query, kind: "search" };
+  }
+  if (tool.name === "mcpCall") {
+    const name = typeof args.name === "string" ? args.name.trim().slice(0, 240) : "";
+    return { label: name ? "Running connected tool" : "Preparing connected tool", target: name, kind: "tool" };
+  }
   return { label: `Using ${tool.name}`, target: "", kind: "tool" };
 }
 

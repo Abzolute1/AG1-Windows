@@ -16,7 +16,7 @@ function commandKind(command: unknown): WorkingVerbKind {
 function toolKind(call: Call): WorkingVerbKind {
   const args = call.arguments && typeof call.arguments === "object" && !Array.isArray(call.arguments) ? call.arguments : {};
   switch (call.name) {
-    case "webSearch": case "grep": case "find": return "searching";
+    case "webSearch": case "mcpSearch": case "grep": case "find": return "searching";
     case "inspect": return args.query || args.glob ? "searching" : "reading";
     case "read": case "ls": case "glob": case "webFetch": case "repo": return "reading";
     case "write": case "append": return "writing";
