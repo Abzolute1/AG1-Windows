@@ -24,8 +24,9 @@ use std::{
     process::ExitStatus,
     ptr::{null, null_mut},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
+        mpsc::{SyncSender, TrySendError, sync_channel},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -58,6 +59,9 @@ use windows_sys::Win32::{
 pub const MAX_LOG_MEMORY: usize = 64 * 1024;
 pub const MAX_LOG_DISK: usize = 8 * 1024 * 1024;
 pub const STOP_DEADLINE_MS: u64 = 3000;
+const MAX_PROTOCOL_MEMORY: usize = 256 * 1024;
+const MAX_PROTOCOL_INPUT: usize = 32 * 1024;
+const MAX_PROTOCOL_MESSAGES: usize = 64;
 
 /// The Linux pinned-descriptor protocol has no Windows equivalent yet.
 /// Keeping these names lets callers be moved one at a time, but Windows rejects
@@ -376,6 +380,179 @@ fn reader(mut pipe: File, spool: Arc<Mutex<Spool>>) -> Result<JoinHandle<()>, Do
         .map_err(io_error)
 }
 
+// Protocol stdout must stay separate from stderr so JSON-RPC and similar
+// callers never have to guess whether a line is data or a diagnostic. The
+// reader pauses at a fixed limit instead of silently dropping protocol bytes.
+struct ProtocolState {
+    bytes: VecDeque<u8>,
+    closed: bool,
+    stopped: bool,
+    error: Option<String>,
+}
+
+struct ProtocolOutput {
+    state: Arc<(Mutex<ProtocolState>, Condvar)>,
+    reader: Option<JoinHandle<()>>,
+}
+
+impl ProtocolOutput {
+    fn start(mut pipe: File) -> Result<Self, DomainError> {
+        let state = Arc::new((
+            Mutex::new(ProtocolState {
+                bytes: VecDeque::new(),
+                closed: false,
+                stopped: false,
+                error: None,
+            }),
+            Condvar::new(),
+        ));
+        let reader_state = state.clone();
+        let reader = thread::Builder::new()
+            .name("ag1-protocol-drain".into())
+            .spawn(move || {
+                let mut buffer = [0u8; 8192];
+                loop {
+                    // Waiting before a read means every successful pipe read can
+                    // fit in the queue. That preserves byte order without an
+                    // unbounded Vec growing behind a slow protocol consumer.
+                    let (lock, changed) = &*reader_state;
+                    let mut state = lock.lock().unwrap();
+                    while !state.stopped && state.bytes.len() > MAX_PROTOCOL_MEMORY - buffer.len() {
+                        state = changed.wait(state).unwrap();
+                    }
+                    if state.stopped {
+                        return;
+                    }
+                    drop(state);
+
+                    match pipe.read(&mut buffer) {
+                        Ok(0) => {
+                            let mut state = lock.lock().unwrap();
+                            state.closed = true;
+                            changed.notify_all();
+                            return;
+                        }
+                        Ok(count) => {
+                            let mut state = lock.lock().unwrap();
+                            if state.stopped {
+                                return;
+                            }
+                            state.bytes.extend(&buffer[..count]);
+                            changed.notify_all();
+                        }
+                        Err(error) => {
+                            let mut state = lock.lock().unwrap();
+                            state.error = Some(error.to_string());
+                            state.closed = true;
+                            changed.notify_all();
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(io_error)?;
+        Ok(Self {
+            state,
+            reader: Some(reader),
+        })
+    }
+
+    fn read(&mut self, max_bytes: usize) -> Result<Vec<u8>, DomainError> {
+        if max_bytes == 0 || max_bytes > MAX_PROTOCOL_INPUT {
+            return Err(DomainError::LimitExceeded("protocol stdout".into()));
+        }
+        let (lock, changed) = &*self.state;
+        let mut state = lock.lock().unwrap();
+        if let Some(error) = &state.error {
+            return Err(DomainError::Io(error.clone()));
+        }
+        let count = max_bytes.min(state.bytes.len());
+        let mut bytes = Vec::with_capacity(count);
+        for _ in 0..count {
+            bytes.push(state.bytes.pop_front().unwrap());
+        }
+        if count > 0 {
+            changed.notify_all();
+        }
+        Ok(bytes)
+    }
+
+    fn closed(&self) -> bool {
+        self.state.0.lock().unwrap().closed
+    }
+
+    fn stop_reader(&mut self) {
+        let (lock, changed) = &*self.state;
+        lock.lock().unwrap().stopped = true;
+        changed.notify_all();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+// Anonymous Windows pipes can block forever when a child stops reading. A
+// bounded worker keeps that backpressure off the UI and lets callers retry via
+// try_write_input while still preserving input order.
+struct ProtocolInput {
+    sender: Option<SyncSender<Vec<u8>>>,
+    worker: Option<JoinHandle<()>>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl ProtocolInput {
+    fn start(mut pipe: File) -> Result<Self, DomainError> {
+        let (sender, receiver) = sync_channel::<Vec<u8>>(MAX_PROTOCOL_MESSAGES);
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = error.clone();
+        let worker = thread::Builder::new()
+            .name("ag1-protocol-input".into())
+            .spawn(move || {
+                for bytes in receiver {
+                    if let Err(error) = pipe.write_all(&bytes) {
+                        *worker_error.lock().unwrap() = Some(error.to_string());
+                        return;
+                    }
+                }
+            })
+            .map_err(io_error)?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            error,
+        })
+    }
+
+    fn write(&self, bytes: &[u8]) -> Result<Option<usize>, DomainError> {
+        if bytes.len() > MAX_PROTOCOL_INPUT {
+            return Err(DomainError::LimitExceeded("process input".into()));
+        }
+        if let Some(error) = &*self.error.lock().unwrap() {
+            return Err(DomainError::Io(error.clone()));
+        }
+        let sender = self.sender.as_ref().ok_or(DomainError::NotFound)?;
+        match sender.try_send(bytes.to_vec()) {
+            Ok(()) => Ok(Some(bytes.len())),
+            Err(TrySendError::Full(_)) => Ok(None),
+            Err(TrySendError::Disconnected(_)) => {
+                let error = self.error.lock().unwrap().clone();
+                Err(error.map(DomainError::Io).unwrap_or(DomainError::Cancelled))
+            }
+        }
+    }
+
+    fn close(&mut self) {
+        self.sender.take();
+    }
+
+    fn finish(&mut self) {
+        self.close();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 struct ActiveLease(Arc<AtomicUsize>);
 
 impl Drop for ActiveLease {
@@ -397,30 +574,32 @@ impl ProcessSupervisor {
     }
 
     pub fn spawn(&self, spec: ProcessSpec, spool_path: &Path) -> Result<OwnedProcess, DomainError> {
-        self.spawn_inner(spec, spool_path, None)
+        self.spawn_inner(spec, spool_path, None, false)
     }
 
-    /// Llama servers use this bounded process path. Protocol transports need
-    /// overlapped named pipes on Windows, so they remain explicitly unavailable.
+    /// Protocol stdout is drained into a separate, bounded queue while stderr
+    /// stays in the diagnostic spool. This matches the contract callers use on
+    /// Linux without making the desktop thread wait on a pipe write.
     pub fn spawn_protocol(
         &self,
-        _spec: ProcessSpec,
-        _spool_path: &Path,
+        spec: ProcessSpec,
+        spool_path: &Path,
     ) -> Result<OwnedProcess, DomainError> {
-        Err(DomainError::Unavailable(
-            "Windows protocol pipes are not implemented yet".into(),
-        ))
+        self.spawn_inner(spec, spool_path, None, true)
     }
 
     pub fn spawn_protocol_limited(
         &self,
-        _spec: ProcessSpec,
-        _spool_path: &Path,
-        _address_space: u64,
+        spec: ProcessSpec,
+        spool_path: &Path,
+        address_space: u64,
     ) -> Result<OwnedProcess, DomainError> {
-        Err(DomainError::Unavailable(
-            "Windows protocol pipes are not implemented yet".into(),
-        ))
+        if !(64 * 1024 * 1024..=8 * 1024 * 1024 * 1024).contains(&address_space) {
+            return Err(DomainError::InvalidInput(
+                "tool process address space".into(),
+            ));
+        }
+        self.spawn_inner(spec, spool_path, Some(address_space), true)
     }
 
     fn spawn_inner(
@@ -428,6 +607,7 @@ impl ProcessSupervisor {
         spec: ProcessSpec,
         spool_path: &Path,
         memory_limit: Option<u64>,
+        protocol: bool,
     ) -> Result<OwnedProcess, DomainError> {
         spec.validate()?;
         if self
@@ -440,7 +620,7 @@ impl ProcessSupervisor {
             return Err(DomainError::LimitExceeded("owned processes".into()));
         }
         let lease = ActiveLease(self.active.clone());
-        match OwnedProcess::launch(spec, spool_path, memory_limit, lease) {
+        match OwnedProcess::launch(spec, spool_path, memory_limit, protocol, lease) {
             Ok(process) => Ok(process),
             Err(error) => Err(error),
         }
@@ -457,8 +637,9 @@ pub struct OwnedProcess {
     identity: ProcessIdentity,
     process: Handle,
     job: Job,
-    stdin: Option<File>,
+    input: Option<ProtocolInput>,
     readers: Vec<JoinHandle<()>>,
+    protocol_stdout: Option<ProtocolOutput>,
     spool: Arc<Mutex<Spool>>,
     status: Option<ExitStatus>,
     completion: Option<ProcessCompletion>,
@@ -470,6 +651,7 @@ impl OwnedProcess {
         spec: ProcessSpec,
         spool_path: &Path,
         memory_limit: Option<u64>,
+        protocol: bool,
         lease: ActiveLease,
     ) -> Result<Self, DomainError> {
         let file = OpenOptions::new()
@@ -561,16 +743,20 @@ impl OwnedProcess {
         drop(stderr_write);
 
         let identity = identity(&process, information.dwProcessId, &spec.executable)?;
-        let readers = vec![
-            reader(stdout_read.into_file(), spool.clone())?,
-            reader(stderr_read.into_file(), spool.clone())?,
-        ];
+        let mut readers = vec![reader(stderr_read.into_file(), spool.clone())?];
+        let protocol_stdout = if protocol {
+            Some(ProtocolOutput::start(stdout_read.into_file())?)
+        } else {
+            readers.push(reader(stdout_read.into_file(), spool.clone())?);
+            None
+        };
         Ok(Self {
             identity,
             process,
             job,
-            stdin: Some(stdin_write.into_file()),
+            input: Some(ProtocolInput::start(stdin_write.into_file())?),
             readers,
+            protocol_stdout,
             spool,
             status: None,
             completion: None,
@@ -600,20 +786,52 @@ impl OwnedProcess {
         Ok(bytes)
     }
 
-    pub fn write_input(&mut self, _bytes: &[u8]) -> Result<usize, DomainError> {
-        Err(DomainError::Unavailable(
-            "Windows protocol stdin is not implemented yet".into(),
-        ))
+    /// Return protocol bytes without mixing in stderr. An empty read means the
+    /// background drain has no complete bytes ready yet; it is not an EOF.
+    pub fn read_stdout(&mut self, max_bytes: usize) -> Result<Vec<u8>, DomainError> {
+        self.protocol_stdout
+            .as_mut()
+            .ok_or(DomainError::NotFound)?
+            .read(max_bytes)
     }
 
-    pub fn try_write_input(&mut self, _bytes: &[u8]) -> Result<Option<usize>, DomainError> {
-        Err(DomainError::Unavailable(
-            "Windows protocol stdin is not implemented yet".into(),
-        ))
+    /// A terminal process is only complete for protocol callers after its
+    /// separate stdout reader has reached EOF and its final bytes were drained.
+    pub fn poll_stdout(
+        &mut self,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, Option<ExitStatus>), DomainError> {
+        let status = self.try_wait()?;
+        let bytes = self.read_stdout(max_bytes)?;
+        let closed = self
+            .protocol_stdout
+            .as_ref()
+            .is_some_and(ProtocolOutput::closed);
+        let complete = if bytes.is_empty() && closed {
+            status
+        } else {
+            None
+        };
+        Ok((bytes, complete))
+    }
+
+    /// The worker queue never blocks the caller. A full queue is surfaced here
+    /// because protocol owners can drain stdout and retry on their next tick.
+    pub fn try_write_input(&mut self, bytes: &[u8]) -> Result<Option<usize>, DomainError> {
+        self.input
+            .as_ref()
+            .ok_or(DomainError::NotFound)?
+            .write(bytes)
+    }
+
+    pub fn write_input(&mut self, bytes: &[u8]) -> Result<usize, DomainError> {
+        self.try_write_input(bytes)?.ok_or(DomainError::QueueFull)
     }
 
     pub fn close_input(&mut self) {
-        self.stdin.take();
+        if let Some(input) = &mut self.input {
+            input.close();
+        }
     }
 
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, DomainError> {
@@ -691,7 +909,11 @@ impl OwnedProcess {
         for reader in self.readers.drain(..) {
             let _ = reader.join();
         }
-        self.stdin.take();
+        // Keep protocol stdout alive after process exit. The caller still has
+        // to drain the final bytes before it can treat its request as complete.
+        if let Some(mut input) = self.input.take() {
+            input.finish();
+        }
         self.lease.take();
     }
 }
@@ -701,6 +923,12 @@ impl Drop for OwnedProcess {
         if self.status.is_none() {
             let _ = self.job.terminate();
         }
+        if let Some(mut output) = self.protocol_stdout.take() {
+            output.stop_reader();
+        }
+        // Once the job is stopped, its pipe endpoints close. Joining here keeps
+        // helper threads from outliving an AG1-owned process handle.
+        self.finish();
     }
 }
 
@@ -874,5 +1102,41 @@ mod tests {
             .unwrap();
         process.stop_with_timeout(Duration::from_secs(2)).unwrap();
         assert!(process.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn protocol_transport_keeps_stdout_separate_and_bounded() {
+        let root = tempfile::Builder::new()
+            .prefix("ag1-protocol-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
+        let mut process = ProcessSupervisor::new(Path::new("unused"))
+            .unwrap()
+            .spawn_protocol(
+                spec(
+                    &["/d", "/v:on", "/c", "set /p answer= & echo !answer!"],
+                    root.path(),
+                ),
+                &root.path().join("log"),
+            )
+            .unwrap();
+
+        assert_eq!(process.write_input(b"protocol-ready\r\n").unwrap(), 16);
+        process.close_input();
+
+        let mut output = Vec::new();
+        let started = Instant::now();
+        loop {
+            let (bytes, complete) = process.poll_stdout(1024).unwrap();
+            output.extend(bytes);
+            if complete.is_some() {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(String::from_utf8(output).unwrap(), "protocol-ready\r\n");
+        assert!(process.tail(1024).unwrap().bytes.is_empty());
     }
 }
