@@ -24,6 +24,7 @@ use ag1_platform::{
         CancelSource, GenerationRuntime, ProviderHttp, cancellation, endpoint_origin,
     },
     session::{LocalProjectTools, LocalTurnInput, NativeSession, ProjectWriteAccess},
+    website_icons,
     workspace::{MAX_READ, Workspace, WorkspaceService, preserve_text},
 };
 use ag1_storage::{CatalogPosition, Store, digest};
@@ -451,6 +452,39 @@ impl NativeHost {
             .map_err(|_| "AG1W navigation status lock is unavailable".to_owned())?
             .clone();
         Ok(json!({"last_terminal":last_terminal}))
+    }
+
+    /// Resolve a site icon only for a URL that already belongs to a durable
+    /// web-tool result in this chat. The renderer cannot turn an icon card
+    /// into an arbitrary outbound request.
+    pub fn website_icon(&self, args: &Value) -> Result<Value, String> {
+        let entry = args["entry"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 256)
+            .ok_or("Missing web result entry")?;
+        let url = args["url"]
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 2048)
+            .ok_or("Missing web source URL")?;
+        let session = {
+            let active = self.active()?;
+            active
+                .as_ref()
+                .ok_or("Open a local chat before loading source icons")?
+                .session
+                .clone()
+        };
+        let records = session.records().map_err(describe)?;
+        let record = records
+            .iter()
+            .find(|record| record["id"] == entry)
+            .ok_or("The web result is no longer in this chat")?;
+        let sources = website_icons::sources(record);
+        if !sources.iter().any(|source| source["url"] == url) {
+            return Err("That icon URL does not belong to this web result".into());
+        }
+        let data = website_icons::icon(url).map_err(describe)?;
+        Ok(json!({"dataUrl":data}))
     }
 
     /// Record the user's explicit choice before a prompt starts. The mode is
@@ -2390,19 +2424,23 @@ impl NativeHost {
             })
             .collect::<Vec<_>>();
         // This is the exact small tool list the model receives on its next
-        // prompt. General chat has no project root, so it gets no file tools.
+        // prompt. Public web research is useful in general chat; file tools
+        // still require an attached, user-granted project folder.
         let write_access = project_write_access(&active.approval_mode);
-        let tools = if active.workspace.is_some() {
-            LocalProjectTools::definitions_for_command_runner(write_access, true)
-        } else {
-            vec![]
-        };
+        let mut tools = LocalProjectTools::web_definitions();
+        if active.workspace.is_some() {
+            tools.extend(LocalProjectTools::definitions_for_command_runner(
+                write_access,
+                true,
+            ));
+        }
         let mut capabilities = vec![
             "local-llamacpp-chat",
             "durable-session",
             "context-virtualization",
             "owned-runtime-when-configured",
             "project-file-browser",
+            "web-research",
         ];
         if active.workspace.is_some() {
             capabilities.push("project-read-tools");
@@ -3520,13 +3558,14 @@ fn session_configuration(
             "off".into()
         },
         model,
-        // General chats describe no tools at all. A project chat journals the
-        // three read-only definitions. Per-prompt write definitions are added
-        // only after the host sees an explicit allow-changes mode.
-        tools: if has_project_tools {
-            LocalProjectTools::definitions()
-        } else {
-            vec![]
+        // Web schemas are small enough to retain in every chat. Project files
+        // remain opt-in and richer write schemas are still request-local.
+        tools: {
+            let mut tools = LocalProjectTools::web_definitions();
+            if has_project_tools {
+                tools.extend(LocalProjectTools::definitions());
+            }
+            tools
         },
         system_prompt: system_prompt.into(),
         prompt: None,
@@ -3719,7 +3758,7 @@ fn project_message(record: &Value) -> Option<Value> {
     });
     // The desktop's compact activity component needs structured tool blocks,
     // not a flattened transcript. Keep the journal record as the source here.
-    let blocks = if let Some(text) = content.as_str() {
+    let mut blocks = if let Some(text) = content.as_str() {
         vec![json!({"kind":"text","text":text})]
     } else {
         content
@@ -3744,6 +3783,15 @@ fn project_message(record: &Value) -> Option<Value> {
             })
             .collect::<Vec<_>>()
     };
+    // Source cards are a display projection of already-durable web evidence.
+    // They never go back into the provider transcript or grant the renderer a
+    // way to request arbitrary icon URLs.
+    if let Some(sources) = web_sources(message) {
+        blocks.insert(
+            0,
+            json!({"kind":"unknown","value":{"kind":"web_result","sources":sources}}),
+        );
+    }
     let tool = if role == "toolResult" {
         json!({
             "call_id":message["toolCallId"],
@@ -3761,6 +3809,56 @@ fn project_message(record: &Value) -> Option<Value> {
         "blocks":blocks,
         "tool":tool,
     }))
+}
+
+fn web_sources(message: &Value) -> Option<Vec<Value>> {
+    if message["role"] != "toolResult" || message["isError"] == true {
+        return None;
+    }
+    let details = &message["details"];
+    if details["error"].is_string() || details["fallbackUsed"] == true {
+        return None;
+    }
+    let urls = match message["toolName"].as_str() {
+        Some("webSearch") => details["sourceUrls"]
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>(),
+        Some("webFetch") => details["finalUrl"]
+            .as_str()
+            .or_else(|| details["url"].as_str())
+            .into_iter()
+            .collect::<Vec<_>>(),
+        _ => return None,
+    };
+    let mut sources = Vec::new();
+    for url in urls {
+        let Ok(parsed) = url::Url::parse(url) else {
+            continue;
+        };
+        if url.len() > 2048
+            || !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || sources.iter().any(|source: &Value| source["url"] == url)
+        {
+            continue;
+        }
+        let title = details["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|row| row["url"] == url)
+            .and_then(|row| row["title"].as_str())
+            .or_else(|| details["title"].as_str())
+            .unwrap_or_else(|| parsed.host_str().unwrap_or("Webpage"));
+        sources.push(json!({"url":url,"title":utf8_prefix(title, 240)}));
+        if sources.len() == 4 {
+            break;
+        }
+    }
+    (!sources.is_empty()).then_some(sources)
 }
 
 fn history_entry(record: &Value) -> Value {
@@ -4742,6 +4840,28 @@ mod tests {
         assert_eq!(result["tool"]["name"], "list_project_files");
         assert_eq!(result["tool"]["failed"], false);
         assert_eq!(result["blocks"][0]["text"], "src/main.rs");
+
+        let search = project_message(&json!({
+            "id":"web-result",
+            "message":{
+                "role":"toolResult",
+                "toolCallId":"search-docs",
+                "toolName":"webSearch",
+                "isError":false,
+                "details":{
+                    "sourceUrls":["https://docs.example.com/guide"],
+                    "results":[{"url":"https://docs.example.com/guide","title":"Example guide"}]
+                },
+                "content":[{"type":"text","text":"One result"}]
+            }
+        }))
+        .unwrap();
+        assert_eq!(search["blocks"][0]["kind"], "unknown");
+        assert_eq!(search["blocks"][0]["value"]["kind"], "web_result");
+        assert_eq!(
+            search["blocks"][0]["value"]["sources"][0]["title"],
+            "Example guide"
+        );
     }
 
     #[test]
@@ -5713,14 +5833,18 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            3
+            5
         );
         assert_eq!(
             opened["details"]["context"]["tools"][0]["name"],
-            "list_project_files"
+            "webSearch"
         );
         assert_eq!(
             opened["details"]["context"]["tools"][2]["name"],
+            "list_project_files"
+        );
+        assert_eq!(
+            opened["details"]["context"]["tools"][4]["name"],
             "search_project_files"
         );
         assert!(
@@ -5870,14 +5994,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            6
-        );
-        assert_eq!(
-            enabled["details"]["context"]["tools"][3]["name"],
-            "edit_project_file"
+            8
         );
         assert_eq!(
             enabled["details"]["context"]["tools"][5]["name"],
+            "edit_project_file"
+        );
+        assert_eq!(
+            enabled["details"]["context"]["tools"][7]["name"],
             "run_project_command"
         );
 
@@ -5923,10 +6047,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            6
+            8
         );
         assert_eq!(
-            updated["details"]["context"]["tools"][5]["name"],
+            updated["details"]["context"]["tools"][7]["name"],
             "run_project_command"
         );
     }

@@ -1,16 +1,18 @@
 //! Optional public favicon decoration, bound to an existing web-tool result.
 //! Never fetch from the renderer, send search text/credentials, or alter tool evidence.
-use super::*;
 use crate::web_http::{SystemResolver, WebPolicy, WebResolver};
+use ag1_core::DomainError;
 use reqwest::Url;
+use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
     net::SocketAddr,
-    sync::LazyLock,
-    time::Instant,
+    sync::{LazyLock, Mutex},
+    time::{Duration, Instant},
 };
+type Result<T> = std::result::Result<T, DomainError>;
 
-pub(super) fn sources(entry: &Value) -> Vec<Value> {
+pub fn sources(entry: &Value) -> Vec<Value> {
     let m = &entry["message"];
     if m["role"] != "toolResult"
         || m["isError"] == true
@@ -83,7 +85,7 @@ struct Cache {
     requests: VecDeque<Instant>,
 }
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(|| Mutex::new(Cache::default()));
-pub(super) fn icon(raw: &str) -> Result<Option<String>> {
+pub fn icon(raw: &str) -> Result<Option<String>> {
     cached_icon(&CACHE, raw, |root| {
         fetch(root.clone()).or_else(|_| fallback(root))
     })

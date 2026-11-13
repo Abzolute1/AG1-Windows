@@ -25,6 +25,9 @@ pub mod session;
 #[path = "session_windows.rs"]
 pub mod session;
 pub mod web_http;
+#[cfg(windows)]
+#[path = "client/website_icons.rs"]
+pub mod website_icons;
 #[cfg(target_os = "linux")]
 pub mod workspace;
 #[cfg(windows)]

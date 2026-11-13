@@ -701,6 +701,26 @@ async fn bridge_command(
                 }
             }
         }
+        Command::Runtime { action, args } if action == "website_icon" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                // Icon fetching is bounded but can wait on a remote TLS server.
+                // Keep that wait off Tauri's command executor so streamed chat
+                // updates and the rest of the desktop remain responsive.
+                let host = state.host.clone();
+                let args = args.clone();
+                match tauri::async_runtime::spawn_blocking(move || host.website_icon(&args)).await {
+                    Ok(Ok(data)) => reply(&envelope, &before, "accepted", false, data),
+                    Ok(Err(error)) => reject(&envelope, &before, error),
+                    Err(_) => reject(
+                        &envelope,
+                        &before,
+                        "AG1W source-icon worker stopped unexpectedly",
+                    ),
+                }
+            }
+        }
         Command::Runtime { action, .. } if action == "status" => {
             if let Err(error) = check_scope(&envelope, &before) {
                 reject(&envelope, &before, error)

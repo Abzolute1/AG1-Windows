@@ -15,6 +15,8 @@ use crate::{
         request_http::{HttpCredential, generation_http_request},
         requests::{RequestContext, session_options},
     },
+    web_http::{SystemResolver, WebHttp, WebPolicy},
+    web_tools::{SearchConfig, SearchService, WebExecution, WebService},
     workspace::{MAX_READ, Workspace, preserve_text},
 };
 use ag1_core::{
@@ -35,11 +37,17 @@ use ag1_core::{
         tree,
     },
     storage::StoragePort,
+    tools::{
+        approval::{Authorizer, Preflight, PreflightContext},
+        policy::{Mode as ToolMode, Policy},
+        registry::{Registry, Scope},
+        research, web_presentation,
+    },
 };
 use ag1_storage::{SessionBootstrap, SessionSeed, Store, context::ContextStore};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::PathBuf,
     sync::{
@@ -61,6 +69,7 @@ const PROJECT_COMMAND_MAX_ARGS: usize = 64;
 const PROJECT_COMMAND_MAX_ARG_BYTES: usize = 4 * 1024;
 const PROJECT_COMMAND_MAX_TIMEOUT_MS: u64 = 120_000;
 const PROJECT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const WEB_TOOL_TIMEOUT: Duration = Duration::from_secs(45);
 static PROJECT_COMMAND_SERIAL: AtomicU64 = AtomicU64::new(0);
 
 /// One committed point in the journal. Callers can render this without seeing
@@ -124,6 +133,17 @@ pub struct LocalCompactionResult {
 pub struct LocalPlanResult {
     pub turn: LocalTurnResult,
     pub plan: Option<Plan>,
+}
+
+/// The public-web transport is scoped to one durable chat and context epoch.
+/// Keeping it here preserves AG1's short search/fetch cache and search hints
+/// across tool rounds without sharing either between chats.
+struct LocalWeb {
+    workspace: String,
+    session: String,
+    epoch: u64,
+    fetch: Arc<WebService<SystemResolver>>,
+    search: Arc<SearchService<SystemResolver>>,
 }
 
 /// A prompt gets this mode from the desktop's explicit approval setting.
@@ -288,6 +308,23 @@ impl LocalProjectTools {
             }
         }
         definitions
+    }
+
+    /// Web research is intentionally a separate two-tool surface. It is useful
+    /// in a general chat too, while project tools still require a granted folder.
+    pub fn web_definitions() -> Vec<Value> {
+        vec![
+            json!({
+                "name":"webSearch",
+                "description":"Search the public web using DuckDuckGo. Returns bounded titles, URLs, and snippets with durable source evidence. Use it for current information, documentation, or error messages.",
+                "parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"},"maxResults":{"type":"number","description":"Maximum results to return, from 1 to 4"}},"required":["query"]},
+            }),
+            json!({
+                "name":"webFetch",
+                "description":"Fetch a public URL and return a compact, evidence-backed reading extract. Use it after webSearch when a source needs closer reading.",
+                "parameters":{"type":"object","properties":{"url":{"type":"string","description":"Public http or https URL to fetch"}},"required":["url"]},
+            }),
+        ]
     }
 
     fn request_definitions(&self) -> Vec<Value> {
@@ -845,6 +882,77 @@ fn project_tool_error(error: &DomainError) -> &'static str {
     }
 }
 
+fn unavailable_local_tool_result(call: &Value) -> Value {
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":call["name"],
+        "content":[{"type":"text","text":"Attach a project before using file or command tools."}],
+        "isError":true,
+    })
+}
+
+fn web_tool_result(call: &Value, result: Value) -> Value {
+    let name = call["name"].as_str().unwrap_or_default();
+    let content = result["content"].as_array().cloned().unwrap_or_else(|| {
+        vec![json!({"type":"text","text":"The web tool returned no readable result."})]
+    });
+    let presentation = web_presentation::render(name, &call["arguments"], &result, false)
+        .ok()
+        .and_then(|value| serde_json::to_value(value).ok());
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":name,
+        "content":content,
+        "details":result["details"],
+        "presentation":presentation,
+        "isError":result["isError"].as_bool().unwrap_or(false),
+    })
+}
+
+fn web_tool_error_result(call: &Value, error: DomainError) -> Value {
+    let message = match error {
+        DomainError::PermissionDenied => "That URL is outside AG1W's public-web safety boundary.",
+        DomainError::Cancelled => "Web research was stopped.",
+        DomainError::TimedOut => "Web research timed out.",
+        DomainError::QueueFull => "Web research is busy. Retry shortly.",
+        DomainError::InvalidInput(reason)
+        | DomainError::LimitExceeded(reason)
+        | DomainError::Unavailable(reason) => {
+            return json!({
+                "role":"toolResult",
+                "toolCallId":call["id"],
+                "toolName":call["name"],
+                "content":[{"type":"text","text":reason}],
+                "details":{"error":reason,"status":"error"},
+                "isError":true,
+            });
+        }
+        _ => "Web research could not complete safely.",
+    };
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":call["name"],
+        "content":[{"type":"text","text":message}],
+        "details":{"error":message,"status":"error"},
+        "isError":true,
+    })
+}
+
+// Gregorian civil year from nonnegative Unix milliseconds. Search planning
+// needs the year, and this avoids a second time library in the native host.
+fn utc_year(milliseconds: u64) -> u32 {
+    let days = milliseconds / 86_400_000 + 719468;
+    let era = days / 146097;
+    let day = days % 146097;
+    let year = (day - day / 1460 + day / 36524 - day / 146096) / 365;
+    let day_of_year = day - (365 * year + year / 4 - year / 100);
+    let month = (5 * day_of_year + 2) / 153;
+    (year + era * 400 + u64::from(month >= 10)) as u32
+}
+
 /// A small Windows owner around the real AG1 session state machine.
 ///
 /// The mutex serializes journal transitions. SQLite is still the durable
@@ -858,6 +966,7 @@ pub struct NativeSession {
     // The journal owns this value. The desktop uses it to reopen the same
     // project folder rather than treating every durable chat as general chat.
     cwd: String,
+    web: Mutex<Option<LocalWeb>>,
 }
 
 impl NativeSession {
@@ -951,6 +1060,7 @@ impl NativeSession {
             session,
             origin: origin.into(),
             cwd,
+            web: Mutex::new(None),
         })
     }
 
@@ -1819,10 +1929,18 @@ impl NativeSession {
         // instead of an in-memory transcript of uncommitted tool output.
         let mut round = 0u8;
         let mut tool_calls = 0usize;
-        // A chat's stored configuration contains the conservative read-only
-        // catalog. The host supplies a short-lived richer catalog only after
-        // the user chooses an allow-changes mode for this exact prompt.
-        let request_tools = tools.map(LocalProjectTools::request_definitions);
+        // Web research is available in ordinary chats, even before a project
+        // is attached. Project tools are added only from the prompt's frozen
+        // folder snapshot. Plan drafts deliberately receive neither surface.
+        let request_tools = if input.system_addendum.is_some() {
+            None
+        } else {
+            let mut definitions = LocalProjectTools::web_definitions();
+            if let Some(tools) = tools {
+                definitions.extend(tools.request_definitions());
+            }
+            Some(definitions)
+        };
         loop {
             // Preparation captures one immutable journal/configuration view. The
             // context compiler can now run without holding the session mutex.
@@ -2013,7 +2131,7 @@ impl NativeSession {
             }
 
             let calls = Self::project_tool_calls(&message)?;
-            if calls.is_empty() || tools.is_none() {
+            if calls.is_empty() {
                 return Ok(LocalTurnResult {
                     user,
                     assistant,
@@ -2034,7 +2152,6 @@ impl NativeSession {
                     "local project tool calls".into(),
                 ));
             }
-            let tools = tools.expect("checked above");
             let change = LocalChangeContext {
                 store: self.store.as_ref(),
                 session: self.session.as_str(),
@@ -2042,13 +2159,181 @@ impl NativeSession {
                 timestamp_ms: input.timestamp_ms,
             };
             for (index, call) in calls.iter().enumerate() {
-                let result = tools.execute_with_changes(call, Some(&change));
+                let result = match call["name"].as_str() {
+                    Some("webSearch") | Some("webFetch") => {
+                        self.execute_web_tool(
+                            call,
+                            &format!("{assistant_id}-web-{round}-{index}"),
+                            &input.timestamp,
+                            input.timestamp_ms,
+                            cancel,
+                        )
+                        .await
+                    }
+                    _ => tools
+                        .map(|tools| tools.execute_with_changes(call, Some(&change)))
+                        .unwrap_or_else(|| unavailable_local_tool_result(call)),
+                };
                 let id = format!("{}-tool-{round}-{index}", input.assistant_id);
                 self.append_message(&id, &id, &input.timestamp, result)?;
             }
             tool_calls += calls.len();
             round += 1;
         }
+    }
+
+    /// Run AG1's existing web services behind a fresh, turn-bound authority
+    /// fence. The model sees only the two small web schemas; raw responses are
+    /// retained as evidence and do not become unbounded chat context.
+    async fn execute_web_tool(
+        &self,
+        call: &Value,
+        operation: &str,
+        timestamp: &str,
+        timestamp_ms: u64,
+        cancel: &mut CancelToken,
+    ) -> Value {
+        let result = async {
+            let name = call["name"]
+                .as_str()
+                .ok_or_else(|| DomainError::InvalidInput("web tool name".into()))?;
+            let call_id = call["id"]
+                .as_str()
+                .ok_or_else(|| DomainError::InvalidInput("web tool call".into()))?;
+            let args = &call["arguments"];
+            let (scope, profile) = {
+                let state = self.state()?;
+                let configuration = state.configuration();
+                (
+                    Scope {
+                        workspace: self.cwd.clone(),
+                        session: self.session.as_str().into(),
+                        epoch: state.stamp().epoch(),
+                        revision: state.journal_revision(),
+                    },
+                    research::profile(configuration.context_limit() as f64, 0.0),
+                )
+            };
+            let (service, search) = self.web_services(&scope)?;
+            let mut registry = Registry::builtins()?;
+            let available = BTreeSet::from([name.to_owned()]);
+            registry.activate(&[name.to_owned()], &available)?;
+            let prepared = registry.prepare(operation, call_id, name, args, true)?;
+            let mut authorizer = Authorizer::new(operation)?;
+            let policy = Policy {
+                // Research is read-only, but Autonomous makes that explicit
+                // for the policy engine instead of silently bypassing it.
+                mode: ToolMode::Autonomous,
+                cwd: self.cwd.clone(),
+                planning_read_only_tools: None,
+                trusted_tools: vec![],
+                extension_tools: vec![],
+            };
+            let target = if name == "webSearch" {
+                search.target_revision().to_owned()
+            } else {
+                service.target_revision().to_owned()
+            };
+            let authorization = match authorizer.preflight(
+                prepared,
+                PreflightContext {
+                    scope: &scope,
+                    policy: &policy,
+                    policy_revision: 1,
+                    target_revision: &target,
+                    now: timestamp_ms,
+                    ttl: 60_000,
+                    untrusted_extensions: false,
+                },
+            )? {
+                Preflight::Ready(authorization) => authorization,
+                Preflight::Rejected(_) => return Err(DomainError::PermissionDenied),
+                // The policy currently marks public research as ready. Keep a
+                // hard failure here if that contract changes rather than
+                // manufacturing an approval from inside a model turn.
+                Preflight::Approval(_) => return Err(DomainError::PermissionDenied),
+            };
+            let mut artifacts = ContextStore::new(
+                self.store.as_ref(),
+                self.session.clone(),
+                &self.origin,
+                operation,
+                timestamp,
+                Features::default(),
+            )?;
+            let execution = WebExecution {
+                registry: &registry,
+                scope: &scope,
+                policy_revision: 1,
+                now: || timestamp_ms,
+                deadline: tokio::time::Instant::now() + WEB_TOOL_TIMEOUT,
+                cancel,
+                profile,
+            };
+            let outcome = if name == "webSearch" {
+                search
+                    .execute(
+                        authorization,
+                        execution,
+                        utc_year(timestamp_ms),
+                        &mut artifacts,
+                    )
+                    .await?
+            } else if name == "webFetch" {
+                service
+                    .execute(authorization, execution, &mut artifacts)
+                    .await?
+            } else {
+                return Err(DomainError::InvalidInput("web tool name".into()));
+            };
+            Ok::<Value, DomainError>(web_tool_result(call, outcome.result))
+        }
+        .await;
+        result.unwrap_or_else(|error| web_tool_error_result(call, error))
+    }
+
+    fn web_services(
+        &self,
+        scope: &Scope,
+    ) -> Result<
+        (
+            Arc<WebService<SystemResolver>>,
+            Arc<SearchService<SystemResolver>>,
+        ),
+        DomainError,
+    > {
+        let mut state = self
+            .web
+            .lock()
+            .map_err(|_| DomainError::Unavailable("web service state".into()))?;
+        let stale = state.as_ref().is_none_or(|web| {
+            web.workspace != scope.workspace
+                || web.session != scope.session
+                || web.epoch != scope.epoch
+        });
+        if stale {
+            let incarnation = format!("ag1w-web-{}", scope.epoch);
+            let fetch = Arc::new(WebService::new(
+                WebHttp::new(WebPolicy::default()),
+                scope.clone(),
+                &incarnation,
+                BTreeMap::new(),
+            )?);
+            let search = Arc::new(SearchService::new(
+                fetch.clone(),
+                SearchConfig::default(),
+                &format!("ag1w-search-{}", scope.epoch),
+            )?);
+            *state = Some(LocalWeb {
+                workspace: scope.workspace.clone(),
+                session: scope.session.clone(),
+                epoch: scope.epoch,
+                fetch,
+                search,
+            });
+        }
+        let web = state.as_ref().expect("web state initialized");
+        Ok((web.fetch.clone(), web.search.clone()))
     }
 
     fn validate_local_turn(input: &LocalTurnInput) -> Result<(), DomainError> {
@@ -2547,6 +2832,12 @@ mod tests {
         assert_eq!(definitions[2]["name"], "search_project_files");
         assert_eq!(definitions[3]["name"], "edit_project_file");
         assert_eq!(definitions[4]["name"], "write_project_file");
+
+        let web = LocalProjectTools::web_definitions();
+        assert_eq!(web.len(), 2);
+        assert_eq!(web[0]["name"], "webSearch");
+        assert_eq!(web[1]["name"], "webFetch");
+        assert_eq!(web[0]["parameters"]["required"], json!(["query"]));
 
         let listed = tools.execute(&json!({
             "id":"list-project",
