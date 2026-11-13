@@ -2561,6 +2561,22 @@ impl NativeHost {
                 true,
             ));
         }
+        // MCP exposes only a two-tool discovery/call gateway. The actual
+        // server catalog stays out of the model context until mcpSearch asks
+        // for a relevant slice, matching the turn runner below.
+        let mcp_scope = if active.workspace.is_some() {
+            CatalogScope::Workspace(active.workspace_scope.clone())
+        } else {
+            CatalogScope::GeneralChat
+        };
+        let has_mcp_tools = self
+            .inner
+            .mcp
+            .has_callable_tools(&mcp_scope)
+            .map_err(describe)?;
+        if has_mcp_tools {
+            tools.extend(McpToolSurface::request_definitions());
+        }
         let mut capabilities = vec![
             "local-llamacpp-chat",
             "durable-session",
@@ -2569,6 +2585,9 @@ impl NativeHost {
             "project-file-browser",
             "web-research",
         ];
+        if has_mcp_tools {
+            capabilities.push("reviewed-mcp-tools");
+        }
         if active.workspace.is_some() {
             capabilities.push("project-read-tools");
             capabilities.push(if write_access == ProjectWriteAccess::AllowWrites {

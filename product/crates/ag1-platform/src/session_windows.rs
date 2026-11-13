@@ -170,7 +170,7 @@ impl McpToolSurface {
         Self { manager, scope }
     }
 
-    fn request_definitions() -> Vec<Value> {
+    pub fn request_definitions() -> Vec<Value> {
         vec![
             json!({
                 "name":"mcpSearch",
