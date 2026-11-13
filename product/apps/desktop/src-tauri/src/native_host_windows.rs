@@ -170,7 +170,19 @@ impl LiveActivity {
                 self.touch();
             }
             ProviderEvent::Delta { key, text } => self.write_text(key, text, false),
-            ProviderEvent::Replace { key, text, .. } => self.write_text(key, text, true),
+            ProviderEvent::Replace {
+                key,
+                text,
+                signature,
+            } => {
+                // A replacement with `signature` updates metadata the provider
+                // needs for a later tool round. It is not visible model text.
+                // Treating it as text replaced streamed Qwen reasoning with the
+                // literal field name "reasoning_content".
+                if !signature {
+                    self.write_text(key, text, true);
+                }
+            }
             ProviderEvent::ToolIdentity { key, id, name } => {
                 let key = self.block_key(key);
                 if let Some(block) = self.blocks.iter_mut().find(|block| block["key"] == key) {
@@ -4080,6 +4092,11 @@ mod tests {
         live.observe(&ProviderEvent::Delta {
             key: "reason".into(),
             text: "Read the project first.".into(),
+        });
+        live.observe(&ProviderEvent::Replace {
+            key: "reason".into(),
+            text: "reasoning_content".into(),
+            signature: true,
         });
         live.observe(&ProviderEvent::Begin {
             key: "call".into(),
