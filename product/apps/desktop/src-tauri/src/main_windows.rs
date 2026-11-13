@@ -31,6 +31,10 @@ use windows_sys::Win32::UI::Shell::{
 
 struct Desktop {
     host: NativeHost,
+    // GitHub credentials remain in GitHub CLI's own store. AG1W retains only
+    // connection state and exact, expiring request confirmations.
+    github: Arc<ag1_platform::github::GitHub>,
+    transition: tokio::sync::Mutex<()>,
     // Sidebar metadata is deliberately separate from the durable message
     // journal. A damaged sidebar must never damage a conversation.
     catalog: Mutex<Value>,
@@ -1142,11 +1146,118 @@ async fn choose_chat_folder(
 async fn github_command(
     window: tauri::Window,
     state: tauri::State<'_, Arc<Desktop>>,
-    _action: String,
-    _args: Value,
+    action: String,
+    args: Value,
 ) -> Result<Value, String> {
     local(&window)?;
-    Err(state.host.unsupported("GitHub integration"))
+    let state = state.inner().clone();
+
+    // Schemas and the catalog are bundled data. They never log in, make a
+    // request, or expose an account to the renderer.
+    if action == "api_schema" {
+        return ag1_platform::github::schemas::get(args["id"].as_str().unwrap_or(""));
+    }
+    if action == "api_search" {
+        return ag1_platform::github::schemas::search(
+            args["query"].as_str().unwrap_or(""),
+            args["page"].as_u64().unwrap_or(0) as usize,
+        );
+    }
+    if action == "api_cancel" {
+        state.github.shared(state.host.state_path())?.cancel();
+        return Ok(json!({"cancelled":true}));
+    }
+
+    if matches!(
+        action.as_str(),
+        "capabilities"
+            | "api_read"
+            | "api_preview"
+            | "api_confirm"
+            | "api_dismiss"
+            | "repos"
+            | "issues"
+            | "pulls"
+            | "runs"
+            | "files"
+            | "item"
+            | "pull_review"
+    ) {
+        if action == "capabilities" {
+            return Ok(ag1_platform::github::operations::catalog());
+        }
+
+        // One UI transition at a time keeps previews tied to a stable chat
+        // scope and prevents a double-click from publishing two operations.
+        let _transition = state.transition.lock().await;
+        let scope = state.host.github_scope()?;
+        let state_path = state.host.state_path().to_owned();
+        let service = state.github.shared(&state_path)?;
+        return tauri::async_runtime::spawn_blocking(move || {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let control = ag1_platform::resource_fs::ScanControl {
+                cancel: &cancel,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            };
+            if [
+                "repos",
+                "issues",
+                "pulls",
+                "runs",
+                "files",
+                "item",
+                "pull_review",
+            ]
+            .contains(&action.as_str())
+            {
+                return ag1_platform::github::browse::read(
+                    &service, &action, &args, &scope, &control,
+                )
+                .map_err(|error| error.message.to_string());
+            }
+            let result = match action.as_str() {
+                "api_read" => {
+                    let request = serde_json::from_value(args)
+                        .map_err(|_| "Invalid GitHub read operation".to_string())?;
+                    service
+                        .read(vec![request], &scope, &control)
+                        .map(|mut replies| serde_json::to_value(replies.remove(0)).unwrap())
+                }
+                "api_preview" => {
+                    let request = serde_json::from_value(args)
+                        .map_err(|_| "Invalid GitHub operation".to_string())?;
+                    service.preview(request, &scope, &control)
+                }
+                "api_confirm" => service
+                    .confirm(
+                        args["confirmation"].as_str().unwrap_or(""),
+                        &scope,
+                        &control,
+                    )
+                    .map(|reply| serde_json::to_value(reply).unwrap()),
+                _ => {
+                    service.dismiss(args["confirmation"].as_str().unwrap_or(""));
+                    Ok(json!({"dismissed":true}))
+                }
+            };
+            Ok(match result {
+                Ok(value) => json!({"ok":true,"value":value}),
+                Err(error) => json!({"ok":false,"error":error}),
+            })
+        })
+        .await
+        .map_err(|_| "GitHub action interrupted".to_string())?;
+    }
+
+    if matches!(action.as_str(), "local" | "checkout" | "push" | "clone") {
+        return Err("Local Git checkout and push are not ported to AG1W yet.".into());
+    }
+
+    let state_path = state.host.state_path().to_owned();
+    let github = state.github.clone();
+    tauri::async_runtime::spawn_blocking(move || github.request(&state_path, &action, args, None))
+        .await
+        .map_err(|_| "GitHub action interrupted".to_string())?
 }
 
 #[tauri::command]
@@ -1203,6 +1314,8 @@ async fn quit(
     state: tauri::State<'_, Arc<Desktop>>,
 ) -> Result<(), String> {
     local(&window)?;
+    state.github.shutdown();
+    state.github.wait_stopped()?;
     state.host.shutdown().await?;
     app.exit(0);
     Ok(())
@@ -1218,6 +1331,8 @@ pub fn run() {
     let loaded_catalog = read_catalog(&catalog_path).expect("AG1W sidebar catalog unavailable");
     let desktop = Arc::new(Desktop {
         host,
+        github: Arc::new(ag1_platform::github::GitHub::default()),
+        transition: tokio::sync::Mutex::new(()),
         catalog: Mutex::new(loaded_catalog),
         catalog_path,
     });
@@ -1254,8 +1369,11 @@ pub fn run() {
                 // Job-owned runtime reports its shutdown result.
                 api.prevent_close();
                 let host = window.state::<Arc<Desktop>>().host.clone();
+                let github = window.state::<Arc<Desktop>>().github.clone();
                 let app = window.app_handle().clone();
                 tauri::async_runtime::spawn(async move {
+                    github.shutdown();
+                    let _ = github.wait_stopped();
                     let _ = host.shutdown().await;
                     app.exit(0);
                 });

@@ -131,7 +131,7 @@ impl Store {
         }
         let id = format!(
             "download-{}",
-            crate::client::nonce()
+            crate::random_nonce()
                 .map_err(|_| ApiError::new("unavailable", "Cannot retain this download."))?
         );
         let extension = if op.id == "actions.download_job_log" {

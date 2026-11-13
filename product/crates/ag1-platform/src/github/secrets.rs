@@ -19,10 +19,11 @@ pub const TARGETS: &[&str] = &[
     "agents_repository",
     "agents_organization",
 ];
+#[cfg(target_os = "linux")]
 #[link(name = "sodium")]
 unsafe extern "C" {
     fn sodium_init() -> i32;
-    fn sodium_memzero(p: *mut libc::c_void, len: usize);
+    fn sodium_memzero(p: *mut std::ffi::c_void, len: usize);
     fn crypto_box_publickeybytes() -> usize;
     fn crypto_box_sealbytes() -> usize;
     fn crypto_box_seal(c: *mut u8, m: *const u8, len: u64, pk: *const u8) -> i32;
@@ -30,8 +31,16 @@ unsafe extern "C" {
 pub struct Secret(Vec<u8>);
 impl Drop for Secret {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         unsafe {
             sodium_memzero(self.0.as_mut_ptr().cast(), self.0.len());
+        }
+        #[cfg(windows)]
+        {
+            // This is a best-effort erase for the short-lived value. AG1W does
+            // not yet expose native GitHub secret entry, so Windows never
+            // creates this value through the UI.
+            self.0.fill(0);
         }
     }
 }
@@ -46,6 +55,7 @@ impl Secret {
         }
         Ok(secret)
     }
+    #[cfg(target_os = "linux")]
     pub fn seal(&self, public_key: &str) -> Result<String> {
         let key = base64::engine::general_purpose::STANDARD
             .decode(public_key)
@@ -70,6 +80,17 @@ impl Secret {
             }
             Ok(base64::engine::general_purpose::STANDARD.encode(encrypted))
         }
+    }
+
+    #[cfg(windows)]
+    pub fn seal(&self, _public_key: &str) -> Result<String> {
+        // The Linux desktop uses a tightly scoped native secret-entry dialog
+        // and libsodium. Do not fake that guarantee on Windows until its
+        // equivalent entry flow exists.
+        Err(ApiError::new(
+            "unsupported",
+            "GitHub secret writes are not available in AG1W yet.",
+        ))
     }
 }
 fn invalid_key() -> ApiError {

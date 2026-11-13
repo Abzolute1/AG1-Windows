@@ -58,6 +58,7 @@ impl Drop for Child {
     }
 }
 
+#[cfg(not(windows))]
 fn token(control: &ScanControl<'_>) -> Result<Token> {
     check(control)?;
     let mut command = super::gh();
@@ -129,6 +130,78 @@ fn token(control: &ScanControl<'_>) -> Result<Token> {
         bytes.0.pop();
     }
     if bytes.0.is_empty() || !bytes.0.iter().all(|b| b.is_ascii_graphic()) {
+        return Err(ApiError::new("credentials", "Invalid GitHub credential."));
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn token(control: &ScanControl<'_>) -> Result<Token> {
+    check(control)?;
+    let mut command = super::gh();
+    command
+        .args(["auth", "token", "--hostname", "github.com"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .stdout(Stdio::piped());
+    let mut child =
+        Child(command.spawn().map_err(|_| {
+            ApiError::new("missing_cli", "Install GitHub CLI, then reconnect GitHub.")
+        })?);
+    let mut pipe = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| ApiError::new("credentials", "Cannot read GitHub credentials."))?;
+
+    // Windows does not expose the Unix non-blocking pipe flag. Read the small
+    // credential response on one thread while this thread keeps honoring the
+    // desktop cancel/deadline contract.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = pipe
+            .by_ref()
+            .take(8193)
+            .read_to_end(&mut output)
+            .map(|_| output)
+            .map_err(|_| ());
+        let _ = sender.send(result);
+    });
+
+    let deadline = control
+        .deadline
+        .min(Instant::now() + Duration::from_secs(15));
+    let status =
+        loop {
+            check(control)?;
+            if Instant::now() >= deadline {
+                return Err(ApiError::new(
+                    "credentials_timeout",
+                    "GitHub credential store did not respond.",
+                ));
+            }
+            if let Some(status) = child.0.try_wait().map_err(|_| {
+                ApiError::new("credentials", "GitHub credential helper interrupted.")
+            })? {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        };
+    if !status.success() {
+        return Err(ApiError::new("reauthenticate", "Sign in to GitHub again."));
+    }
+
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let output = receiver
+        .recv_timeout(remaining)
+        .map_err(|_| ApiError::new("credentials", "Cannot read GitHub credentials."))?
+        .map_err(|_| ApiError::new("credentials", "Cannot read GitHub credentials."))?;
+    let mut bytes = Token(output);
+    while bytes.0.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes.0.pop();
+    }
+    if bytes.0.is_empty() || !bytes.0.iter().all(|byte| byte.is_ascii_graphic()) {
         return Err(ApiError::new("credentials", "Invalid GitHub credential."));
     }
     Ok(bytes)

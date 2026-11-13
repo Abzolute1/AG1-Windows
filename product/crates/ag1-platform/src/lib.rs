@@ -7,7 +7,7 @@ pub mod diagnostics;
 pub mod executor;
 #[cfg(target_os = "linux")]
 pub mod git;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod github;
 pub mod llama;
 #[cfg(any(target_os = "linux", windows))]
@@ -51,6 +51,45 @@ pub(crate) fn io_error(error: std::io::Error) -> ag1_core::DomainError {
         std::io::ErrorKind::TimedOut => DomainError::TimedOut,
         _ => DomainError::Io(error.to_string()),
     }
+}
+
+pub(crate) fn random_nonce() -> Result<String, ag1_core::DomainError> {
+    let mut bytes = [0; 16];
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut file| file.read_exact(&mut bytes))
+            .map_err(io_error)?;
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Security::Cryptography::{
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+        };
+
+        // CNG is the Windows CSPRNG. GitHub uses this value only to bind a
+        // connection or approval to one local desktop session.
+        let result = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len().try_into().map_err(|_| {
+                    ag1_core::DomainError::LimitExceeded("random nonce length".into())
+                })?,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if result != 0 {
+            return Err(ag1_core::DomainError::Unavailable(
+                "Windows system random generator".into(),
+            ));
+        }
+    }
+
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 pub mod source;

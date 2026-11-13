@@ -97,11 +97,7 @@ impl Clock for WallClock {
     }
 }
 pub fn nonce() -> Result<String> {
-    let mut bytes = [0; 16];
-    fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(crate::io_error)?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    crate::random_nonce()
 }
 
 /// Explicit host configuration, loaded from a private file by CLI/Tauri. Models

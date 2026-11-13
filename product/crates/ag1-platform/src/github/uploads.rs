@@ -429,8 +429,11 @@ mod tests {
         let mut large = request.clone();
         large.parameters.insert("path".into(), json!("large.bin"));
         assert!(Upload::capture(&large, root.clone(), grant.clone(), 1, &budget, &c).is_err());
-        std::fs::remove_file(root.root().join("owned.bin")).unwrap();
-        std::os::unix::fs::symlink("outside", root.root().join("owned.bin")).unwrap();
-        assert!(Upload::capture(&request, root, grant, 1, &budget, &c).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::remove_file(root.root().join("owned.bin")).unwrap();
+            std::os::unix::fs::symlink("outside", root.root().join("owned.bin")).unwrap();
+            assert!(Upload::capture(&request, root, grant, 1, &budget, &c).is_err());
+        }
     }
 }

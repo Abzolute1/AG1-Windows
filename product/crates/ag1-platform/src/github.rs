@@ -22,6 +22,7 @@ mod credential_fields;
 pub mod downloads;
 mod graph_mutations;
 mod graph_reads;
+#[cfg(target_os = "linux")]
 pub mod local;
 mod model_contract;
 pub mod operations;
@@ -47,11 +48,11 @@ struct Login {
     code: Option<String>,
     error: Option<String>,
 }
-fn own_group(cmd: &mut Command) {
+fn own_group(_cmd: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        _cmd.process_group(0);
     }
 }
 fn stop_child(child: &mut std::process::Child) {
@@ -209,17 +210,42 @@ fn connected(state: &Path) -> bool {
     state.join("github-connected").is_file()
 }
 fn mark(state: &Path) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     let generation =
-        crate::client::nonce().map_err(|_| "Cannot create GitHub connection identity")?;
+        crate::random_nonce().map_err(|_| "Cannot create GitHub connection identity")?;
+    let path = state.join("github-connected");
+
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    #[cfg(target_os = "linux")]
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(state.join("github-connected"))
+        .open(&path)
         .map_err(|_| "Cannot save GitHub connection")?;
+
+    #[cfg(windows)]
+    let mut file = {
+        // The state folder is private to AG1W. Reject a pre-existing reparse
+        // point before opening it so the durable connection marker cannot be
+        // redirected somewhere outside that folder.
+        if fs::symlink_metadata(&path)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err("Cannot save GitHub connection".into());
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|_| "Cannot save GitHub connection")?
+    };
+
     file.write_all(format!("github.com\n{generation}\n").as_bytes())
         .and_then(|_| file.sync_all())
         .map_err(|_| "Cannot save GitHub connection".into())

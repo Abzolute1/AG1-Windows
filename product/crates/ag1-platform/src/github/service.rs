@@ -493,17 +493,46 @@ impl Service {
             return Err(ApiError::new("closed", "GitHub is shutting down."));
         }
         use std::io::Read;
+        let path = self.state.join("github-connected");
+
+        #[cfg(target_os = "linux")]
         use std::os::unix::fs::OpenOptionsExt;
+
+        #[cfg(target_os = "linux")]
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(self.state.join("github-connected"))
+            .open(&path)
             .map_err(|_| {
                 ApiError::new(
                     "disconnected",
                     "Connect GitHub before requesting account data.",
                 )
             })?;
+
+        #[cfg(windows)]
+        let mut file = {
+            // See `github::mark`: AG1W keeps this marker under its private
+            // state directory and does not follow a pre-existing reparse point.
+            if std::fs::symlink_metadata(&path)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                return Err(ApiError::new(
+                    "connection_state",
+                    "Reconnect GitHub to refresh its connection state.",
+                ));
+            }
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .map_err(|_| {
+                    ApiError::new(
+                        "disconnected",
+                        "Connect GitHub before requesting account data.",
+                    )
+                })?
+        };
         let mut bytes = Vec::new();
         file.by_ref()
             .take(4097)
@@ -582,7 +611,7 @@ impl Service {
         generation: Vec<u8>,
         scope: &str,
     ) -> Result<Prepared> {
-        let nonce = crate::client::nonce()
+        let nonce = crate::random_nonce()
             .map_err(|_| ApiError::new("unavailable", "Cannot create GitHub admission."))?;
         let revision = format!(
             "github-{:x}",

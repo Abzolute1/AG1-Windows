@@ -409,6 +409,16 @@ impl NativeHost {
         &self.inner.state
     }
 
+    pub fn github_scope(&self) -> Result<String, String> {
+        // A GitHub preview belongs to the current chat. Changing chats gives
+        // it a different scope, so an old confirmation cannot be reused.
+        let active = self.active()?;
+        Ok(active
+            .as_ref()
+            .map(|session| format!("chat:{}", session.id.as_str()))
+            .unwrap_or_else(|| "desktop-account".into()))
+    }
+
     pub fn models(&self) -> Result<Value, String> {
         let config = self.config()?;
         let models = config
@@ -4711,6 +4721,22 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn github_previews_are_scoped_to_the_active_chat() {
+        let state = tempdir().unwrap();
+        let config = write_fixture_config(state.path(), "github-fixture");
+        let host = NativeHost::open_from_config(state.path().to_path_buf(), config).unwrap();
+
+        // Account browsing can start before a chat, but a pending preview must
+        // become stale once the user moves to another local conversation.
+        assert_eq!(host.github_scope().unwrap(), "desktop-account");
+        host.open_general().unwrap();
+        let first = host.github_scope().unwrap();
+        assert!(first.starts_with("chat:win-session-"));
+        host.new_chat().unwrap();
+        assert_ne!(first, host.github_scope().unwrap());
     }
 
     #[test]

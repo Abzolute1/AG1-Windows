@@ -55,6 +55,9 @@ pub(super) fn execute(
         })
     })
 }
-#[cfg(test)]
+// This fixture verifies the Linux native secret-entry path against libsodium.
+// AG1W deliberately leaves secret writes unavailable until it has an equivalent
+// Windows-native entry flow, so it must not pull a Unix-only linker dependency.
+#[cfg(all(test, target_os = "linux"))]
 #[path = "secret_transport_fixture.rs"]
 mod fixture;
