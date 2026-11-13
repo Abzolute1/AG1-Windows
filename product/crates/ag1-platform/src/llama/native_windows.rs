@@ -286,11 +286,22 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
             std::process::id(),
             self.serial
         ));
+        let mut environment = plan.environment.clone();
+        // The captured profile intentionally does not inherit the user's full
+        // environment. Windows still needs these system values for its loader,
+        // CUDA driver, and temporary-file APIs; none exposes a user secret.
+        for name in ["SystemRoot", "SystemDrive", "TEMP", "TMP"] {
+            if !environment.contains_key(name)
+                && let Some(value) = std::env::var_os(name)
+            {
+                environment.insert(name.to_owned(), value.to_string_lossy().into_owned());
+            }
+        }
         let spec = ProcessSpec {
             executable: PathBuf::from(&plan.command),
             argv: plan.args.clone(),
             cwd: self.private_dir.clone(),
-            env: plan.environment.clone(),
+            env: environment,
             timeout_ms: 86_400_000,
             grace_ms: 1000,
             resident: true,
@@ -317,12 +328,27 @@ impl<O: FnMut(&LaunchPlan) -> Result<Observation, DomainError>> RuntimeHost
     fn owned_alive(&mut self, handle: &Self::Handle) -> Result<bool, DomainError> {
         // A live Windows process handle names one kernel process object. Unlike a
         // PID, it cannot become a handle to a later process after an exit.
-        handle
+        let mut process = handle
             .process
             .lock()
-            .map_err(|_| DomainError::Unavailable("runtime handle poisoned".into()))?
-            .try_wait()
-            .map(|status| status.is_none())
+            .map_err(|_| DomainError::Unavailable("runtime handle poisoned".into()))?;
+        let status = process.try_wait()?;
+        if let Some(status) = status {
+            // llama.cpp writes the useful explanation to its captured output.
+            // Surface its tail instead of making a failed load look mysterious.
+            let tail = String::from_utf8_lossy(&process.tail(8 * 1024)?.bytes)
+                .trim()
+                .to_owned();
+            let detail = if tail.is_empty() {
+                "no diagnostic was written".to_owned()
+            } else {
+                tail
+            };
+            return Err(DomainError::Unavailable(format!(
+                "llama-server exited with {status:?}: {detail}"
+            )));
+        }
+        Ok(true)
     }
 
     fn generation_idle(

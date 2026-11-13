@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 // AG1W has its own composition host. The original desktop host remains intact
 // for Linux, where its TypeScript worker and Linux-only integrations exist.
 #[cfg(not(windows))]

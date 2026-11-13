@@ -422,12 +422,12 @@ fn desktop_preferences(
 #[tauri::command]
 async fn model_reasoning(
     window: tauri::Window,
-    _state: tauri::State<'_, Arc<Desktop>>,
-    _provider: String,
-    _id: String,
+    state: tauri::State<'_, Arc<Desktop>>,
+    provider: String,
+    id: String,
 ) -> Result<Value, String> {
     local(&window)?;
-    Ok(json!({"kind":"unsupported","modes":[],"source":"windows-native-local"}))
+    state.host.reasoning_controls(&provider, &id)
 }
 
 #[tauri::command]
@@ -563,14 +563,23 @@ async fn bridge_command(
         Command::Runtime { action, args } if action == "load_model" => {
             let provider = args["provider"].as_str().ok_or("Missing model provider")?;
             let id = args["model_id"].as_str().ok_or("Missing model ID")?;
-            match state.host.load_model(provider, id).await {
-                Ok(view) => reply(
-                    &envelope,
-                    &view,
-                    "accepted",
-                    true,
-                    json!({"kind":"settled","operation":{"operation":"local-model-load","status":"completed"}}),
-                ),
+            match state.host.begin_model_load(provider, id) {
+                Ok(()) => {
+                    // Loading a 22 GiB model can take minutes. Acknowledge the
+                    // click now; `bridge_view` exposes the verified live phase.
+                    let host = state.host.clone();
+                    let model = id.to_owned();
+                    tauri::async_runtime::spawn(async move {
+                        let _ = host.run_started_model_load(model).await;
+                    });
+                    reply(
+                        &envelope,
+                        &current_view(&state)?,
+                        "accepted",
+                        false,
+                        json!({"kind":"accepted","operation":{"operation":"local-model-load","status":"running"}}),
+                    )
+                }
                 Err(error) => reject(&envelope, &before, error),
             }
         }

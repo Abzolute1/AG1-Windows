@@ -250,8 +250,16 @@ export default function App() {
     try {
       await ensureChat(pick);
       await run({ kind: "runtime", action: "load_model", args: { provider: pick.provider, model_id: pick.id } });
-    } finally { setModelLoad(null); }
+      // The host accepted the load and now reports the real phase through the
+      // normal live view. Keep this small local marker until that phase settles.
+    } catch (error) {
+      setModelLoad(null);
+      throw error;
+    }
   }
+  useEffect(() => {
+    if (modelLoad && preparation?.model === modelLoad.model && ["ready", "failed"].includes(preparation.phase)) setModelLoad(null);
+  }, [modelLoad, preparation]);
   async function newChat() {
     const previousDraft = draft, previousAttachments = attachments; preserveDraft(); setNavigating("New chat");
     try { const opened = !activeRef.current ? await openWorkspace() : undefined; if (activeRef.current?.message_count || executing) await selectConversation(undefined, !!(opened?.details ?? view.details)); setApproval(savedApproval()); setConfirmBypass(false); setSubmitted(null); setDraft(current => current === previousDraft ? "" : current); setAttachments(current => current === previousAttachments ? [] : current); }

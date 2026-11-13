@@ -380,6 +380,21 @@ impl NativeHost {
         json!({"approval_mode":mode})
     }
 
+    /// Return the capability for one configured local model. Keeping this in
+    /// the host means the picker and the model catalog cannot disagree.
+    pub fn reasoning_controls(&self, provider: &str, id: &str) -> Result<Value, String> {
+        let config = self.config()?;
+        let model = config
+            .as_ref()
+            .and_then(|config| {
+                config.models.iter().find(|model| {
+                    model["provider"].as_str() == Some(provider) && model["id"].as_str() == Some(id)
+                })
+            })
+            .ok_or("That model is not in AG1W's local catalog")?;
+        Ok(model_reasoning_controls(model))
+    }
+
     /// Give the sidebar the current native chat's state without rebuilding its
     /// history. AG1W owns one local generation at a time, so idle chats do not
     /// need entries here; the sidebar already has their durable metadata.
@@ -1651,33 +1666,39 @@ impl NativeHost {
         }
     }
 
-    /// Load the selected model without making a chat request. This remains
-    /// unavailable for an attached server because AG1W cannot prove it owns
-    /// that process or report meaningful verification progress for it.
-    pub async fn load_model(&self, provider: &str, id: &str) -> Result<Value, String> {
+    /// Reserve the current chat for an explicit model load. The slow work runs
+    /// after the desktop command returns, so the UI can keep polling progress
+    /// instead of timing out while llama.cpp maps a large GGUF.
+    pub fn begin_model_load(&self, provider: &str, id: &str) -> Result<(), String> {
         self.ensure_session()?;
-        self.ensure_runtime().await?;
-        let runtime = self.runtime()?.ok_or(
-            "Loading requires a sealed AG1W runtime capture. An attached local server can answer prompts, but AG1W does not own or load it.",
-        )?;
-
-        {
-            let mut active = self.active()?;
-            let active = active.as_mut().ok_or("Open a local chat first")?;
-            if active.busy || active.loading {
-                return Err("The local model is already working on this chat".into());
-            }
-            if active.model["provider"].as_str() != Some(provider)
-                || active.model["id"].as_str() != Some(id)
-            {
-                return Err("Choose that model before loading it".into());
-            }
-            active.loading = true;
-            active.progress = format!("Preparing owned local model · {id}");
-            active.diagnostic = None;
+        let mut active = self.active()?;
+        let active = active.as_mut().ok_or("Open a local chat first")?;
+        if active.busy || active.loading {
+            return Err("The local model is already working on this chat".into());
         }
+        if active.model["provider"].as_str() != Some(provider)
+            || active.model["id"].as_str() != Some(id)
+        {
+            return Err("Choose that model before loading it".into());
+        }
+        active.loading = true;
+        active.progress = format!("Preparing owned local model · {id}");
+        active.diagnostic = None;
+        Ok(())
+    }
 
-        let outcome = runtime.load_model(id).await;
+    /// Complete a model load reserved by `begin_model_load`. This method owns
+    /// the terminal state so either a manual load or a normal first prompt
+    /// leaves the chat usable again after a server error.
+    pub async fn run_started_model_load(&self, id: String) -> Result<Value, String> {
+        let outcome = async {
+            self.ensure_runtime().await?;
+            let runtime = self.runtime()?.ok_or(
+                "Loading requires a sealed AG1W runtime capture. An attached local server can answer prompts, but AG1W does not own or load it.",
+            )?;
+            runtime.load_model(&id).await.map_err(describe)
+        }
+        .await;
         let mut active = self.active()?;
         if let Some(active) = active.as_mut() {
             active.loading = false;
@@ -1687,8 +1708,15 @@ impl NativeHost {
             }
         }
         drop(active);
-        outcome.map_err(describe)?;
+        outcome?;
         self.view()
+    }
+
+    /// Keep the direct Rust API useful for tests and callers that do not use
+    /// the Tauri command queue. The desktop uses the two-stage form above.
+    pub async fn load_model(&self, provider: &str, id: &str) -> Result<Value, String> {
+        self.begin_model_load(provider, id)?;
+        self.run_started_model_load(id.to_owned()).await
     }
 
     /// Stop the current local request. The cancellation token exists before
@@ -3010,7 +3038,7 @@ fn prepare_runtime_setup(
         "contextWindow": plan.requested_context,
         "maxTokens": plan.max_tokens,
         "input": if plan.projector.is_some() { json!(["text", "image"]) } else { json!(["text"]) },
-        "reasoning": false,
+        "reasoning": model_supports_thinking(&input.model_id),
     });
     let (mut saved_models, mut captures, process_host, system_prompt, extra) = match existing {
         Some(config) => {
@@ -3201,14 +3229,38 @@ fn same_local_model(candidate: &Value, saved: &Value) -> bool {
     .all(|field| candidate[*field] == saved[*field])
 }
 
+fn model_supports_thinking(id: &str) -> bool {
+    // The local Qwen profiles use the model's Qwen chat template. It emits
+    // reasoning natively; AG1W does not need a cloud-provider effort setting.
+    id.starts_with("Qwen3.")
+}
+
+fn model_reasoning_controls(model: &Value) -> Value {
+    let supported = model["reasoning"].as_bool() == Some(true)
+        || model["id"].as_str().is_some_and(model_supports_thinking);
+    if supported {
+        // This is intentionally one fixed mode. The copied llama.cpp profile
+        // enables Qwen thinking at the template level, and pretending it has
+        // selectable cloud-style effort levels would make the UI lie.
+        json!({
+            "kind":"unknown",
+            "modes":[{"id":"on","label":"On","level":"high"}],
+            "source":"qwen-chat-template"
+        })
+    } else {
+        json!({"kind":"unsupported","modes":[],"source":"windows-native-local"})
+    }
+}
+
 fn public_model(model: &Value) -> Value {
+    let controls = model_reasoning_controls(model);
     json!({
         "id":model["id"],
         "provider":model["provider"],
         "contextWindow":model["contextWindow"],
         "input":model["input"],
-        "reasoning":false,
-        "reasoningControls":{"kind":"unsupported","modes":[],"source":"windows-native-local"},
+        "reasoning":controls["kind"] != "unsupported",
+        "reasoningControls":controls,
     })
 }
 
@@ -3555,6 +3607,21 @@ mod tests {
         thread,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn qwen_local_models_report_native_thinking() {
+        // Existing state files from before this fix stored reasoning as false.
+        // The model family is the source of truth for those old entries.
+        let qwen = json!({
+            "id": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
+            "reasoning": false
+        });
+        let other = json!({"id": "plain-local-model", "reasoning": false});
+
+        assert_eq!(model_reasoning_controls(&qwen)["kind"], "unknown");
+        assert_eq!(model_reasoning_controls(&qwen)["modes"][0]["id"], "on");
+        assert_eq!(model_reasoning_controls(&other)["kind"], "unsupported");
+    }
 
     fn write_fixture_config(state: &Path, id: &str) -> PathBuf {
         let path = state.join("native-host.json");
