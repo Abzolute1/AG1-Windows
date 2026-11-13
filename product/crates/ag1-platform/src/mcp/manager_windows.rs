@@ -28,6 +28,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc::{self, SyncSender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -121,6 +122,9 @@ struct View {
 
 struct Control {
     cancelled: AtomicBool,
+    // A stdio MCP server has one ordered request stream. Keeping this busy flag
+    // beside that stream prevents two model turns from interleaving JSON-RPC.
+    busy: AtomicBool,
     view: Mutex<View>,
 }
 
@@ -140,8 +144,17 @@ impl Control {
 }
 
 struct Worker {
+    sender: SyncSender<Command>,
     control: Arc<Control>,
     join: Option<JoinHandle<()>>,
+}
+
+// The manager accepts only this small, validated command. The renderer and
+// model never receive a process handle or a raw stdio pipe.
+struct Command {
+    name: String,
+    arguments: Value,
+    reply: SyncSender<Result<Value, DomainError>>,
 }
 
 impl Worker {
@@ -519,8 +532,13 @@ impl Manager {
         }
 
         let id = new_id();
+        // One waiting command is enough: an MCP process is serial by design,
+        // and a second tool request should fail cleanly instead of queueing
+        // behind an unknown operation for an unbounded time.
+        let (sender, receiver) = mpsc::sync_channel(1);
         let control = Arc::new(Control {
             cancelled: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             view: Mutex::new(View {
                 status: ConnectionStatus {
                     id: id.clone(),
@@ -552,6 +570,7 @@ impl Manager {
                         digest,
                         limits,
                         worker_control.clone(),
+                        receiver,
                     )
                 }));
                 if result.is_err() {
@@ -562,6 +581,7 @@ impl Manager {
         state.live.insert(
             id.clone(),
             Worker {
+                sender,
                 control,
                 join: Some(join),
             },
@@ -616,6 +636,208 @@ impl Manager {
             );
         }
         Ok(connections)
+    }
+
+    /// True only when this chat scope has a reviewed, ready connection with at
+    /// least one schema-supported tool. It does not start a process or refresh
+    /// a catalog, so adding this check to a model turn is cheap and inert.
+    pub fn has_callable_tools(&self, scope: &CatalogScope) -> Result<bool, DomainError> {
+        self.reap_finished()?;
+        let state = self.state()?;
+        for worker in state.live.values() {
+            let view = worker
+                .control
+                .view
+                .lock()
+                .map_err(|_| DomainError::Conflict)?;
+            let Some(record) = state.records.servers.get(&view.status.server_id) else {
+                continue;
+            };
+            if view.status.health != ConnectionHealth::Ready
+                || view.status.inspection_only
+                || &view.status.scope != scope
+                || !record.availability.allows(scope)
+                || worker.control.cancelled.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            let Some(catalog) = &view.catalog else {
+                continue;
+            };
+            if record.configuration_revision() != catalog.binding.config_revision {
+                continue;
+            }
+            if catalog
+                .tools
+                .iter()
+                .any(|tool| selected_tool(&catalog.binding, tool).is_ok())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Search only metadata the user has already reviewed by connecting the
+    /// server. The returned schemas are limited to the small result set, so a
+    /// long MCP catalog is never stuffed into every model request.
+    pub fn search_tools(
+        &self,
+        scope: &CatalogScope,
+        query: &str,
+        limit: usize,
+    ) -> Result<Value, DomainError> {
+        if query.len() > 256 || query.chars().any(char::is_control) || !(1..=8).contains(&limit) {
+            return Err(invalid("MCP tool search bounds"));
+        }
+        self.reap_finished()?;
+        let state = self.state()?;
+        let query = query.to_lowercase();
+        let mut rows = Vec::new();
+        let mut found = 0usize;
+        for (connection, worker) in &state.live {
+            let view = worker
+                .control
+                .view
+                .lock()
+                .map_err(|_| DomainError::Conflict)?;
+            let Some(record) = state.records.servers.get(&view.status.server_id) else {
+                continue;
+            };
+            if view.status.health != ConnectionHealth::Ready
+                || view.status.inspection_only
+                || &view.status.scope != scope
+                || !record.availability.allows(scope)
+                || worker.control.cancelled.load(Ordering::Acquire)
+            {
+                continue;
+            }
+            let Some(catalog) = &view.catalog else {
+                continue;
+            };
+            if record.configuration_revision() != catalog.binding.config_revision {
+                continue;
+            }
+            for tool in &catalog.tools {
+                let Ok(definition) = selected_tool(&catalog.binding, tool) else {
+                    continue;
+                };
+                let name = definition.identity().original_name.as_str();
+                let description = tool["description"].as_str().unwrap_or_default();
+                if !query.is_empty()
+                    && !name.to_lowercase().contains(&query)
+                    && !description.to_lowercase().contains(&query)
+                {
+                    continue;
+                }
+                found = found.saturating_add(1);
+                if rows.len() < limit {
+                    rows.push(json!({
+                        "connection":connection,
+                        "server":record.draft.name,
+                        "name":name,
+                        "description":description.chars().take(500).collect::<String>(),
+                        "inputSchema":tool["inputSchema"].clone(),
+                    }));
+                }
+            }
+        }
+        let result = json!({
+            "tools":rows,
+            "truncated":found > limit,
+            "note":"Call mcpCall only with a connection and name returned here."
+        });
+        if serde_json::to_vec(&result)
+            .map_err(|_| invalid("MCP tool search encoding"))?
+            .len()
+            > 64 * 1024
+        {
+            return Err(DomainError::LimitExceeded("MCP tool search result".into()));
+        }
+        Ok(result)
+    }
+
+    /// Submit one selected tool to its owned MCP worker. The worker re-reads
+    /// the live catalog before sending, so an edited, disconnected, stale, or
+    /// changed server cannot be called through an old search result.
+    pub fn execute_tool(
+        &self,
+        connection: &str,
+        scope: &CatalogScope,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, DomainError> {
+        if name.is_empty()
+            || name.len() > 256
+            || name.chars().any(char::is_control)
+            || serde_json::to_vec(&arguments)
+                .map_err(|_| invalid("MCP tool arguments encoding"))?
+                .len()
+                > 256 * 1024
+        {
+            return Err(invalid("MCP tool call bounds"));
+        }
+        self.reap_finished()?;
+        let (sender, control) = {
+            let state = self.state()?;
+            let worker = state.live.get(connection).ok_or(DomainError::NotFound)?;
+            let view = worker
+                .control
+                .view
+                .lock()
+                .map_err(|_| DomainError::Conflict)?;
+            let record = state
+                .records
+                .servers
+                .get(&view.status.server_id)
+                .ok_or(DomainError::NotFound)?;
+            let catalog = view
+                .catalog
+                .as_ref()
+                .ok_or(DomainError::Unavailable("MCP catalog not ready".into()))?;
+            if view.status.health != ConnectionHealth::Ready
+                || view.status.inspection_only
+                || &view.status.scope != scope
+                || !record.availability.allows(scope)
+                || record.configuration_revision() != catalog.binding.config_revision
+                || worker.control.cancelled.load(Ordering::Acquire)
+            {
+                return Err(DomainError::PermissionDenied);
+            }
+            // Check the saved result before reserving the process. The worker
+            // repeats this against its refreshed catalog immediately before send.
+            selected_tool(&catalog.binding, catalog_tool(&catalog.tools, name)?)?;
+            worker
+                .control
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| DomainError::QueueFull)?;
+            (worker.sender.clone(), worker.control.clone())
+        };
+        let (reply, receive) = mpsc::sync_channel(1);
+        let command = Command {
+            name: name.into(),
+            arguments,
+            reply,
+        };
+        if sender.try_send(command).is_err() {
+            control.busy.store(false, Ordering::Release);
+            return Err(DomainError::QueueFull);
+        }
+        let result = receive.recv_timeout(self.limits.timeout() + Duration::from_secs(1));
+        control.busy.store(false, Ordering::Release);
+        match result {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A timed-out stdio request has unknown peer state. Retire the
+                // connection instead of letting a later call share that stream.
+                control.cancel();
+                Err(DomainError::TimedOut)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(DomainError::Unavailable(
+                "MCP worker stopped before a tool result".into(),
+            )),
+        }
     }
 
     pub fn catalog(
@@ -814,6 +1036,40 @@ fn binding(
     }
 }
 
+fn catalog_tool<'a>(tools: &'a [Value], name: &str) -> Result<&'a Value, DomainError> {
+    tools
+        .iter()
+        .find(|tool| tool["name"] == name)
+        .ok_or(DomainError::NotFound)
+}
+
+// Both discovery and execution construct this from native-owned binding data.
+// The peer's tool record supplies descriptive metadata only; it never selects
+// a server, workspace, or execution authority by itself.
+fn selected_tool(
+    binding: &CatalogBinding,
+    tool: &Value,
+) -> Result<ag1_core::tools::mcp::SelectedDefinition, DomainError> {
+    ag1_core::tools::mcp::SelectedDefinition::new(core_binding(binding), tool)
+}
+
+fn core_binding(binding: &CatalogBinding) -> ag1_core::tools::mcp::Binding {
+    ag1_core::tools::mcp::Binding {
+        server_id: binding.server_id.clone(),
+        scope: match &binding.scope {
+            CatalogScope::GeneralChat => ag1_core::tools::mcp::Scope::GeneralChat,
+            CatalogScope::Workspace(workspace) => {
+                ag1_core::tools::mcp::Scope::Workspace(workspace.clone())
+            }
+        },
+        config_revision: binding.config_revision,
+        auth_profile: binding.auth_profile.clone(),
+        credential_generation: binding.credential_generation,
+        connection_generation: binding.connection_generation,
+        protocol: binding.protocol.as_str().into(),
+    }
+}
+
 fn run_worker(
     root: &Path,
     connection_id: &str,
@@ -822,6 +1078,7 @@ fn run_worker(
     reviewed_digest: String,
     limits: DiscoveryLimits,
     control: Arc<Control>,
+    receiver: mpsc::Receiver<Command>,
 ) {
     let result = (|| -> Result<(), DomainError> {
         if control.cancelled.load(Ordering::Acquire) {
@@ -944,12 +1201,29 @@ fn run_worker(
         }
 
         // The stdio client retains the owned process and its bounded pipes for
-        // this connection.  We poll process liveness; there is no auto-retry.
+        // this connection. Requests arrive through one queue, so JSON-RPC IDs
+        // and read-ahead bytes can never be consumed by the wrong model turn.
         while !control.cancelled.load(Ordering::Acquire) {
             if !client.is_running()? {
                 return Err(DomainError::Unavailable("MCP child exited".into()));
             }
-            thread::sleep(Duration::from_millis(25));
+            match receiver.recv_timeout(Duration::from_millis(25)) {
+                Ok(command) => {
+                    let result = call_selected_tool(&mut client, &control, &command);
+                    let retire = result.is_err();
+                    // The caller needs the result even when we retire this
+                    // connection. A protocol error after a send leaves the
+                    // stream's state unknown, so reconnect is the only safe
+                    // way to continue.
+                    let _ = command.reply.send(result.clone());
+                    if retire {
+                        return result.map(|_| ());
+                    }
+                    refresh_tool_catalog(&mut client, &control)?;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         }
         client.shutdown()?;
         Ok(())
@@ -958,6 +1232,68 @@ fn run_worker(
         Ok(()) | Err(DomainError::Cancelled) => stop(&control),
         Err(error) => fail(&control, diagnostic(&error)),
     }
+}
+
+fn call_selected_tool(
+    client: &mut StdioDiscovery,
+    control: &Control,
+    command: &Command,
+) -> Result<Value, DomainError> {
+    let tools = client.tools().ok_or(DomainError::Conflict)?;
+    let tool = tools.get(&command.name).ok_or(DomainError::NotFound)?;
+    let identity = selected_tool(tools.binding(), tool.original())
+        .map(|definition| definition.identity().clone())?;
+    let admit = || {
+        if control.cancelled.load(Ordering::Acquire) {
+            return Err(DomainError::Cancelled);
+        }
+        let view = control.view.lock().map_err(|_| DomainError::Conflict)?;
+        if view.status.health != ConnectionHealth::Ready || view.status.inspection_only {
+            return Err(DomainError::PermissionDenied);
+        }
+        Ok(())
+    };
+    client.call_selected(
+        &identity,
+        &command.arguments,
+        &control.cancelled,
+        &admit,
+        &admit,
+        None,
+    )
+}
+
+fn refresh_tool_catalog(client: &mut StdioDiscovery, control: &Control) -> Result<(), DomainError> {
+    let tools = client.tools().ok_or(DomainError::Conflict)?;
+    let tools = tools
+        .tools()
+        .map(|tool| tool.original().clone())
+        .collect::<Vec<_>>();
+    let binding = client
+        .tools()
+        .map(|tools| tools.binding().clone())
+        .ok_or(DomainError::Conflict)?;
+    let mut view = control.view.lock().map_err(|_| DomainError::Conflict)?;
+    let catalog = view.catalog.as_ref().ok_or(DomainError::Conflict)?;
+    let encoded_bytes = serde_json::to_vec(&json!({
+        "server":catalog.server,"tools":tools,"resources":catalog.resources,
+        "templates":catalog.templates,"prompts":catalog.prompts
+    }))
+    .map_err(|_| invalid("MCP catalog encoding"))?
+    .len();
+    if encoded_bytes > CATALOG_BYTES {
+        return Err(DomainError::LimitExceeded("MCP catalog bytes".into()));
+    }
+    view.catalog = Some(Arc::new(ConnectedCatalog {
+        binding,
+        server: catalog.server.clone(),
+        tools,
+        resources: catalog.resources.clone(),
+        templates: catalog.templates.clone(),
+        prompts: catalog.prompts.clone(),
+        encoded_bytes,
+    }));
+    Ok(())
 }
 
 fn stop(control: &Control) {

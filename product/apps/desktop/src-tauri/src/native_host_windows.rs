@@ -32,7 +32,9 @@ use ag1_platform::{
     provider::http::{
         CancelSource, GenerationRuntime, ProviderHttp, cancellation, endpoint_origin,
     },
-    session::{LocalProjectTools, LocalTurnInput, NativeSession, ProjectWriteAccess},
+    session::{
+        LocalProjectTools, LocalTurnInput, McpToolSurface, NativeSession, ProjectWriteAccess,
+    },
     website_icons,
     workspace::{MAX_READ, Workspace, WorkspaceService, preserve_text},
 };
@@ -1751,6 +1753,7 @@ impl NativeHost {
                 model,
                 runtime,
                 tools,
+                mcp_tools,
                 command,
                 user_id,
                 assistant_id,
@@ -1790,6 +1793,14 @@ impl NativeHost {
                             ))
                         })
                         .transpose()?,
+                    McpToolSurface::new(
+                        self.inner.mcp.clone(),
+                        if active.workspace.is_some() {
+                            CatalogScope::Workspace(active.workspace_scope.clone())
+                        } else {
+                            CatalogScope::GeneralChat
+                        },
+                    ),
                     format!("{session_id}-turn-{serial}"),
                     format!("{session_id}-user-{serial}"),
                     format!("{session_id}-assistant-{serial}"),
@@ -1828,6 +1839,7 @@ impl NativeHost {
                     &http,
                     &mut cancel,
                     tools.as_ref(),
+                    Some(mcp_tools),
                     move |event| {
                         host.note_event(event);
                         Ok(())
@@ -2631,9 +2643,9 @@ impl NativeHost {
         )
     }
 
-    /// Dispatch the narrow Windows MCP management surface.  This deliberately
-    /// manages inspected stdio servers only; model-side MCP tool execution is
-    /// added separately once its per-turn capability boundary exists.
+    /// Dispatch the narrow Windows MCP management surface. Reviewed local
+    /// stdio servers can be searched and called lazily by the active chat;
+    /// HTTP transports and credential-backed servers remain unavailable here.
     pub fn mcp_action(&self, args: &Value) -> Result<Value, String> {
         let action = args["action"].as_str().ok_or("Missing MCP action")?;
         match action {
@@ -2826,7 +2838,7 @@ impl NativeHost {
             .ok_or("Missing MCP connection")?;
         let kind = mcp_catalog_kind(args["kind"].as_str().ok_or("Missing MCP catalog kind")?)?;
         let scope = self.mcp_scope()?;
-        // This is the management UI's inspect path. It permits a test-only
+        // This is the management UI's inspect path. It also permits a test-only
         // connection to display its catalog without making it model-callable.
         let catalog = self
             .inner
@@ -2886,7 +2898,7 @@ impl NativeHost {
             "classification":"unknown",
             "classificationBasis":"Reviewed local MCP catalog",
             "wireName":wire_name,
-            "approval":"MCP model execution is not wired into the Windows session yet; this screen is inspection only.",
+            "approval":"A ready, enabled host-account connection is available to the model through the lazy mcpSearch and mcpCall tools. Test-only connections remain inspection-only.",
         }))
     }
 
@@ -4714,6 +4726,10 @@ mod tests {
                 "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-1\",\"result\":{\"supportedVersions\":[\"2026-07-28\"],\"resultType\":\"complete\",\"ttlMs\":1000,\"cacheScope\":\"private\",\"capabilities\":{\"tools\":{}}}}\r\n",
                 "set /p second=\r\n",
                 "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-2\",\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"fixture_echo\",\"description\":\"Fixture tool\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}\r\n",
+                "set /p refresh=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-3\",\"result\":{\"resultType\":\"complete\",\"tools\":[{\"name\":\"fixture_echo\",\"description\":\"Fixture tool\",\"inputSchema\":{\"type\":\"object\",\"properties\":{}}}]}}\r\n",
+                "set /p call=\r\n",
+                "echo {\"jsonrpc\":\"2.0\",\"id\":\"ag1-mcp-4\",\"result\":{\"resultType\":\"complete\",\"content\":[{\"type\":\"text\",\"text\":\"fixture echo completed\"}]}}\r\n",
                 ":wait\r\n",
                 "set /p later=\r\n",
                 "goto wait\r\n"
@@ -4783,6 +4799,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(catalog["items"][0]["key"], "fixture_echo");
+        let search = host
+            .inner
+            .mcp
+            .search_tools(&CatalogScope::GeneralChat, "echo", 4)
+            .unwrap();
+        assert_eq!(search["tools"][0]["name"], "fixture_echo");
+        let result = host
+            .inner
+            .mcp
+            .execute_tool(
+                &connection,
+                &CatalogScope::GeneralChat,
+                "fixture_echo",
+                json!({"message":"hello"}),
+            )
+            .unwrap();
+        assert_eq!(
+            result["result"]["content"][0]["text"],
+            "fixture echo completed"
+        );
         host.mcp_action(&json!({"action":"disconnect","connection":connection}))
             .unwrap();
     }

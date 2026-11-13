@@ -8,6 +8,7 @@
 use crate::{
     change_receipts::PendingChange,
     folder_access::Snapshot as FolderSnapshot,
+    mcp::{catalog::CatalogScope, manager::Manager as McpManager},
     process::{ProcessSpec, ProcessSupervisor},
     provider::{
         generation::{GenerationLimits, GenerationRequest, request_generation},
@@ -153,6 +154,36 @@ struct LocalWeb {
 pub enum ProjectWriteAccess {
     ReadOnly,
     AllowWrites,
+}
+
+/// A narrow bridge from one durable chat to its reviewed MCP connections. The
+/// manager still owns the child process; this value only fixes the chat scope
+/// and keeps the model from seeing a whole catalog until it asks to search it.
+#[derive(Clone)]
+pub struct McpToolSurface {
+    manager: Arc<McpManager>,
+    scope: CatalogScope,
+}
+
+impl McpToolSurface {
+    pub fn new(manager: Arc<McpManager>, scope: CatalogScope) -> Self {
+        Self { manager, scope }
+    }
+
+    fn request_definitions() -> Vec<Value> {
+        vec![
+            json!({
+                "name":"mcpSearch",
+                "description":"Search the small catalog of reviewed, connected MCP tools for this chat. Use this before mcpCall so the required arguments come from the live server catalog.",
+                "parameters":{"type":"object","properties":{"query":{"type":"string","description":"Tool name or capability to look for"},"maxResults":{"type":"integer","description":"Optional result limit from 1 to 8"}},"required":["query"]},
+            }),
+            json!({
+                "name":"mcpCall",
+                "description":"Call one reviewed MCP tool returned by mcpSearch. The connection and name must match that search result exactly; arguments must satisfy its returned inputSchema.",
+                "parameters":{"type":"object","properties":{"connection":{"type":"string","description":"Connection returned by mcpSearch"},"name":{"type":"string","description":"Exact MCP tool name returned by mcpSearch"},"arguments":{"type":"object","description":"Arguments matching the selected tool inputSchema"}},"required":["connection","name","arguments"]},
+            }),
+        ]
+    }
 }
 
 /// The first native tool surface stays deliberately small and project-bound.
@@ -939,6 +970,68 @@ fn web_tool_error_result(call: &Value, error: DomainError) -> Value {
         "details":{"error":message,"status":"error"},
         "isError":true,
     })
+}
+
+fn mcp_tool_result(call: &Value, result: Value) -> Value {
+    let content = result["result"]["content"]
+        .as_array()
+        .cloned()
+        .unwrap_or_else(|| {
+            vec![json!({
+                "type":"text",
+                "text":bounded_mcp_text(&result),
+            })]
+        });
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":call["name"],
+        "content":content,
+        "details":{"mcp":{"connection":call["arguments"]["connection"],"name":call["arguments"]["name"]}},
+        "isError":result["result"]["isError"].as_bool().unwrap_or(false),
+    })
+}
+
+fn mcp_tool_error_result(call: &Value, error: DomainError) -> Value {
+    let text = match error {
+        DomainError::Cancelled => "The MCP call was stopped and its connection was retired.".into(),
+        DomainError::TimedOut => "The MCP call timed out and its connection was retired.".into(),
+        DomainError::QueueFull => "That MCP connection is already handling a tool call.".into(),
+        DomainError::NotFound => "That MCP connection or tool is no longer available. Search the MCP catalog again.".into(),
+        DomainError::PermissionDenied => "That MCP tool is not enabled for this chat or its reviewed connection is no longer ready.".into(),
+        DomainError::Conflict => "The MCP tool catalog changed. Search it again before calling a tool.".into(),
+        DomainError::InvalidInput(reason)
+        | DomainError::LimitExceeded(reason)
+        | DomainError::Unavailable(reason) => reason,
+        _ => "The MCP tool could not complete safely.".into(),
+    };
+    json!({
+        "role":"toolResult",
+        "toolCallId":call["id"],
+        "toolName":call["name"],
+        "content":[{"type":"text","text":text}],
+        "details":{"mcp":{"status":"error"}},
+        "isError":true,
+    })
+}
+
+fn bounded_mcp_text(value: &Value) -> String {
+    let text = serde_json::to_string(value).unwrap_or_else(|_| {
+        "MCP returned a result that AG1W could not encode for this chat.".into()
+    });
+    if text.len() <= PROJECT_TOOL_MAX_TEXT {
+        return text;
+    }
+    let end = text
+        .char_indices()
+        .take_while(|(index, _)| *index < PROJECT_TOOL_MAX_TEXT.saturating_sub(64))
+        .last()
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    format!(
+        "{}\n[MCP result truncated in chat; reconnect and inspect its catalog for details.]",
+        &text[..end]
+    )
 }
 
 // Gregorian civil year from nonnegative Unix milliseconds. Search planning
@@ -1896,7 +1989,7 @@ impl NativeSession {
         cancel: &mut CancelToken,
         observe: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
     ) -> Result<LocalTurnResult, DomainError> {
-        self.run_local_turn_with_tools(input, scheduler, http, cancel, None, observe)
+        self.run_local_turn_with_tools(input, scheduler, http, cancel, None, None, observe)
             .await
     }
 
@@ -1910,6 +2003,7 @@ impl NativeSession {
         http: &ProviderHttp,
         cancel: &mut CancelToken,
         tools: Option<&LocalProjectTools>,
+        mcp: Option<McpToolSurface>,
         mut observe: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
     ) -> Result<LocalTurnResult, DomainError> {
         Self::validate_local_turn(&input)?;
@@ -1938,6 +2032,11 @@ impl NativeSession {
             let mut definitions = LocalProjectTools::web_definitions();
             if let Some(tools) = tools {
                 definitions.extend(tools.request_definitions());
+            }
+            if let Some(mcp) = &mcp
+                && mcp.manager.has_callable_tools(&mcp.scope)?
+            {
+                definitions.extend(McpToolSurface::request_definitions());
             }
             Some(definitions)
         };
@@ -2170,6 +2269,8 @@ impl NativeSession {
                         )
                         .await
                     }
+                    Some("mcpSearch") => self.execute_mcp_search(mcp.as_ref(), call),
+                    Some("mcpCall") => self.execute_mcp_call(mcp.as_ref(), call, cancel).await,
                     _ => tools
                         .map(|tools| tools.execute_with_changes(call, Some(&change)))
                         .unwrap_or_else(|| unavailable_local_tool_result(call)),
@@ -2179,6 +2280,104 @@ impl NativeSession {
             }
             tool_calls += calls.len();
             round += 1;
+        }
+    }
+
+    fn execute_mcp_search(&self, mcp: Option<&McpToolSurface>, call: &Value) -> Value {
+        let Some(mcp) = mcp else {
+            return mcp_tool_error_result(
+                call,
+                DomainError::Unavailable(
+                    "No reviewed MCP tools are connected for this chat.".into(),
+                ),
+            );
+        };
+        let query = call["arguments"]["query"]
+            .as_str()
+            .ok_or_else(|| DomainError::InvalidInput("MCP tool search query".into()));
+        let limit = call["arguments"]["maxResults"]
+            .as_u64()
+            .map(|value| value as usize)
+            .unwrap_or(4);
+        match query.and_then(|query| mcp.manager.search_tools(&mcp.scope, query, limit)) {
+            Ok(result) => json!({
+                "role":"toolResult",
+                "toolCallId":call["id"],
+                "toolName":call["name"],
+                "content":[{"type":"text","text":bounded_mcp_text(&result)}],
+                "details":{"mcp":{"status":"search"}},
+                "isError":false,
+            }),
+            Err(error) => mcp_tool_error_result(call, error),
+        }
+    }
+
+    async fn execute_mcp_call(
+        &self,
+        mcp: Option<&McpToolSurface>,
+        call: &Value,
+        cancel: &mut CancelToken,
+    ) -> Value {
+        let Some(mcp) = mcp else {
+            return mcp_tool_error_result(
+                call,
+                DomainError::Unavailable(
+                    "No reviewed MCP tools are connected for this chat.".into(),
+                ),
+            );
+        };
+        let connection = match call["arguments"]["connection"].as_str() {
+            Some(value) => value.to_owned(),
+            None => {
+                return mcp_tool_error_result(
+                    call,
+                    DomainError::InvalidInput("MCP connection".into()),
+                );
+            }
+        };
+        let name = match call["arguments"]["name"].as_str() {
+            Some(value) => value.to_owned(),
+            None => {
+                return mcp_tool_error_result(
+                    call,
+                    DomainError::InvalidInput("MCP tool name".into()),
+                );
+            }
+        };
+        let arguments = match call["arguments"].get("arguments") {
+            Some(Value::Object(value)) => Value::Object(value.clone()),
+            _ => {
+                return mcp_tool_error_result(
+                    call,
+                    DomainError::InvalidInput("MCP tool arguments".into()),
+                );
+            }
+        };
+        if cancel.cancelled() {
+            return mcp_tool_error_result(call, DomainError::Cancelled);
+        }
+
+        // The MCP stdio process is deliberately blocking. Move that wait off
+        // the async desktop worker, but keep Stop responsive by retiring the
+        // owned connection if the chat cancellation token fires.
+        let manager = mcp.manager.clone();
+        let scope = mcp.scope.clone();
+        let call_manager = manager.clone();
+        let call_connection = connection.clone();
+        let work = tokio::task::spawn_blocking(move || {
+            call_manager.execute_tool(&call_connection, &scope, &name, arguments)
+        });
+        tokio::pin!(work);
+        let outcome = tokio::select! {
+            result = &mut work => result.map_err(|_| DomainError::Unavailable("MCP worker task".into())).and_then(|result| result),
+            _ = cancel.wait() => {
+                let _ = manager.disconnect(&connection);
+                Err(DomainError::Cancelled)
+            }
+        };
+        match outcome {
+            Ok(result) => mcp_tool_result(call, result),
+            Err(error) => mcp_tool_error_result(call, error),
         }
     }
 
