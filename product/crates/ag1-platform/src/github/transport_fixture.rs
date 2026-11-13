@@ -33,7 +33,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let cert = dir.path().join("cert.pem");
         let key = dir.path().join("key.pem");
-        let generated = std::process::Command::new("/usr/bin/openssl")
+        let generated = crate::github::fixture_openssl()
             .args([
                 "req",
                 "-x509",

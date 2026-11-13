@@ -15,6 +15,32 @@ use std::{
 };
 type Result<T> = std::result::Result<T, String>;
 pub const REST_VERSION: &str = "2026-03-10";
+
+#[cfg(test)]
+pub(crate) fn fixture_openssl() -> Command {
+    // TLS fixtures generate a throwaway certificate. The installed app never
+    // uses OpenSSL, but Windows development machines commonly get it from Git.
+    let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("AG1_TEST_OPENSSL") {
+        candidates.push(PathBuf::from(path));
+    }
+    #[cfg(windows)]
+    {
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\usr\bin\openssl.exe"));
+        candidates.push(PathBuf::from(r"C:\Program Files\Git\mingw64\bin\openssl.exe"));
+    }
+    #[cfg(not(windows))]
+    candidates.push(PathBuf::from("/usr/bin/openssl"));
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Command::new(candidate);
+        }
+    }
+    // Keep a normal PATH lookup as the final option for custom installations.
+    Command::new("openssl")
+}
+
 #[cfg(test)]
 mod acceptance_tests;
 pub mod browse;

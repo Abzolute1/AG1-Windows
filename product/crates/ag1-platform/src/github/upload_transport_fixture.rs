@@ -15,7 +15,7 @@ fn real_tls_upload_sends_exact_binary_to_one_origin_and_never_retries() {
     let (dir, root, grant, request) = fixture_source();
     let cert = dir.path().join("cert.pem");
     let key = dir.path().join("key.pem");
-    let generated = std::process::Command::new("/usr/bin/openssl")
+    let generated = crate::github::fixture_openssl()
         .args([
             "req",
             "-x509",
