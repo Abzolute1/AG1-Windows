@@ -27,7 +27,9 @@ pub(crate) fn fixture_openssl() -> Command {
     #[cfg(windows)]
     {
         candidates.push(PathBuf::from(r"C:\Program Files\Git\usr\bin\openssl.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files\Git\mingw64\bin\openssl.exe"));
+        candidates.push(PathBuf::from(
+            r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+        ));
     }
     #[cfg(not(windows))]
     candidates.push(PathBuf::from("/usr/bin/openssl"));
