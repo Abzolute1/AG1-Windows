@@ -165,16 +165,7 @@ impl<R: WebResolver> SearchService<R> {
                 now: now(),
             },
         )?;
-        let query = call.args()["query"]
-            .as_str()
-            .ok_or_else(|| DomainError::InvalidInput("search query".into()))?;
-        if query.is_empty() {
-            return Ok(AdapterOutcome {
-                result: json!({"details":{},"content":[{"type":"text","text":"Error: 'query' parameter is required."}]}),
-                effect: Effect::None,
-                artifact_page: false,
-            });
-        }
+        let query = search_query(call.args())?;
         let maximum = call.args()["maxResults"].as_f64().unwrap_or(3.);
         if !maximum.is_finite() || maximum < 1. || maximum.fract() != 0. {
             return Err(DomainError::InvalidInput(
@@ -651,6 +642,23 @@ impl<R: WebResolver> SearchService<R> {
         ))
     }
 }
+
+// Treat a missing or blank query as a failed tool call. Returning a normal
+// result here made the model believe that `webSearch {}` had succeeded, so it
+// could repeat the same useless call instead of correcting its arguments.
+fn search_query(arguments: &Value) -> Result<&str, DomainError> {
+    let query = arguments["query"]
+        .as_str()
+        .ok_or_else(|| DomainError::InvalidInput("webSearch needs a non-empty query.".into()))?
+        .trim();
+    if query.is_empty() {
+        return Err(DomainError::InvalidInput(
+            "webSearch needs a non-empty query.".into(),
+        ));
+    }
+    Ok(query)
+}
+
 fn search_url(endpoint: &str, query: &str, max: Option<usize>) -> String {
     let encoded = query
         .as_bytes()
@@ -686,6 +694,21 @@ fn search_cancelled(query: &str, cancelled: bool) -> AdapterOutcome {
 mod serialization_tests {
     use super::*;
     use crate::provider::http::cancellation;
+
+    #[test]
+    fn search_rejects_missing_or_blank_queries() {
+        for arguments in [json!({}), json!({"query":"   "})] {
+            let error = search_query(&arguments).unwrap_err();
+            assert!(
+                matches!(error, DomainError::InvalidInput(message) if message == "webSearch needs a non-empty query.")
+            );
+        }
+        assert_eq!(
+            search_query(&json!({"query":"  Rust release notes  "})).unwrap(),
+            "Rust release notes"
+        );
+    }
+
     #[tokio::test]
     async fn search_serialization_has_no_padding_and_honors_cancellation_and_deadline() {
         let gate = tokio::sync::Mutex::new(());
