@@ -10,7 +10,7 @@ pub mod git;
 #[cfg(target_os = "linux")]
 pub mod github;
 pub mod llama;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod mcp;
 pub mod ports;
 #[cfg(target_os = "linux")]
@@ -97,7 +97,7 @@ pub mod package_queries;
 pub mod package_query_git;
 #[cfg(target_os = "linux")]
 pub mod package_settings;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod resource_fs;
 #[cfg(target_os = "linux")]
 pub mod resource_overrides;

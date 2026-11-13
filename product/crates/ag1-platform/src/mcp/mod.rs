@@ -18,7 +18,7 @@ pub mod registry;
 #[cfg(target_os = "linux")]
 pub mod service;
 mod sse;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub mod stdio;
 pub mod wire;
 
