@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_platform::projects::{Toolchains, environment::trust_bundles};
 use std::{fs, path::Path};
 

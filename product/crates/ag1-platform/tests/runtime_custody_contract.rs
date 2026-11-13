@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 #[path = "../../../../fixtures/runtime/custody.rs"]
 mod fixture;
 use ag1_core::{

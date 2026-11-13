@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_platform::cutover::{Owner, Registry, Stage};
 use ag1_storage::{FileKind, FrozenFile, FrozenManifest, digest};
 use std::{

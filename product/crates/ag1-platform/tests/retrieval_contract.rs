@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_core::context::retrieval::{
     RecentAccess, RetrievalOptions, SourceRetrievalPort, WorkingTree, build_capsule,
 };

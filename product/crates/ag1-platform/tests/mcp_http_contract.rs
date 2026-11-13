@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_core::{DomainError, PortFuture};
 use ag1_platform::{
     mcp::{

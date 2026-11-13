@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_core::{DomainError, evidence::Freshness};
 use ag1_platform::{source::SourceService, workspace::WorkspaceService};
 use sha2::{Digest, Sha256};

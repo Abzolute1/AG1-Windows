@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 use ag1_platform::cutover::{Registry, SourceSnapshot};
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
