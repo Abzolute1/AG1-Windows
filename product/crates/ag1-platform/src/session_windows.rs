@@ -2263,14 +2263,10 @@ impl NativeSession {
                 });
             }
             if round >= 7 {
-                return Err(DomainError::LimitExceeded(
-                    "local project tool rounds".into(),
-                ));
+                return Err(DomainError::LimitExceeded("local tool rounds".into()));
             }
             if calls.len() > MAX_LOCAL_TOOL_CALLS.saturating_sub(tool_calls) {
-                return Err(DomainError::LimitExceeded(
-                    "local project tool calls".into(),
-                ));
+                return Err(DomainError::LimitExceeded("local tool calls".into()));
             }
             let change = LocalChangeContext {
                 store: self.store.as_ref(),
