@@ -271,6 +271,112 @@ fn check_scope(envelope: &CommandEnvelope, view: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// The shared React composer uses this small text protocol for its built-in
+// slash commands. Convert only commands AG1W really implements; treating a
+// Linux-only command as successful would leave the chat in a misleading state.
+fn parse_native_client_action(text: &str, selected_model: &Value) -> Result<Command, String> {
+    let (name, rest) = text.trim().split_once(' ').unwrap_or((text.trim(), ""));
+    let rest = rest.trim();
+    match name {
+        "/new" => Ok(Command::Session {
+            action: "new".into(),
+            args: json!({}),
+        }),
+        "/compact" => Ok(Command::Session {
+            action: "compact".into(),
+            args: json!({"focus":if rest.is_empty(){Value::Null}else{json!(rest)}}),
+        }),
+        "/resume" => {
+            if rest.is_empty() {
+                return Err("Use /resume <chat-id>.".into());
+            }
+            Ok(Command::Session {
+                action: "resume".into(),
+                args: json!({"session":rest}),
+            })
+        }
+        "/fork" => {
+            if rest.is_empty() {
+                return Err("Use /fork <user-message-id>.".into());
+            }
+            Ok(Command::Session {
+                action: "fork".into(),
+                args: json!({"entry":rest}),
+            })
+        }
+        "/tree" => {
+            if rest.is_empty() {
+                return Err("Use /tree <user-message-id>.".into());
+            }
+            Ok(Command::Session {
+                action: "tree".into(),
+                args: json!({"target":rest,"summarize":false}),
+            })
+        }
+        "/export" => {
+            if rest.is_empty() {
+                return Err("Use /export <new-file.html>.".into());
+            }
+            Ok(Command::Session {
+                action: "export".into(),
+                args: json!({"path":rest}),
+            })
+        }
+        "/model" => {
+            let (provider, model_id) = rest
+                .split_once('/')
+                .filter(|(provider, model_id)| !provider.is_empty() && !model_id.is_empty())
+                .ok_or("Use /model <provider>/<model-id>.")?;
+            Ok(Command::Model {
+                action: "select".into(),
+                args: json!({"provider":provider,"model_id":model_id}),
+            })
+        }
+        "/thinking" => {
+            let provider = selected_model["provider"]
+                .as_str()
+                .ok_or("Open a local chat before changing reasoning.")?;
+            let model_id = selected_model["id"]
+                .as_str()
+                .ok_or("Open a local chat before changing reasoning.")?;
+            if rest != "on" {
+                return Err("This local Qwen profile supports one mode: /thinking on.".into());
+            }
+            Ok(Command::Model {
+                action: "reasoning".into(),
+                args: json!({"provider":provider,"model_id":model_id,"mode":"on"}),
+            })
+        }
+        "/context" => {
+            let tokens = rest
+                .parse::<u64>()
+                .ok()
+                .filter(|tokens| *tokens >= 1024)
+                .ok_or("Use /context <tokens>, with at least 1024 tokens.")?;
+            Ok(Command::Model {
+                action: "context".into(),
+                args: json!({"tokens":tokens}),
+            })
+        }
+        "/plan" => {
+            if rest.is_empty() {
+                return Err("Use /plan <objective>.".into());
+            }
+            Ok(Command::Plan {
+                action: "draft".into(),
+                args: json!({"input":{"kind":"inline","text":rest},"previous":null,"feedback":null}),
+            })
+        }
+        "/task" => Ok(Command::Task {
+            action: "view".into(),
+            args: json!({}),
+        }),
+        _ => Err(format!(
+            "AG1W supports /new, /compact, /resume, /fork, /tree, /export, /model, /thinking on, /context, /plan, and /task. {name} is not available in the Windows-native host yet."
+        )),
+    }
+}
+
 #[tauri::command]
 async fn open_general(
     window: tauri::Window,
@@ -463,7 +569,17 @@ async fn bridge_command(
     envelope: CommandEnvelope,
 ) -> Result<Value, String> {
     local(&window)?;
+    let mut envelope = envelope;
     let before = current_view(&state)?;
+    if let Command::Runtime { action, args } = &envelope.command
+        && action == "client_action"
+    {
+        let text = args["text"].as_str().ok_or("Missing slash command text")?;
+        match parse_native_client_action(text, &before["details"]["context"]["selected_model"]) {
+            Ok(command) => envelope.command = command,
+            Err(error) => return Ok(reject(&envelope, &before, error)),
+        }
+    }
     let result = match &envelope.command {
         Command::Prompt {
             input: PromptInput::Inline { text },
@@ -970,6 +1086,23 @@ async fn bridge_command(
                 }
             }
         }
+        Command::Session { action, args } if action == "resume" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                let session = args["session"].as_str().ok_or("Missing chat ID")?;
+                match state.host.open_session(session) {
+                    Ok(view) => reply(
+                        &envelope,
+                        &view,
+                        "accepted",
+                        false,
+                        json!({"kind":"settled","operation":{"operation":"navigation","status":"completed"}}),
+                    ),
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
         Command::Session { action, .. } if action == "new" => match state.host.new_chat() {
             Ok(view) => reply(
                 &envelope,
@@ -1417,5 +1550,37 @@ mod tests {
 
         write_catalog(&path, &catalog).unwrap();
         assert_eq!(read_catalog(&path).unwrap(), catalog);
+    }
+
+    #[test]
+    fn native_slash_commands_become_supported_protocol_commands() {
+        let model = json!({"provider":"llamacpp","id":"Qwen3.6-35B-A3B-UD-Q4_K_XL"});
+
+        match parse_native_client_action("/model llamacpp/Qwen3.6-35B-A3B-UD-Q4_K_XL", &model)
+            .unwrap()
+        {
+            Command::Model { action, args } => {
+                assert_eq!(action, "select");
+                assert_eq!(args["provider"], "llamacpp");
+            }
+            other => panic!("expected native model selection, got {other:?}"),
+        }
+        match parse_native_client_action("/thinking on", &model).unwrap() {
+            Command::Model { action, args } => {
+                assert_eq!(action, "reasoning");
+                assert_eq!(args["mode"], "on");
+                assert_eq!(args["model_id"], model["id"]);
+            }
+            other => panic!("expected native reasoning selection, got {other:?}"),
+        }
+        match parse_native_client_action("/compact keep the findings", &model).unwrap() {
+            Command::Session { action, args } => {
+                assert_eq!(action, "compact");
+                assert_eq!(args["focus"], "keep the findings");
+            }
+            other => panic!("expected compaction, got {other:?}"),
+        }
+        assert!(parse_native_client_action("/workflow hidden.yml", &model).is_err());
+        assert!(parse_native_client_action("/thinking low", &model).is_err());
     }
 }
