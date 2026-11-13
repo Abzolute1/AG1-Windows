@@ -60,6 +60,7 @@ fn native_default_models(state: &Path) -> Vec<NativeModelSetup> {
     let profile = state.join("profiles").join("llamacpp-model-profiles.json");
     let primary = state.join("models").join("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf");
     let copied_primary = state.join("models").join("35b-copy-complete");
+    let primary_projector = state.join("models").join("mmproj-F16.gguf");
     let copied_secondary = state.join("models").join("Qwen3.8-27B-UD-Q4_K_XL.gguf");
     let documents_secondary = std::env::var_os("USERPROFILE").map(|home| {
         PathBuf::from(home)
@@ -67,14 +68,6 @@ fn native_default_models(state: &Path) -> Vec<NativeModelSetup> {
             .join("models")
             .join("Qwen3.8-27B-UD-Q4_K_XL.gguf")
     });
-    let secondary = if copied_secondary.is_file() {
-        copied_secondary
-    } else if let Some(path) = documents_secondary.filter(|path| path.is_file()) {
-        path
-    } else {
-        return Vec::new();
-    };
-
     // Do not register a partially copied primary model. The copy marker is
     // written only after the source and destination sizes match. AG1W still
     // seals the GGUF with its own SHA-256 before it can start a model.
@@ -84,37 +77,65 @@ fn native_default_models(state: &Path) -> Vec<NativeModelSetup> {
 
     // Both plans deliberately use one private port. Changing the picker stops
     // the current model before launching the other sealed plan on that port.
-    vec![
-        NativeModelSetup {
+    // The 35B model is useful by itself. Its availability must not depend on
+    // the optional 27B model also being present on this Windows installation.
+    let mut models = vec![NativeModelSetup {
+        model_id: "Qwen3.6-35B-A3B-UD-Q4_K_XL".into(),
+        server_path: server.clone(),
+        model_path: primary,
+        profile_path: profile.clone(),
+        projector_path: primary_projector.is_file().then_some(primary_projector),
+        port: 18084,
+        vram_mib: Some(24_576),
+        system_prompt: String::new(),
+    }];
+
+    let secondary = if copied_secondary.is_file() {
+        Some(copied_secondary)
+    } else {
+        documents_secondary.filter(|path| path.is_file())
+    };
+    if let Some(model_path) = secondary {
+        models.push(NativeModelSetup {
             model_id: "Qwen3.8-27B-UD-Q4_K_XL".into(),
-            server_path: server.clone(),
-            model_path: secondary,
-            profile_path: profile.clone(),
-            projector_path: None,
-            port: 18084,
-            vram_mib: Some(24_576),
-            system_prompt: String::new(),
-        },
-        NativeModelSetup {
-            model_id: "Qwen3.6-35B-A3B-UD-Q4_K_XL".into(),
             server_path: server,
-            model_path: primary,
+            model_path,
             profile_path: profile,
             projector_path: None,
             port: 18084,
             vram_mib: Some(24_576),
             system_prompt: String::new(),
-        },
-    ]
+        });
+    }
+    models
 }
 
 fn provision_native_defaults(host: &NativeHost, state: &Path) -> Result<(), String> {
-    let models = host.models()?;
-    if models.as_array().is_some_and(|models| !models.is_empty()) {
-        return Ok(());
-    }
     let defaults = native_default_models(state);
     if defaults.is_empty() {
+        return Ok(());
+    }
+
+    let models = host.models()?;
+    if let Some(configured) = models.as_array().filter(|models| !models.is_empty()) {
+        // An old AG1W configuration knows the 35B as text-only. Once its
+        // verified projector arrives, replace just that sealed plan before a
+        // chat is opened. Later starts read the image capability from the
+        // saved catalog and do not hash the large GGUF again.
+        let primary = defaults
+            .iter()
+            .find(|model| model.model_id == "Qwen3.6-35B-A3B-UD-Q4_K_XL");
+        let has_text_only_primary = configured.iter().any(|model| {
+            model["id"] == "Qwen3.6-35B-A3B-UD-Q4_K_XL"
+                && !model["input"]
+                    .as_array()
+                    .is_some_and(|input| input.iter().any(|kind| kind == "image"))
+        });
+        if let Some(primary) = primary.filter(|model| model.projector_path.is_some())
+            && has_text_only_primary
+        {
+            tauri::async_runtime::block_on(host.refresh_owned_runtime(primary.clone()))?;
+        }
         return Ok(());
     }
 

@@ -1591,6 +1591,86 @@ impl NativeHost {
         self.models()
     }
 
+    /// Replace one sealed model plan while AG1W is idle.
+    ///
+    /// This is for a runtime upgrade such as adding the matching vision
+    /// projector. It deliberately leaves the other picker entries and their
+    /// captures untouched, and it never changes a chat that already began.
+    pub async fn refresh_owned_runtime(&self, input: NativeModelSetup) -> Result<Value, String> {
+        if std::env::var_os("AG1_NATIVE_CONFIG").is_some() {
+            return Err(
+                "AG1W is using an externally supplied native configuration. Remove AG1_NATIVE_CONFIG before replacing its local runtime setup."
+                    .into(),
+            );
+        }
+        if self.runtime()?.is_some() {
+            return Err("Stop and restart AG1W before replacing a runtime it already owns.".into());
+        }
+        if self.active()?.is_some() {
+            return Err(
+                "Create the native model setup before opening a chat, then restart AG1W so existing chat history keeps its original model configuration."
+                    .into(),
+            );
+        }
+
+        let existing = self
+            .config()?
+            .clone()
+            .ok_or("AG1W has no native model catalog to refresh.")?;
+        let state = self.inner.state.clone();
+        let refreshed_id = input.model_id.clone();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let mut previous = existing.clone();
+            let model_count = previous.models.len();
+            previous
+                .models
+                .retain(|model| model["id"].as_str() != Some(refreshed_id.as_str()));
+            if previous.models.len() + 1 != model_count {
+                return Err("AG1W could not find that model in its native picker.".to_owned());
+            }
+
+            let runtime = previous
+                .runtime
+                .as_mut()
+                .ok_or("AG1W cannot refresh a manually attached server.")?;
+            let captures = runtime.captures();
+            let remaining = captures
+                .iter()
+                .filter(|capture| !capture.plan_sha256.contains_key(&refreshed_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if remaining.len() + 1 != captures.len() {
+                return Err("AG1W could not find that model's sealed runtime plan.".to_owned());
+            }
+            runtime.captures = remaining;
+            runtime.capture = None;
+
+            let selected_before = existing.selected.clone();
+            let mut rebuilt = prepare_runtime_setup(&state, Some(&previous), input)?;
+            // Replacing a background picker entry must not silently switch the
+            // user's chosen model. The primary setup remains selected when it
+            // is the model being upgraded.
+            if selected_before != refreshed_id {
+                rebuilt.selected = selected_before;
+            }
+            Ok(rebuilt)
+        })
+        .await
+        .map_err(|_| "AG1W runtime refresh worker stopped unexpectedly".to_owned())??;
+
+        // Hashing is slow enough that a chat can be created during it. Do not
+        // publish a changed runtime plan into a session that already started.
+        if self.runtime()?.is_some() || self.active()?.is_some() {
+            return Err(
+                "A local chat opened while AG1W was refreshing the runtime. The verified setup was not published; restart and try again."
+                    .into(),
+            );
+        }
+        write_config(&self.inner.state, &prepared)?;
+        *self.config()? = Some(prepared);
+        self.models()
+    }
+
     /// Reserve the chat before the command returns to the desktop. The actual
     /// provider work runs afterward, so the UI can poll a real live response.
     pub fn begin_prompt(&self, text: &str) -> Result<(), String> {
@@ -3372,7 +3452,9 @@ fn prepare_runtime_setup(
                 context_override: None,
                 forced_moe: None,
                 cached_moe: None,
-                discovered_projector: None,
+                discovered_projector: projector
+                    .as_ref()
+                    .map(|projector| projector.display().to_string()),
                 materials,
                 expected: ExpectedLaunch {
                     command: plan.command.clone(),
@@ -5785,6 +5867,79 @@ mod tests {
             .unwrap()
             .unwrap();
         let captures = config.runtime.unwrap().captures();
+        let plan = &captures[0].verify().unwrap()[0];
+        assert!(
+            plan.projector
+                .as_deref()
+                .is_some_and(|path| same_windows_path(Path::new(path), &projector))
+        );
+        assert!(!state.path().join("owned-llama-runtime").exists());
+    }
+
+    #[tokio::test]
+    async fn runtime_refresh_upgrades_one_idle_model_to_vision() {
+        let state = tempdir().unwrap();
+        let source = tempdir().unwrap();
+        let server =
+            PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32\\cmd.exe");
+        let model = source.path().join("qwen-fixture.gguf");
+        let projector = source.path().join("mmproj-qwen-fixture.gguf");
+        let profile = source.path().join("profile.json");
+        fs::write(&model, b"small fixture model").unwrap();
+        fs::write(
+            &profile,
+            serde_json::to_vec(&json!({
+                "version": 1,
+                "models": {
+                    "vision-fixture": {
+                        "contextWindow": 4096,
+                        "maxTokens": 256,
+                        "nGpuLayers": 0,
+                        "flashAttention": false
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let host = NativeHost::open(state.path().to_path_buf()).unwrap();
+        let text_only = NativeModelSetup {
+            model_id: "vision-fixture".into(),
+            server_path: server.clone(),
+            model_path: model.clone(),
+            profile_path: profile.clone(),
+            projector_path: None,
+            port: 19093,
+            vram_mib: None,
+            system_prompt: String::new(),
+        };
+        let models = host.configure_owned_runtime(text_only).await.unwrap();
+        assert_eq!(models[0]["input"], json!(["text"]));
+
+        // The first setup must genuinely be text-only. Adding this file later
+        // models the completed projector download in an existing AG1W state.
+        fs::write(&projector, b"small fixture projector").unwrap();
+        let models = host
+            .refresh_owned_runtime(NativeModelSetup {
+                model_id: "vision-fixture".into(),
+                server_path: server,
+                model_path: model,
+                profile_path: profile,
+                projector_path: Some(projector.clone()),
+                port: 19093,
+                vram_mib: None,
+                system_prompt: String::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(models[0]["input"], json!(["text", "image"]));
+        let config = read_config(&state.path().join("native-host.json"))
+            .unwrap()
+            .unwrap();
+        let captures = config.runtime.unwrap().captures();
+        assert_eq!(captures.len(), 1);
         let plan = &captures[0].verify().unwrap()[0];
         assert!(
             plan.projector
