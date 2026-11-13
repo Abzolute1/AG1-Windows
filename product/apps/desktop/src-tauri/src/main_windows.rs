@@ -1,5 +1,6 @@
 //! Tauri commands for the Windows-native local chat host.
 
+use ag1_core::runtime::planning::PlanRef;
 use ag1_desktop::{
     native_host::{NativeHost, NativeModelSetup},
     themes,
@@ -565,6 +566,79 @@ async fn bridge_command(
                 reject(&envelope, &before, error)
             } else {
                 match state.host.task_action(action, args) {
+                    Ok(data) => reply(&envelope, &current_view(&state)?, "accepted", true, data),
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
+        Command::Plan { action, args } if action == "view" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                match state.host.plan_snapshot() {
+                    Ok(data) => reply(&envelope, &before, "accepted", false, data),
+                    Err(error) => reject(&envelope, &before, error),
+                }
+            }
+        }
+        Command::Plan { action, args } if action == "draft" => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                let input = &args["input"];
+                if input["kind"] != "inline" {
+                    reject(
+                        &envelope,
+                        &before,
+                        "Native plan mode currently accepts text objectives only",
+                    )
+                } else {
+                    let goal = input["text"]
+                        .as_str()
+                        .ok_or("Missing plan objective")?
+                        .to_owned();
+                    let previous = if args["previous"].is_null() {
+                        None
+                    } else {
+                        Some(PlanRef {
+                            plan_id: args["previous"]["planId"]
+                                .as_str()
+                                .filter(|value| !value.is_empty())
+                                .ok_or("Invalid previous plan")?
+                                .into(),
+                            revision: args["previous"]["revision"]
+                                .as_u64()
+                                .filter(|value| *value > 0)
+                                .ok_or("Invalid previous plan revision")?,
+                        })
+                    };
+                    let feedback = args["feedback"].as_str().map(str::to_owned);
+                    match state.host.begin_plan_draft(&goal) {
+                        Ok(command) => {
+                            let host = state.host.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let _ = host
+                                    .run_started_plan_draft(command, goal, previous, feedback)
+                                    .await;
+                            });
+                            reply(
+                                &envelope,
+                                &current_view(&state)?,
+                                "accepted",
+                                false,
+                                json!({"kind":"accepted","operation":{"operation":"local-plan-draft","status":"running"}}),
+                            )
+                        }
+                        Err(error) => reject(&envelope, &before, error),
+                    }
+                }
+            }
+        }
+        Command::Plan { action, args } => {
+            if let Err(error) = check_scope(&envelope, &before) {
+                reject(&envelope, &before, error)
+            } else {
+                match state.host.change_plan(action, args) {
                     Ok(data) => reply(&envelope, &current_view(&state)?, "accepted", true, data),
                     Err(error) => reject(&envelope, &before, error),
                 }

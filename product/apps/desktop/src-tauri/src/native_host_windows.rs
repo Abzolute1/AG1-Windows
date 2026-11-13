@@ -5,8 +5,11 @@
 //! commands which appear to work but cannot settle their side effects.
 
 use ag1_core::{
-    DomainError, FileRevision, SessionId, context::compiler::CompileOptions, inference::Scheduler,
-    runtime::session::Configuration, storage::StoragePort,
+    DomainError, FileRevision, SessionId,
+    context::compiler::CompileOptions,
+    inference::Scheduler,
+    runtime::{planning::PlanRef, session::Configuration},
+    storage::StoragePort,
 };
 use ag1_platform::{
     change_receipts::{self, ChangeReceipt},
@@ -1668,6 +1671,7 @@ impl NativeHost {
                         timestamp,
                         timestamp_ms,
                         message,
+                        system_addendum: None,
                     },
                     &self.inner.scheduler,
                     &http,
@@ -1715,6 +1719,155 @@ impl NativeHost {
         active.cancel_token = Some(cancel_token);
         active.live = Some(LiveActivity::new(command.clone(), stamp));
         Ok(command)
+    }
+
+    /// Return the current chat's durable plan records for the Plans drawer.
+    pub fn plan_snapshot(&self) -> Result<Value, String> {
+        self.ensure_session()?;
+        let active = self.active()?;
+        let active = active.as_ref().ok_or("Open a local chat first")?;
+        serde_json::to_value(active.session.plan_snapshot(30).map_err(describe)?)
+            .map_err(|_| "Encode native plan records".into())
+    }
+
+    /// Reserve the model for a planning-only turn. The planner uses the normal
+    /// cancellation and live-stream machinery, but its request gets no tools
+    /// and cannot use an approval choice to turn itself into an edit.
+    pub fn begin_plan_draft(&self, goal: &str) -> Result<String, String> {
+        self.ensure_session()?;
+        if goal.trim().is_empty() || goal.len() > 1024 * 1024 {
+            return Err("Enter a plan objective under 1 MiB.".into());
+        }
+        let mut active = self.active()?;
+        let active = active.as_mut().ok_or("Open a local chat first")?;
+        if active.busy || active.loading {
+            return Err("The local model is already working on this chat".into());
+        }
+        let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let stamp = now_ms();
+        let command = format!("{}-plan-{serial}", active.id.as_str());
+        let (cancel_source, cancel_token) = cancellation();
+        active.busy = true;
+        active.operation = Some("local-plan-draft".into());
+        active.progress = "Preparing plan draft".into();
+        active.diagnostic = None;
+        active.last_usage = None;
+        active.cancel = Some(Arc::new(cancel_source));
+        active.cancel_token = Some(cancel_token);
+        active.live = Some(LiveActivity::new(command.clone(), stamp));
+        Ok(command)
+    }
+
+    /// Run the model-backed half of a previously admitted plan request. The
+    /// platform layer turns the answer into a shared AG1 `Plan` record only
+    /// after the assistant message is durable.
+    pub async fn run_started_plan_draft(
+        &self,
+        command: String,
+        goal: String,
+        previous: Option<PlanRef>,
+        feedback: Option<String>,
+    ) -> Result<Value, String> {
+        let outcome = async {
+            self.ensure_runtime().await?;
+            let (session, model, runtime, timestamp, timestamp_ms, mut cancel) = {
+                let mut active = self.active()?;
+                let active = active.as_mut().ok_or("Open a local chat first")?;
+                if !active.busy || active.loading {
+                    return Err("The local plan draft is no longer active".into());
+                }
+                let cancel = active
+                    .cancel_token
+                    .take()
+                    .ok_or("The local plan draft has no cancellation token")?;
+                active.progress = "Drafting a durable plan".into();
+                let stamp = now_ms();
+                (
+                    active.session.clone(),
+                    active.model.clone(),
+                    self.runtime()?,
+                    timestamp(stamp),
+                    stamp,
+                    cancel,
+                )
+            };
+            let base_url = model["baseUrl"]
+                .as_str()
+                .ok_or("Selected local model has no baseUrl")?
+                .to_owned();
+            let origin = endpoint_origin(&base_url).map_err(describe)?;
+            let mut http =
+                ProviderHttp::new(&[origin], Duration::from_secs(10)).map_err(describe)?;
+            if let Some(runtime) = runtime {
+                http = http.with_runtime(runtime);
+            }
+            let mut guidance = [
+                "AG1W planning mode is read-only. Do not edit files, run commands, or call tools.",
+                "Return a concise Markdown plan. Use a Summary heading and a Plan heading with numbered implementation steps.",
+                "If critical language, platform, framework, or scope choices are still unknown, ask one to three concrete questions under a Clarifying Questions heading instead of inventing them.",
+                "This answer will be parsed into a durable plan record. Do not claim that the plan has already been executed.",
+            ]
+            .join("\n");
+            if let Some(previous) = previous.as_ref() {
+                guidance.push_str(&format!(
+                    "\n\nThis revises plan {} revision {}. Keep the goal and only change what the new request requires.",
+                    previous.plan_id, previous.revision
+                ));
+            }
+            if let Some(feedback) = feedback.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+                guidance.push_str(&format!("\n\nUser feedback on the prior plan:\n{feedback}"));
+            }
+            let host = self.clone();
+            session
+                .draft_plan_local(
+                    LocalTurnInput {
+                        command: command.clone(),
+                        user_id: format!("{command}-user"),
+                        assistant_id: format!("{command}-assistant"),
+                        timestamp,
+                        timestamp_ms,
+                        message: inline_message(&goal),
+                        system_addendum: Some(guidance),
+                    },
+                    &goal,
+                    previous,
+                    feedback.as_deref(),
+                    &self.inner.scheduler,
+                    &http,
+                    &mut cancel,
+                    move |event| {
+                        host.note_event(event);
+                        Ok(())
+                    },
+                )
+                .await
+                .map_err(describe)?;
+            Ok(())
+        }
+        .await;
+        self.finish_prompt(outcome.as_ref().err().cloned());
+        outcome?;
+        self.view()
+    }
+
+    /// Transition one existing plan without invoking a model. The platform
+    /// validates the transition against the durable plan and selection state.
+    pub fn change_plan(&self, action: &str, args: &Value) -> Result<Value, String> {
+        self.ensure_session()?;
+        let (session, id) = {
+            let active = self.active()?;
+            let active = active.as_ref().ok_or("Open a local chat first")?;
+            if active.busy || active.loading {
+                return Err("Wait for the local model to finish before changing a plan".into());
+            }
+            (active.session.clone(), active.id.as_str().to_owned())
+        };
+        let serial = self.inner.next.fetch_add(1, Ordering::Relaxed) + 1;
+        let command = format!("{id}-plan-change-{serial}");
+        let updated = session
+            .change_plan(&command, &command, &timestamp(now_ms()), action, args)
+            .map_err(describe)?;
+        serde_json::to_value(updated).map_err(|_| "Encode native plan update".into())
     }
 
     /// Finish the compaction that was reserved by `begin_context_compaction`.
@@ -1871,6 +2024,7 @@ impl NativeHost {
         active.progress = match active.operation.as_deref() {
             Some("local-context-compaction") => "Stopping local context compaction",
             Some("local-branch-summary") => "Stopping local branch summary",
+            Some("local-plan-draft") => "Stopping local plan draft",
             _ => "Stopping local generation",
         }
         .into();
@@ -4048,6 +4202,30 @@ mod tests {
         assert_eq!(
             host.view().unwrap()["progress"],
             "Stopping local context compaction"
+        );
+        host.finish_prompt(Some("fixture stop".into()));
+    }
+
+    #[test]
+    fn plan_draft_admission_uses_the_live_stop_lifecycle() {
+        let state = tempdir().unwrap();
+        let config_path = write_fixture_config(state.path(), "plan-fixture");
+        let host = NativeHost::open_from_config(state.path().to_path_buf(), config_path).unwrap();
+        host.open_general().unwrap();
+
+        let operation = host
+            .begin_plan_draft("Plan the Windows-native workflow.")
+            .unwrap();
+        assert!(operation.contains("-plan-"));
+        let live = host.view().unwrap();
+        assert_eq!(live["snapshot"]["status"], "streaming");
+        assert_eq!(live["snapshot"]["active_operation"], "local-plan-draft");
+        assert_eq!(live["progress"], "Preparing plan draft");
+
+        host.cancel().unwrap();
+        assert_eq!(
+            host.view().unwrap()["progress"],
+            "Stopping local plan draft"
         );
         host.finish_prompt(Some("fixture stop".into()));
     }

@@ -30,6 +30,7 @@ use ag1_core::{
     provider::{ApiFamily, BlockKind, ProviderEvent, StopReason, assistant_message},
     runtime::{
         SessionRuntime, context as runtime_context, messages as runtime_messages,
+        planning::{self, Plan, PlanRef, Selection, Status},
         session::{CompactionCapture, Configuration, PreparationAction},
         tree,
     },
@@ -89,6 +90,10 @@ pub struct LocalTurnInput {
     pub timestamp: String,
     pub timestamp_ms: u64,
     pub message: Value,
+    // A planning request is still a normal durable turn, but it needs a small
+    // request-only system addendum and no project tools. It never rewrites the
+    // chat's stored configuration.
+    pub system_addendum: Option<String>,
 }
 
 /// The durable facts produced by a completed local-model turn. The three
@@ -111,6 +116,14 @@ pub struct LocalCompactionResult {
     pub result: Value,
     pub context_epoch: u64,
     pub journal_revision: u64,
+}
+
+/// A local planning turn plus the separately journaled plan it produced. A
+/// plan can be absent when the model asked questions instead of proposing
+/// executable steps; the assistant turn still remains durable either way.
+pub struct LocalPlanResult {
+    pub turn: LocalTurnResult,
+    pub plan: Option<Plan>,
 }
 
 /// A prompt gets this mode from the desktop's explicit approval setting.
@@ -1373,6 +1386,184 @@ impl NativeSession {
         Ok(plan.result)
     }
 
+    /// Return the latest durable plan revision for each plan thread. Plans are
+    /// workflow state in the journal, not UI objects reconstructed from text.
+    pub fn plan_snapshot(&self, limit: usize) -> Result<Vec<Plan>, DomainError> {
+        if !(1..=128).contains(&limit) {
+            return Err(DomainError::InvalidInput("plan history limit".into()));
+        }
+        Ok(planning::recent_plans(self.state()?.branch(), limit))
+    }
+
+    /// Run one read-only planning turn, then convert its structured markdown
+    /// into AG1's validated plan record. The plan is stored separately from
+    /// the assistant message so later accept/reject/step updates are checked
+    /// workflow transitions rather than text edits.
+    pub async fn draft_plan_local(
+        &self,
+        input: LocalTurnInput,
+        goal: &str,
+        previous: Option<PlanRef>,
+        feedback: Option<&str>,
+        scheduler: &Scheduler,
+        http: &ProviderHttp,
+        cancel: &mut CancelToken,
+        observe: impl FnMut(&ProviderEvent) -> Result<(), DomainError>,
+    ) -> Result<LocalPlanResult, DomainError> {
+        if goal.trim().is_empty() || goal.len() > 1024 * 1024 {
+            return Err(DomainError::InvalidInput("planning goal".into()));
+        }
+        if input.system_addendum.is_none() {
+            return Err(DomainError::InvalidInput("planning addendum".into()));
+        }
+        let prior = if let Some(reference) = previous.as_ref() {
+            Some(
+                planning::resolve(self.state()?.branch(), reference)
+                    .ok_or(DomainError::NotFound)?,
+            )
+        } else {
+            None
+        };
+
+        let command = input.command.clone();
+        let timestamp = input.timestamp.clone();
+        let turn = self
+            .run_local_turn(input, scheduler, http, cancel, observe)
+            .await?;
+        let text = Self::assistant_text(&turn.message);
+        // The turn already used `input.command` for its user record. Publishing
+        // the plan is a second journal transaction, so it needs AG1's stable
+        // derived command instead of replaying the turn command.
+        let plan_command = format!("plan-{}", ag1_storage::digest(command.as_bytes()));
+        let plan_id = plan_command.clone();
+        let plan =
+            Plan::from_markdown(&plan_id, goal, &text, prior.as_ref(), feedback, &timestamp)?.or(
+                Plan::fallback(&plan_id, goal, prior.as_ref(), feedback, &text, &timestamp)?,
+            );
+
+        if let Some(plan) = plan.as_ref() {
+            let mut state = self.state()?;
+            let mut selection = planning::selection(state.branch()).unwrap_or(Selection {
+                version: 1,
+                planning: None,
+                accepted: None,
+                executing: None,
+                updated_at: timestamp.clone(),
+            });
+            selection.planning = Some(plan.reference());
+            selection.accepted = None;
+            selection.executing = None;
+            selection.updated_at = timestamp.clone();
+            let id = format!("{plan_command}-record");
+            let action = state.update_plan(
+                &plan_command,
+                &id,
+                &timestamp,
+                Some(plan.clone()),
+                selection,
+            )?;
+            Self::commit(&mut state, action, self.store.as_ref())?;
+        }
+        Ok(LocalPlanResult { turn, plan })
+    }
+
+    /// Apply one non-generative plan transition using AG1's same validated
+    /// state machine. It cannot grant tool permissions or run a plan.
+    pub fn change_plan(
+        &self,
+        command: &str,
+        id: &str,
+        timestamp: &str,
+        action: &str,
+        args: &Value,
+    ) -> Result<Plan, DomainError> {
+        let plan_id = args["planId"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| DomainError::InvalidInput("plan identifier".into()))?;
+        let revision = args["revision"]
+            .as_u64()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| DomainError::InvalidInput("plan revision".into()))?;
+        let reference = PlanRef {
+            plan_id: plan_id.into(),
+            revision,
+        };
+        let mut state = self.state()?;
+        let plan = planning::resolve(state.branch(), &reference).ok_or(DomainError::NotFound)?;
+        let mut selection = planning::selection(state.branch()).unwrap_or(Selection {
+            version: 1,
+            planning: None,
+            accepted: None,
+            executing: None,
+            updated_at: timestamp.into(),
+        });
+        let updated = match action {
+            "accept" => {
+                let updated = plan.transition(Status::Accepted, timestamp)?;
+                selection.planning = None;
+                selection.executing = None;
+                selection.accepted = Some(reference);
+                updated
+            }
+            "reject" | "clear" => {
+                let next = if action == "reject" {
+                    Status::Rejected
+                } else {
+                    Status::Discarded
+                };
+                let mut updated = plan.transition(next, timestamp)?;
+                if action == "reject" {
+                    updated.rejected_reason = args["reason"]
+                        .as_str()
+                        .filter(|reason| !reason.trim().is_empty())
+                        .map(|reason| reason.trim().into());
+                }
+                for selected in [
+                    &mut selection.planning,
+                    &mut selection.accepted,
+                    &mut selection.executing,
+                ] {
+                    if selected.as_ref() == Some(&reference) {
+                        *selected = None;
+                    }
+                }
+                updated
+            }
+            "complete_step" | "reopen_step" => {
+                let step = args["stepIndex"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| DomainError::InvalidInput("plan step".into()))?;
+                let updated = plan.mark_step(step, action == "complete_step", timestamp)?;
+                selection.planning = None;
+                selection.executing = None;
+                selection.accepted = Some(updated.reference());
+                updated
+            }
+            "answer" => {
+                let question = args["questionIndex"]
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| DomainError::InvalidInput("plan question".into()))?;
+                let answer = args["answer"]
+                    .as_str()
+                    .ok_or_else(|| DomainError::InvalidInput("plan answer".into()))?;
+                plan.answer(question, answer, timestamp)?
+            }
+            "execute" => {
+                return Err(DomainError::Unavailable(
+                    "native plan execution needs an explicit follow-up request".into(),
+                ));
+            }
+            _ => return Err(DomainError::InvalidInput("plan action".into())),
+        };
+        selection.updated_at = timestamp.into();
+        let action = state.update_plan(command, id, timestamp, Some(updated.clone()), selection)?;
+        Self::commit(&mut state, action, self.store.as_ref())?;
+        Ok(updated)
+    }
+
     /// Compact the active durable branch through the selected local model.
     ///
     /// This keeps AG1's normal contract: capture and fence the journal first,
@@ -1635,7 +1826,23 @@ impl NativeSession {
         loop {
             // Preparation captures one immutable journal/configuration view. The
             // context compiler can now run without holding the session mutex.
-            let preparation = self.state()?.prepare_request()?;
+            let mut preparation = self.state()?.prepare_request()?;
+            if let Some(addendum) = input.system_addendum.as_deref() {
+                // Plan mode keeps the same conversation and model, but this
+                // one request is read-only. Its tools and instructions are
+                // changed on the captured preparation only, never globally.
+                let system = format!(
+                    "{}\n\n{addendum}",
+                    preparation.configuration().system_prompt
+                );
+                if let Err(error) = preparation
+                    .set_tools(Vec::new())
+                    .and_then(|_| preparation.set_system_prompt(system))
+                {
+                    self.discard_preparation(preparation, error.clone());
+                    return Err(error);
+                }
+            }
             let assistant_id = if round == 0 {
                 input.assistant_id.clone()
             } else {
@@ -1858,11 +2065,25 @@ impl NativeSession {
         if input.user_id == input.assistant_id
             || input.timestamp.is_empty()
             || input.timestamp.len() > 64
+            || input
+                .system_addendum
+                .as_ref()
+                .is_some_and(|value| value.len() > 2 * 1024 * 1024)
             || input.message["role"] != "user"
         {
             return Err(DomainError::InvalidInput("local turn input".into()));
         }
         Ok(())
+    }
+
+    fn assistant_text(message: &Value) -> String {
+        message["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<String>()
     }
 
     fn project_tool_calls(message: &Value) -> Result<Vec<Value>, DomainError> {
@@ -3097,6 +3318,7 @@ mod tests {
                     timestamp: "2026-11-12T00:00:01.000Z".into(),
                     timestamp_ms: 1_763_000_001_000,
                     message: json!({"role":"user","content":"Reply with the fixture phrase."}),
+                    system_addendum: None,
                 },
                 &scheduler,
                 &http,
@@ -3224,6 +3446,108 @@ mod tests {
         let record = resumed.records().unwrap().last().unwrap().clone();
         assert_eq!(record["type"], "compaction");
         assert!(record["details"]["originalJournal"].is_object());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_plan_draft_and_plan_transitions_are_durable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0u8; 32 * 1024];
+            let _ = socket.read(&mut request).unwrap();
+            let body = concat!(
+                "data: {\"id\":\"windows-plan\",\"choices\":[{\"delta\":{\"content\":\"## Summary\\nCreate the native planning workflow.\\n\\n## Plan\\n1. Add the durable planner.\\n2. Validate its journal records.\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":24,\"total_tokens\":36}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            socket.flush().unwrap();
+        });
+
+        let directory = tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let mut configuration = config();
+        configuration.model = json!({
+            "provider":"llamacpp",
+            "id":"fixture-model",
+            "api":"openai-completions",
+            "baseUrl":format!("http://{address}/v1"),
+            "contextWindow":4096,
+            "maxTokens":256,
+            "input":["text"],
+            "reasoning":false,
+        });
+        let session = NativeSession::create(
+            store,
+            SessionId::new("windows-local-plan").unwrap(),
+            "windows-plan-origin",
+            "C:\\lab",
+            "2026-11-13T00:00:00.000Z",
+            1,
+            configuration,
+        )
+        .unwrap();
+        let endpoint = format!("http://{address}");
+        let http = ProviderHttp::new(&[endpoint], Duration::from_secs(5)).unwrap();
+        let scheduler = Scheduler::default();
+        let (_source, mut cancel) = crate::provider::http::cancellation();
+
+        let result = session
+            .draft_plan_local(
+                LocalTurnInput {
+                    command: "windows-plan-command".into(),
+                    user_id: "windows-plan-user".into(),
+                    assistant_id: "windows-plan-assistant".into(),
+                    timestamp: "2026-11-13T00:00:01.000Z".into(),
+                    timestamp_ms: 1_763_000_001_000,
+                    message: json!({"role":"user","content":"Plan the native workflow."}),
+                    system_addendum: Some(
+                        "Draft a read-only plan in markdown with Summary and Plan headings.".into(),
+                    ),
+                },
+                "Plan the native workflow.",
+                None,
+                None,
+                &scheduler,
+                &http,
+                &mut cancel,
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let plan = result.plan.expect("fixture markdown should create a plan");
+        assert_eq!(plan.status, Status::Draft);
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(session.plan_snapshot(8).unwrap()[0].plan_id, plan.plan_id);
+        assert!(session.state().unwrap().settled());
+
+        let accepted = session
+            .change_plan(
+                "windows-plan-accept",
+                "windows-plan-accept",
+                "2026-11-13T00:00:02.000Z",
+                "accept",
+                &json!({"planId":plan.plan_id,"revision":plan.revision}),
+            )
+            .unwrap();
+        assert_eq!(accepted.status, Status::Accepted);
+        let completed = session
+            .change_plan(
+                "windows-plan-complete",
+                "windows-plan-complete",
+                "2026-11-13T00:00:03.000Z",
+                "complete_step",
+                &json!({"planId":plan.plan_id,"revision":plan.revision,"stepIndex":0}),
+            )
+            .unwrap();
+        assert_eq!(completed.completed_step_indexes, Some(vec![0]));
         server.join().unwrap();
     }
 }
