@@ -2776,10 +2776,15 @@ fn read_config(path: &Path) -> Result<Option<HostConfig>, String> {
     if bytes.len() > 1024 * 1024 {
         return Err("AG1W native model configuration exceeds 1 MiB".into());
     }
-    let config: HostConfig =
+    let mut config: HostConfig =
         serde_json::from_slice(&bytes).map_err(|_| "Invalid AG1W native model configuration")?;
     if config.models.len() > 64 || config.selected.is_empty() {
         return Err("Invalid AG1W model catalog".into());
+    }
+    // Older AG1W catalogs predate the Qwen capability flag. Upgrade their
+    // in-memory entries on read; a later ordinary catalog save writes it back.
+    for model in &mut config.models {
+        normalize_local_model_capabilities(model);
     }
     Ok(Some(config))
 }
@@ -3169,10 +3174,11 @@ fn publish_new(path: &Path, bytes: &[u8], name: &str) -> Result<(), String> {
 }
 
 fn session_configuration(
-    model: Value,
+    mut model: Value,
     system_prompt: &str,
     has_project_tools: bool,
 ) -> Result<Configuration, String> {
+    normalize_local_model_capabilities(&mut model);
     if model["provider"].as_str() != Some("llamacpp")
         || model["api"].as_str() != Some("openai-completions")
         || model["id"].as_str().is_none_or(str::is_empty)
@@ -3185,8 +3191,15 @@ fn session_configuration(
         );
     }
     Ok(Configuration {
+        thinking: if model["reasoning"].as_bool() == Some(true) {
+            // AG1W exposes Qwen's one native reasoning mode as always-on. This
+            // sends llama.cpp the chat-template flag instead of pretending the
+            // model supports cloud-style effort choices.
+            "high".into()
+        } else {
+            "off".into()
+        },
         model,
-        thinking: "off".into(),
         // General chats describe no tools at all. A project chat journals the
         // three read-only definitions. Per-prompt write definitions are added
         // only after the host sees an explicit allow-changes mode.
@@ -3234,6 +3247,26 @@ fn model_supports_thinking(id: &str) -> bool {
     // The local Qwen profiles use the model's Qwen chat template. It emits
     // reasoning natively; AG1W does not need a cloud-provider effort setting.
     id.starts_with("Qwen3.")
+}
+
+fn normalize_local_model_capabilities(model: &mut Value) {
+    let Some(id) = model["id"].as_str() else {
+        return;
+    };
+    if !model_supports_thinking(id) {
+        return;
+    }
+
+    // llama.cpp uses this to choose the Qwen chat template's native thinking
+    // branch. It affects only the in-memory entry until the normal model
+    // catalog writer next saves the user's settings.
+    model["reasoning"] = json!(true);
+    if !model["compat"].is_object() {
+        model["compat"] = json!({});
+    }
+    if model["compat"]["thinkingFormat"].is_null() {
+        model["compat"]["thinkingFormat"] = json!("qwen-chat-template");
+    }
 }
 
 fn model_reasoning_controls(model: &Value) -> Value {
@@ -3613,15 +3646,44 @@ mod tests {
     fn qwen_local_models_report_native_thinking() {
         // Existing state files from before this fix stored reasoning as false.
         // The model family is the source of truth for those old entries.
-        let qwen = json!({
+        let mut qwen = json!({
             "id": "Qwen3.6-35B-A3B-UD-Q4_K_XL",
             "reasoning": false
         });
         let other = json!({"id": "plain-local-model", "reasoning": false});
 
+        normalize_local_model_capabilities(&mut qwen);
+        assert_eq!(qwen["reasoning"], true);
+        assert_eq!(qwen["compat"]["thinkingFormat"], "qwen-chat-template");
         assert_eq!(model_reasoning_controls(&qwen)["kind"], "unknown");
         assert_eq!(model_reasoning_controls(&qwen)["modes"][0]["id"], "on");
         assert_eq!(model_reasoning_controls(&other)["kind"], "unsupported");
+    }
+
+    #[test]
+    fn qwen_session_configuration_enables_native_thinking() {
+        let configuration = session_configuration(
+            json!({
+                "id":"Qwen3.6-35B-A3B-UD-Q4_K_XL",
+                "provider":"llamacpp",
+                "api":"openai-completions",
+                "baseUrl":"http://127.0.0.1:18084/v1",
+                "contextWindow":90000,
+                "maxTokens":65536,
+                "input":["text"],
+                "reasoning":false
+            }),
+            "Fixture",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(configuration.thinking, "high");
+        assert_eq!(configuration.model["reasoning"], true);
+        assert_eq!(
+            configuration.model["compat"]["thinkingFormat"],
+            "qwen-chat-template"
+        );
     }
 
     fn write_fixture_config(state: &Path, id: &str) -> PathBuf {
@@ -4909,7 +4971,7 @@ mod tests {
             &config_path,
             serde_json::to_vec(&json!({
                 "models":[{
-                    "id":"vision-fixture",
+                    "id":"Qwen3.6-35B-A3B-UD-Q4_K_XL",
                     "provider":"llamacpp",
                     "api":"openai-completions",
                     "baseUrl":format!("http://{address}/v1"),
@@ -4918,7 +4980,7 @@ mod tests {
                     "input":["text", "image"],
                     "reasoning":false
                 }],
-                "selected":"vision-fixture",
+                "selected":"Qwen3.6-35B-A3B-UD-Q4_K_XL",
                 "system_prompt":"Local vision fixture"
             }))
             .unwrap(),
@@ -4978,6 +5040,10 @@ mod tests {
             format!("data:image/png;base64,{png}")
         );
         assert!(user["content"][1].get("inlineData").is_none());
+        assert_eq!(
+            payload["chat_template_kwargs"]["enable_thinking"], true,
+            "Qwen's native thinking option reaches llama.cpp"
+        );
         server.join().unwrap();
     }
 
