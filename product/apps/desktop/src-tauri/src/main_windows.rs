@@ -58,7 +58,7 @@ fn native_default_models(state: &Path) -> Vec<NativeModelSetup> {
     let server = state.join("runtime").join("llama-server.exe");
     let profile = state.join("profiles").join("llamacpp-model-profiles.json");
     let primary = state.join("models").join("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf");
-    let verified_primary = state.join("models").join("35b-copy-verified");
+    let copied_primary = state.join("models").join("35b-copy-complete");
     let copied_secondary = state.join("models").join("Qwen3.8-27B-UD-Q4_K_XL.gguf");
     let documents_secondary = std::env::var_os("USERPROFILE").map(|home| {
         PathBuf::from(home)
@@ -74,10 +74,10 @@ fn native_default_models(state: &Path) -> Vec<NativeModelSetup> {
         return Vec::new();
     };
 
-    // Do not register a partially copied primary model. The marker is written
-    // only after the WSL source and native copy have matching SHA-256 hashes.
-    if !server.is_file() || !profile.is_file() || !primary.is_file() || !verified_primary.is_file()
-    {
+    // Do not register a partially copied primary model. The copy marker is
+    // written only after the source and destination sizes match. AG1W still
+    // seals the GGUF with its own SHA-256 before it can start a model.
+    if !server.is_file() || !profile.is_file() || !primary.is_file() || !copied_primary.is_file() {
         return Vec::new();
     }
 
