@@ -27,6 +27,18 @@ test("blocked web searches read as a recoverable availability problem", () => {
   expect(screen.queryByText("1 failed")).toBeNull();
 });
 
+test("historic native web-policy failures stay visible without pretending they had sources", () => {
+  const messages = [
+    { id: "a", role: "assistant", blocks: [{ kind: "tool", name: "webSearch", call_id: "s", arguments: { query: "Qwen release notes" } }] },
+    { id: "r", role: "toolResult", tool: { name: "webSearch", call_id: "s", failed: true }, blocks: [{ kind: "text", text: "captured tool policy" }] },
+  ];
+  render(<ActivityGroup messages={messages as any} active={false} compact={false} run={async () => null} onExpand={() => {}} loading={() => false} />);
+  expect(screen.getByRole("button", { name: /Searched the web.*Local web policy blocked this search/ })).toBeTruthy();
+  expect(screen.getByText("1 recoverable outcome")).toBeTruthy();
+  expect(screen.queryByText("1 failed")).toBeNull();
+  expect(document.querySelector(".web-sources")).toBeNull();
+});
+
 test("ordinary tool faults remain visibly failed", () => {
   const messages = [
     { id: "a", role: "assistant", blocks: [{ kind: "tool", name: "bash", call_id: "b", arguments: { command: "build" } }] },

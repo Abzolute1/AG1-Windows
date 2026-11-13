@@ -46,6 +46,7 @@ export function toolOutcome(call: Call | undefined, results: ClientMessage[]): T
   if (!results.some(message => message.tool?.failed)) return "complete";
   const name = call?.name ?? results[0]?.tool?.name;
   const detail = toolDetail(results);
+  if (name === "webSearch" && /captured tool policy/.test(detail)) return "attention";
   if (name === "webSearch" && /duckduckgo|rate[ -]?limit|human verification|automated access|web blocked/.test(detail)) return "unavailable";
   if (name === "webFetch" && /\b(?:403|429|451|503)\b|rate[ -]?limit|human verification|automated access|access denied|forbidden|cloudflare|captcha|timed out|timeout|connection reset/.test(detail)) return "unavailable";
   if (name === "bash") return bashOutcome(call, detail) ?? "failed";
@@ -57,6 +58,7 @@ function outcomeLabel(call: Call | undefined, results: ClientMessage[], outcome:
   if (outcome === "notice") return "No matching result";
   if (outcome !== "attention") return "";
   const detail = toolDetail(results);
+  if (call?.name === "webSearch" && /captured tool policy/.test(detail)) return "Local web policy blocked this search";
   if (/command timed out|timed out after \d/.test(detail)) return "Command timed out";
   if (/read-only file system|permission denied|operation not permitted/.test(detail)) return "Path not writable";
   if (/unless you are root/.test(detail)) return "Permission required";
