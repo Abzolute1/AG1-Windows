@@ -796,6 +796,8 @@ fn stable_search_projection(mut result: Value) -> Value {
     details.remove("resultCount");
     details.remove("sourceUrls");
     details.remove("preferredSourceUrls");
+    details.remove("effectiveQuery");
+    details.remove("freshness");
     details.remove("searchStrategy");
     details.remove("followUpQueries");
     details.remove("avoidedDomains");

@@ -251,30 +251,13 @@ pub fn plan(query: &str, year: u32) -> Result<Plan, DomainError> {
         .to_vec();
         plan.freshness = "current".into();
     } else if intent == "current_events" {
-        let terms = terms(original, false);
-        if !terms.is_empty() {
-            let date = terms.iter().any(|t| {
-                has(r"^20\d\d$", t) || has(r"^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", t)
-            });
-            plan.effective_query = format!(
-                "{}{}",
-                terms.into_iter().take(8).collect::<Vec<_>>().join(" "),
-                if date {
-                    String::new()
-                } else {
-                    format!(" {year}")
-                }
-            );
-        }
-        if has(r"(?i)\bclaude code\b", &plan.effective_query)
-            && has(r"(?i)\bleak\b", &plan.effective_query)
-        {
-            plan.effective_query = "Claude Code leak March 2026 npm source code".into();
-        }
+        // A date we guessed can turn a current question into a search for made-up
+        // future pages. Keep the user's wording intact; explicit dates remain
+        // intact because they are already part of the original query.
         plan.strategy =
-            "current-events query narrowed to distinctive entities and date-like terms".into();
-        plan.follow_up_queries = ["timeline", "analysis", "official response"]
-            .map(|tail| format!("{} {tail}", plan.effective_query))
+            "current-events query preserved; verify claims with a primary source".into();
+        plan.follow_up_queries = ["official source", "announcement", "release notes"]
+            .map(|tail| format!("{original} {tail}"))
             .to_vec();
         plan.freshness = "current".into();
     } else if intent == "docs_reference" {
@@ -367,8 +350,9 @@ const REPOS: &str = "github.com|raw.githubusercontent.com|gitlab.com|bitbucket.o
 const WEAK: &str = "tech-insider.org|cybersecuritynews.com|ccleaks.com|aitoolanalysis.com|beankinney.com|osintteam.blog|infosecwriteups.com";
 const COMMUNITY: &str =
     "stackoverflow.com|reddit.com|medium.com|dev.to|hashnode.com|youtube.com|x.com|twitter.com";
-const OFFICIAL: &str =
-    "anthropic.com|openai.com|googleblog.com|microsoft.com|nvidia.com|developer.nvidia.com";
+// A page only gets the authoritative label when its host belongs to its
+// publisher. A convincing URL or a high search rank is not enough evidence.
+const OFFICIAL: &str = "anthropic.com|openai.com|googleblog.com|microsoft.com|nvidia.com|developer.nvidia.com|qwen.ai|qwenlm.github.io|alibabacloud.com";
 const TECH: &str = "varonis.com|arstechnica.com|infoq.com|thehackernews.com|techradar.com|bleepingcomputer.com|wired.com|theregister.com";
 fn docs_host(host: &str) -> bool {
     ["docs.", "developer.", "api.", "learn."]
@@ -397,6 +381,10 @@ fn source_score(url: &str, intent: &str, outcome: Option<&str>) -> i64 {
         return -10;
     };
     let mut score = 0;
+    // A vendor's own release page should win over commentary about the release.
+    if host_is(&host, OFFICIAL) {
+        score += 10
+    }
     if docs_host(&host) {
         score += 5
     }
@@ -860,10 +848,18 @@ pub fn rank(
         .map(|r| {
             let outcome = outcomes.get(&r.url).map(String::as_str);
             let score = source_score(&r.url, intent, outcome);
+            let source_kind = source_kind(&r.url, intent);
             Ranked {
                 result: r.clone(),
-                authoritative: score >= 3,
-                source_kind: source_kind(&r.url, intent).into(),
+                // Dated paths used to cross the generic score threshold and
+                // made arbitrary news pages look like primary sources. For
+                // current events, only a publisher-owned host earns this label.
+                authoritative: if intent == "current_events" {
+                    source_kind == "official"
+                } else {
+                    score >= 3
+                },
+                source_kind: source_kind.into(),
                 score: score + content_score(r, intent, query),
                 score_reasons: score_reasons(r, intent, query, outcome),
                 fetch_risk: fetch_risk(&r.url, outcome).into(),
@@ -1236,4 +1232,77 @@ pub fn project(
         },
         hints,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_events_keep_the_users_words_and_do_not_invent_a_year() {
+        let plan = plan("latest AI news on Qwen models", 2026).unwrap();
+
+        assert_eq!(plan.effective_query, "latest AI news on Qwen models");
+        assert_eq!(plan.freshness, "current");
+        assert!(
+            plan.follow_up_queries
+                .iter()
+                .any(|query| query.ends_with("official source"))
+        );
+    }
+
+    #[test]
+    fn current_events_only_mark_publisher_pages_as_authoritative() {
+        let results = vec![
+            ResultRow {
+                title: "Qwen 3.6 roadmap 2026".into(),
+                url: "https://example-news.invalid/research/qwen-3-6-roadmap-2026".into(),
+                snippet: "Unverified commentary about a model release.".into(),
+            },
+            ResultRow {
+                title: "Qwen release announcement".into(),
+                url: "https://qwen.ai/blog?id=qwen-release".into(),
+                snippet: "A publisher-owned announcement.".into(),
+            },
+        ];
+
+        let ranked = rank("latest Qwen model news", &results, &BTreeMap::new()).unwrap();
+        let commentary = ranked
+            .iter()
+            .find(|row| row.result.url.contains("example-news"))
+            .unwrap();
+        let publisher = ranked
+            .iter()
+            .find(|row| row.result.url.contains("qwen.ai"))
+            .unwrap();
+
+        assert!(!commentary.authoritative);
+        assert!(publisher.authoritative);
+        assert!(publisher.score > commentary.score);
+
+        let selected =
+            selection::select("latest Qwen model news", &results, &BTreeMap::new(), 2).unwrap();
+        assert!(selected[0].result.url.contains("qwen.ai"));
+    }
+
+    #[test]
+    fn current_events_transcript_requires_a_fetch_before_an_answer() {
+        let text = research::search_transcript(
+            "latest Qwen model news",
+            &[research::SearchResult {
+                title: "Qwen release announcement".into(),
+                url: "https://qwen.ai/blog?id=qwen-release".into(),
+                snippet: None,
+                authoritative: true,
+            }],
+            &research::profile(32_768., 0.),
+            &research::SearchOptions {
+                intent: Some("current_events".into()),
+                ..Default::default()
+            },
+        );
+
+        assert!(text.contains("Do not answer a current-events question from snippets"));
+        assert!(text.contains("webFetch https://qwen.ai/blog?id=qwen-release"));
+    }
 }

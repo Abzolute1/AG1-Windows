@@ -780,6 +780,7 @@ pub fn search_transcript(
             lines.push(format!("Next step: webFetch {}", top.url));
         }
         if options.intent.as_deref() == Some("current_events") {
+            lines.push("Search snippets are unverified leads. Do not answer a current-events question from snippets or replace them with model memory; fetch a primary or independent source first.".into());
             lines.push(if options.prefer_corroboration{"Fetch the strongest source first. Only fetch one independent corroborating source if the first source is blocked, thin, or still leaves a key fact missing."}else{"Fetch one strongest source first. Do not fetch multiple sources in parallel unless the first source is blocked, thin, or clearly missing a key fact."}.into());
             lines.push("For a brief current-events summary, if the first fetched source is rich and specific, answer from it directly. Treat the other top search results as corroborating candidates unless a key fact still needs confirmation.".into());
             if let Some(next) = options.follow_up_queries.first() {

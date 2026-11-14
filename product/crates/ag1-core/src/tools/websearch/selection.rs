@@ -74,6 +74,9 @@ pub(super) fn select(
         ("javascript", "developer.mozilla.org"),
         ("react", "react.dev"),
         ("typescript", "typescriptlang.org"),
+        // For Qwen release questions, prefer the model publisher instead of an
+        // article that merely has the right words in its URL or title.
+        ("qwen", "qwen.ai"),
         ("git", "git-scm.com"),
         ("go", "go.dev"),
         ("php", "php.net"),
@@ -110,8 +113,14 @@ pub(super) fn select(
                 row.score += 18;
                 row.authoritative = true;
                 row.source_kind = "official".into();
-                row.score_reasons
-                    .push("project_primary_documentation".into());
+                row.score_reasons.push(
+                    if intent == "current_events" {
+                        "publisher_primary_source"
+                    } else {
+                        "project_primary_documentation"
+                    }
+                    .into(),
+                );
             }
             if matches!(intent, "docs_reference" | "code_lookup") {
                 if host_is(&host, "typeerror.org|w3cub.com|gitbooks.io|deepwiki.com") {
